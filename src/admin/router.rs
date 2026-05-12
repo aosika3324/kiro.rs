@@ -2,15 +2,16 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
-        update_credential,
+        add_credential, add_proxy, assign_proxy_to_credential, batch_add_proxies, delete_credential,
+        delete_proxy, force_refresh_token, get_all_credentials, get_credential_balance,
+        get_load_balancing_mode, get_proxy_pool, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, set_proxy_enabled, update_credential,
+        update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -48,7 +49,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
+        .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
+        .route(
+            "/proxy-pool",
+            get(get_proxy_pool).post(add_proxy),
+        )
+        .route("/proxy-pool/batch", post(batch_add_proxies))
+        .route("/proxy-pool/{id}", delete(delete_proxy))
+        .route("/proxy-pool/{id}/enabled", post(set_proxy_enabled))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { maskProxyUrl } from '@/lib/utils'
 import {
   useSetDisabled,
   useSetPriority,
@@ -24,6 +25,7 @@ import {
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
 import { EditCredentialDialog } from '@/components/edit-credential-dialog'
+import { UpdateTokenDialog } from '@/components/update-token-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -34,15 +36,6 @@ interface CredentialCardProps {
   loadingBalance: boolean
 }
 
-// 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
-function maskProxyUrl(url: string): string {
-  const match = url.match(/^(\w+:\/\/)([^:@]+):([^@]+)@(.+)$/)
-  if (!match) return url
-  const [, scheme, user, pass, host] = match
-  const maskPart = (s: string) =>
-    s.length <= 6 ? '****' : `${s.slice(0, 3)}****${s.slice(-3)}`
-  return `${scheme}${maskPart(user)}:${maskPart(pass)}@${host}`
-}
 
 function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
@@ -72,6 +65,7 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showEditDialog, setShowEditDialog] = useState(false)
+  const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -363,6 +357,17 @@ export function CredentialCard({
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
             </Button>
+            {credential.disabled && credential.authMethod !== 'api_key' && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setShowUpdateTokenDialog(true)}
+                title="为已禁用的凭据更新 refreshToken"
+              >
+                <RefreshCw className="h-4 w-4 mr-1" />
+                更新 Token
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -425,6 +430,13 @@ export function CredentialCard({
       <EditCredentialDialog
         open={showEditDialog}
         onOpenChange={setShowEditDialog}
+        credential={credential}
+      />
+
+      {/* 更新 refreshToken 对话框 */}
+      <UpdateTokenDialog
+        open={showUpdateTokenDialog}
+        onOpenChange={setShowUpdateTokenDialog}
         credential={credential}
       />
     </>

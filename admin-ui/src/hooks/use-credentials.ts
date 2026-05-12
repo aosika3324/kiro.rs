@@ -9,10 +9,11 @@ import {
   addCredential,
   deleteCredential,
   updateCredential,
+  updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -95,6 +96,18 @@ export function useDeleteCredential() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 更新已禁用凭据的 refreshToken
+export function useUpdateRefreshToken() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: number; req: UpdateRefreshTokenRequest }) =>
+      updateRefreshToken(id, req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

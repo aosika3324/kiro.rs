@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, UpdateCredentialRequest,
+        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, BatchAddProxyRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
 };
 
@@ -119,6 +120,23 @@ pub async fn update_credential(
     }
 }
 
+/// PUT /api/admin/credentials/:id/refresh-token
+/// 更新已禁用凭据的 refreshToken
+pub async fn update_refresh_token(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateRefreshTokenRequest>,
+) -> impl IntoResponse {
+    match state.service.update_refresh_token(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} refreshToken 已更新（当前仍为禁用状态，请手动启用）",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
 pub async fn force_refresh_token(
@@ -131,6 +149,84 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy-pool
+/// 获取代理池列表
+pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_proxy_pool();
+    Json(response)
+}
+
+/// POST /api/admin/proxy-pool
+/// 添加代理到池中
+pub async fn add_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy(payload.url, payload.label) {
+        Ok(entry) => Json(entry).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/batch
+/// 批量添加代理
+pub async fn batch_add_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchAddProxyRequest>,
+) -> impl IntoResponse {
+    let (added, errors) = state.service.batch_add_proxies(payload);
+    Json(serde_json::json!({
+        "added": added.len(),
+        "errors": errors.len(),
+        "proxies": added,
+        "errorMessages": errors
+    }))
+}
+
+/// DELETE /api/admin/proxy-pool/:id
+/// 删除代理
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已删除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/:id/enabled
+/// 设置代理启用/禁用
+pub async fn set_proxy_enabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    match state.service.set_proxy_enabled(id, enabled) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "代理 #{} 已{}",
+            id,
+            if enabled { "启用" } else { "禁用" }
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy
+/// 将代理池中的代理分配给凭据
+pub async fn assign_proxy_to_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<AssignProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.assign_proxy_to_credential(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -12,10 +12,12 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
-    UpdateCredentialRequest,
+    AddCredentialRequest, AddCredentialResponse, AssignProxyRequest, BalanceResponse,
+    BatchAddProxyRequest, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, ProxyPoolEntry, ProxyPoolResponse, SetLoadBalancingModeRequest,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -39,6 +41,8 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 代理 IP 池管理器
+    proxy_pool: ProxyPoolManager,
 }
 
 impl AdminService {
@@ -50,6 +54,10 @@ impl AdminService {
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
 
+        let proxy_pool_path = token_manager
+            .cache_dir()
+            .map(|d| d.join("proxy_pool.json"));
+
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
         Self {
@@ -57,6 +65,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            proxy_pool: ProxyPoolManager::new(proxy_pool_path),
         }
     }
 
@@ -317,6 +326,26 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
+    /// 更新指定凭据的 refreshToken（仅限已禁用凭据）
+    pub fn update_refresh_token(
+        &self,
+        id: u64,
+        req: UpdateRefreshTokenRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_refresh_token(id, req.refresh_token)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("不存在") {
+                    AdminServiceError::NotFound { id }
+                } else if msg.contains("只能为已禁用") || msg.contains("refreshToken 重复") || msg.contains("已被截断") || msg.contains("refreshToken 为空") || msg.contains("缺少 refreshToken") {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    AdminServiceError::InternalError(msg)
+                }
+            })
+    }
+
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -380,6 +409,144 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         }
+    }
+
+    // ============ 代理池管理 ============
+
+    /// 获取代理池列表（含凭据引用计数）
+    pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
+        let proxies = self.proxy_pool.list();
+        let credentials = {
+            let snapshot = self.token_manager.snapshot();
+            snapshot.entries
+        };
+
+        let pool: Vec<ProxyPoolEntry> = proxies
+            .into_iter()
+            .map(|p| {
+                let count = credentials
+                    .iter()
+                    .filter(|c| {
+                        c.proxy_url
+                            .as_deref()
+                            .map(|u| u == p.url)
+                            .unwrap_or(false)
+                    })
+                    .count() as u32;
+                ProxyPoolEntry {
+                    id: p.id,
+                    url: p.url,
+                    label: p.label,
+                    enabled: p.enabled,
+                    credential_count: count,
+                }
+            })
+            .collect();
+
+        ProxyPoolResponse {
+            total: pool.len(),
+            proxies: pool,
+        }
+    }
+
+    /// 添加代理到池中
+    pub fn add_proxy(
+        &self,
+        url: String,
+        label: Option<String>,
+    ) -> Result<ProxyPoolEntry, AdminServiceError> {
+        let entry = self
+            .proxy_pool
+            .add(url, label)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(ProxyPoolEntry {
+            id: entry.id,
+            url: entry.url,
+            label: entry.label,
+            enabled: entry.enabled,
+            credential_count: 0,
+        })
+    }
+
+    /// 批量添加代理
+    pub fn batch_add_proxies(
+        &self,
+        req: BatchAddProxyRequest,
+    ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
+        let (added, errors) = self.proxy_pool.batch_add(req.urls);
+        let result = added
+            .into_iter()
+            .map(|e| ProxyPoolEntry {
+                id: e.id,
+                url: e.url,
+                label: e.label,
+                enabled: e.enabled,
+                credential_count: 0,
+            })
+            .collect();
+        (result, errors)
+    }
+
+    /// 删除代理池中的代理
+    pub fn delete_proxy(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.proxy_pool.delete(id).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("不存在") {
+                AdminServiceError::NotFound { id }
+            } else {
+                AdminServiceError::InternalError(msg)
+            }
+        })
+    }
+
+    /// 设置代理启用/禁用状态
+    pub fn set_proxy_enabled(&self, id: u64, enabled: bool) -> Result<(), AdminServiceError> {
+        self.proxy_pool
+            .set_enabled(id, enabled)
+            .map_err(|_| AdminServiceError::NotFound { id })
+    }
+
+    /// 将代理池中的代理分配给指定凭据
+    pub fn assign_proxy_to_credential(
+        &self,
+        credential_id: u64,
+        req: AssignProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let proxy_url = match req.proxy_id {
+            Some(proxy_id) => {
+                let url = match self.proxy_pool.get_url(proxy_id) {
+                    GetUrlResult::Ok(url) => url,
+                    GetUrlResult::NotFound => {
+                        return Err(AdminServiceError::NotFound { id: proxy_id })
+                    }
+                    GetUrlResult::Disabled => {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "代理 #{} 已被禁用，请先启用后再分配",
+                            proxy_id
+                        )))
+                    }
+                };
+                Some(url)
+            }
+            None => None, // 清除代理
+        };
+
+        self.token_manager
+            .update_credential(
+                credential_id,
+                None,              // email 不修改
+                Some(proxy_url),   // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
+                None,              // proxy_username 不修改
+                None,              // proxy_password 不修改
+            )
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("不存在") {
+                    AdminServiceError::NotFound { id: credential_id }
+                } else {
+                    AdminServiceError::InternalError(msg)
+                }
+            })
     }
 
     // ============ 错误分类 ============

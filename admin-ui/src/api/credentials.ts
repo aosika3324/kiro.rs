@@ -9,6 +9,13 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   UpdateCredentialRequest,
+  UpdateRefreshTokenRequest,
+  ProxyPoolEntry,
+  ProxyPoolResponse,
+  AddProxyRequest,
+  BatchAddProxyRequest,
+  BatchAddProxyResponse,
+  AssignProxyRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -94,12 +101,62 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
+// 更新已禁用凭据的 refreshToken
+export async function updateRefreshToken(
+  id: number,
+  req: UpdateRefreshTokenRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/credentials/${id}/refresh-token`, req)
+  return data
+}
+
 // 更新凭据可编辑字段
 export async function updateCredential(
   id: number,
   req: UpdateCredentialRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>(`/credentials/${id}`, req)
+  return data
+}
+
+// ============ 代理池 ============
+
+// 获取代理池列表
+export async function getProxyPool(): Promise<ProxyPoolResponse> {
+  const { data } = await api.get<ProxyPoolResponse>('/proxy-pool')
+  return data
+}
+
+// 添加代理
+export async function addProxy(req: AddProxyRequest): Promise<ProxyPoolEntry> {
+  const { data } = await api.post<ProxyPoolEntry>('/proxy-pool', req)
+  return data
+}
+
+// 批量添加代理
+export async function batchAddProxies(req: BatchAddProxyRequest): Promise<BatchAddProxyResponse> {
+  const { data } = await api.post<BatchAddProxyResponse>('/proxy-pool/batch', req)
+  return data
+}
+
+// 删除代理
+export async function deleteProxy(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/proxy-pool/${id}`)
+  return data
+}
+
+// 设置代理启用/禁用
+export async function setProxyEnabled(id: number, enabled: boolean): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/proxy-pool/${id}/enabled`, { enabled })
+  return data
+}
+
+// 分配代理给凭据
+export async function assignProxyToCredential(
+  credentialId: number,
+  req: AssignProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${credentialId}/proxy`, req)
   return data
 }
 

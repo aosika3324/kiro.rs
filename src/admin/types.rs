@@ -143,6 +143,14 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+/// 更新 refreshToken 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRefreshTokenRequest {
+    /// 新的刷新令牌
+    pub refresh_token: String,
+}
+
 /// 更新凭据请求（仅可编辑字段，None 表示不修改，Some("") 表示清除）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +216,59 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 代理池 ============
+
+/// 代理池条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEntry {
+    /// 唯一 ID（自增）
+    pub id: u64,
+    /// 代理 URL（如 socks5://user:pass@host:port）
+    pub url: String,
+    /// 备注标签（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// 是否启用
+    pub enabled: bool,
+    /// 使用此代理的凭据数量
+    pub credential_count: u32,
+}
+
+/// 代理池列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolResponse {
+    pub total: usize,
+    pub proxies: Vec<ProxyPoolEntry>,
+}
+
+/// 添加代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddProxyRequest {
+    pub url: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// 批量导入代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAddProxyRequest {
+    /// 代理 URL 列表（每行一个）
+    pub urls: Vec<String>,
+}
+
+/// 分配代理给凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignProxyRequest {
+    /// 代理池中的代理 ID；null 表示清除代理
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
 }
 
 // ============ 通用响应 ============

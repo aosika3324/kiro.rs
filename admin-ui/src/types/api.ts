@@ -96,3 +96,47 @@ export interface UpdateCredentialRequest {
   proxyUsername?: string
   proxyPassword?: string
 }
+
+// 更新 refreshToken 请求
+export interface UpdateRefreshTokenRequest {
+  refreshToken: string
+}
+
+// 代理池条目
+export interface ProxyPoolEntry {
+  id: number
+  url: string
+  label?: string
+  enabled: boolean
+  credentialCount: number
+}
+
+// 代理池列表响应
+export interface ProxyPoolResponse {
+  total: number
+  proxies: ProxyPoolEntry[]
+}
+
+// 添加代理请求
+export interface AddProxyRequest {
+  url: string
+  label?: string
+}
+
+// 批量添加代理请求
+export interface BatchAddProxyRequest {
+  urls: string[]
+}
+
+// 分配代理给凭据请求
+export interface AssignProxyRequest {
+  proxyId?: number | null
+}
+
+// 批量添加代理响应
+export interface BatchAddProxyResponse {
+  added: number
+  errors: number
+  proxies: ProxyPoolEntry[]
+  errorMessages: string[]
+}
