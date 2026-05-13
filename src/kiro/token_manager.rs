@@ -518,8 +518,8 @@ pub struct MultiTokenManager {
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
-    /// 是否为多凭据格式（数组格式才回写）
-    is_multiple_format: bool,
+    /// 是否为多凭据格式（数组格式才回写；通过 add_credential 动态升级为 true）
+    is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -651,11 +651,22 @@ impl MultiTokenManager {
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
-            is_multiple_format,
+            is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
+
+        // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
+        // 触发条件：原文件是单对象格式 && 存在凭据 && 有文件路径
+        if !is_multiple_format && !manager.entries.lock().is_empty() && manager.credentials_path.is_some() {
+            manager.is_multiple_format.store(true, Ordering::Relaxed);
+            if let Err(e) = manager.persist_credentials() {
+                tracing::warn!("单凭据格式迁移到数组格式失败: {}", e);
+            } else {
+                tracing::info!("已将凭据文件从单对象格式迁移到数组格式，token rotation 将正确持久化");
+            }
+        }
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -982,7 +993,7 @@ impl MultiTokenManager {
         use anyhow::Context;
 
         // 仅多凭据格式才回写
-        if !self.is_multiple_format {
+        if !self.is_multiple_format.load(Ordering::Relaxed) {
             return Ok(false);
         }
 
@@ -1760,7 +1771,8 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
+        // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
+        self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
@@ -2688,5 +2700,108 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ── is_multiple_format 自动升级 ──────────────────────────────────────────
+
+    fn tmp_creds_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("kiro_test_{}.json", name));
+        p
+    }
+
+    /// 单凭据格式（is_multiple_format=false）启动时自动迁移为数组格式，
+    /// 迁移后 persist_credentials 能正确写盘，token rotation 不再丢失。
+    #[test]
+    fn test_single_format_auto_migrates_to_multiple_on_startup() {
+        let path = tmp_creds_path("single_migrate");
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test_migrate_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let single_json = serde_json::to_string(&cred).unwrap();
+        std::fs::write(&path, &single_json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            manager.is_multiple_format.load(Ordering::Relaxed),
+            "单凭据格式应在启动时自动升级为 true"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.trim_start().starts_with('['),
+            "迁移后文件应为数组格式，实际: {}",
+            &content[..content.len().min(50)]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 空凭据列表时不触发迁移
+    #[test]
+    fn test_empty_credentials_no_migration() {
+        let path = tmp_creds_path("empty_no_migrate");
+        std::fs::write(&path, "{}").unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !manager.is_multiple_format.load(Ordering::Relaxed),
+            "无凭据时不应触发格式升级"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// add_credential 后 is_multiple_format 必须升级为 true，文件写为数组格式
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_upgrades_multiple_format() {
+        let path = tmp_creds_path("add_cred_upgrade");
+        std::fs::write(&path, "[]").unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert!(!manager.is_multiple_format.load(Ordering::Relaxed));
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test_upgrade_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+
+        manager.add_credential(cred).await.unwrap();
+
+        assert!(
+            manager.is_multiple_format.load(Ordering::Relaxed),
+            "add_credential 后 is_multiple_format 应升级为 true"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.trim_start().starts_with('['),
+            "add_credential 后文件应为数组格式"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
