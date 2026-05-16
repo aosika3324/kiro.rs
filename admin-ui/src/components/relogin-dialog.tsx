@@ -152,13 +152,20 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
 
   const handleStartSocial = async () => {
     setIsStarting(true)
+    // 必须在 await 之前同步打开窗口，否则浏览器弹窗拦截会导致跳转当前页
+    const loginWindow = window.open('about:blank', '_blank')
     try {
       const resp = await startSocialRelogin(credential.id, {})
       setSocialSession(resp)
       setStep('waiting')
-      window.open(resp.portalUrl, '_blank')
+      if (loginWindow) {
+        loginWindow.location.href = resp.portalUrl
+      } else {
+        window.open(resp.portalUrl, '_blank')
+      }
       if (!isRemote) scheduleSocialPoll(resp.sessionId)
     } catch (e) {
+      loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
     } finally {
       setIsStarting(false)

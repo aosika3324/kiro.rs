@@ -149,6 +149,12 @@ fn default_auth_method() -> String {
 pub struct UpdateRefreshTokenRequest {
     /// 新的刷新令牌
     pub refresh_token: String,
+    /// 可选：同时更新 accessToken（来自 KAM 导出，避免强制清空后立即需要刷新）
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// 可选：同时更新 expiresAt（与 accessToken 配套）
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 /// 更新凭据请求（仅可编辑字段，None 表示不修改，Some("") 表示清除）

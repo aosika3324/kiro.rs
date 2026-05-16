@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
-import { maskProxyUrl } from '@/lib/utils'
+import { maskProxyUrl, extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
   useSetPriority,
@@ -126,7 +126,7 @@ export function CredentialCard({
         toast.success(res.message)
       },
       onError: (err) => {
-        toast.error('刷新失败: ' + (err as Error).message)
+        toast.error('刷新失败: ' + extractErrorMessage(err))
       },
     })
   }
@@ -153,14 +153,17 @@ export function CredentialCard({
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Checkbox
-                checked={selected}
-                onCheckedChange={onToggleSelect}
-              />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+          <div className="flex items-start gap-2">
+            <Checkbox
+              className="mt-1 flex-shrink-0"
+              checked={selected}
+              onCheckedChange={onToggleSelect}
+            />
+            <div className="flex-1 min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <CardTitle className="text-lg leading-tight">
+                  {credential.email || `凭据 #${credential.id}`}
+                </CardTitle>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -181,9 +184,9 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
-              </CardTitle>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-shrink-0">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
                 checked={!credential.disabled}
@@ -370,12 +373,12 @@ export function CredentialCard({
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
             </Button>
-            {credential.authMethod !== 'api_key' && (credential.disabled || credential.failureCount > 0 || credential.refreshFailureCount > 0) && (
+            {credential.authMethod !== 'api_key' && (
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => setShowUpdateTokenDialog(true)}
-                title={credential.disabled ? '重新导入新 Token 并自动启用' : '凭据存在失败记录，可重新导入 Token'}
+                title="手动粘贴新 Token 并更新凭据"
               >
                 <RefreshCw className="h-4 w-4 mr-1" />
                 重新导入

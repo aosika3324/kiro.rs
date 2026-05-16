@@ -22,9 +22,11 @@ interface UpdateTokenDialogProps {
 interface ParsedTokenData {
   refreshToken: string
   email?: string
+  accessToken?: string
+  expiresAt?: string
 }
 
-// 从 KAM JSON 或纯字符串中提取 refreshToken 和 email
+// 从 KAM JSON 或纯字符串中提取 token 相关字段
 function parseTokenInput(input: string): ParsedTokenData {
   const trimmed = input.trim()
   if (!trimmed) return { refreshToken: '' }
@@ -36,7 +38,14 @@ function parseTokenInput(input: string): ParsedTokenData {
       const rt = typeof obj.refreshToken === 'string' ? obj.refreshToken.trim() : ''
       if (!rt) return null
       const email = typeof obj.email === 'string' ? obj.email.trim() : undefined
-      return { refreshToken: rt, email: email || undefined }
+      const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken.trim() : undefined
+      const expiresAt = typeof obj.expiresAt === 'string' ? obj.expiresAt.trim() : undefined
+      return {
+        refreshToken: rt,
+        email: email || undefined,
+        accessToken: accessToken || undefined,
+        expiresAt: expiresAt || undefined,
+      }
     }
 
     const direct = extractFromObj(parsed as Record<string, unknown>)
@@ -45,7 +54,6 @@ function parseTokenInput(input: string): ParsedTokenData {
     if (parsed.credentials) {
       const nested = extractFromObj(parsed.credentials as Record<string, unknown>)
       if (nested) {
-        // email 可能在外层：用 spread 返回新对象，避免 mutation
         const outerEmail = typeof (parsed as Record<string, unknown>).email === 'string'
           ? ((parsed as Record<string, unknown>).email as string).trim() || undefined
           : undefined
@@ -115,15 +123,22 @@ export function UpdateTokenDialog({ open, onOpenChange, credential }: UpdateToke
         addLog('✓ 已临时禁用')
       }
 
-      // 步骤 2：更新 refreshToken
+      // 步骤 2：更新 refreshToken（若 JSON 中含 accessToken 则一并保留，避免立即调认证服务器）
       addLog('正在更新 refreshToken…')
       await new Promise<void>((resolve, reject) => {
         updateRefreshToken.mutate(
-          { id: credential.id, req: { refreshToken: extractedToken } },
+          {
+            id: credential.id,
+            req: {
+              refreshToken: extractedToken,
+              accessToken: parsed.accessToken,
+              expiresAt: parsed.expiresAt,
+            },
+          },
           { onSuccess: () => resolve(), onError: reject }
         )
       })
-      addLog('✓ refreshToken 已更新')
+      addLog(`✓ refreshToken 已更新${parsed.accessToken ? '（含 accessToken）' : ''}`)
 
       // 步骤 3：重置失败计数
       addLog('正在重置失败计数…')

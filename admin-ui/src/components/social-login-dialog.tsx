@@ -80,6 +80,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
   const handleStart = async () => {
     setIsStarting(true)
+    const loginWindow = window.open('about:blank', '_blank')
     try {
       const resp = await startSocialLogin({
         priority: parseInt(priority) || 0,
@@ -87,10 +88,14 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       })
       setSession(resp)
       setStep('waiting')
-      window.open(resp.portalUrl, '_blank')
-      // 本机模式才轮询（服务端回调服务器可达）
+      if (loginWindow) {
+        loginWindow.location.href = resp.portalUrl
+      } else {
+        window.open(resp.portalUrl, '_blank')
+      }
       if (!isRemote) schedulePoll(resp.sessionId)
     } catch (e) {
+      loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
     } finally {
       setIsStarting(false)

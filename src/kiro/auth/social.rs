@@ -48,38 +48,44 @@ pub struct ServerHandle {
 pub fn start_callback_server(
     tx: oneshot::Sender<OAuthCallbackData>,
 ) -> anyhow::Result<(u16, ServerHandle)> {
-    let port = find_available_port()?;
+    // 直接持有已绑定的 socket，避免 probe-and-bind 的 TOCTOU 竞态
+    let (port, std_listener) = bind_available_port()?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        run_callback_server(port, tx, shutdown_rx).await;
+        run_callback_server(std_listener, tx, shutdown_rx).await;
     });
 
     Ok((port, ServerHandle { _shutdown_tx: shutdown_tx }))
 }
 
-fn find_available_port() -> anyhow::Result<u16> {
+fn bind_available_port() -> anyhow::Result<(u16, std::net::TcpListener)> {
     for &port in CALLBACK_PORTS {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                listener.set_nonblocking(true)?;
+                return Ok((port, listener));
+            }
+            Err(_) => continue,
         }
     }
     anyhow::bail!("所有回调端口均被占用，请确保没有其他程序占用 {:?}", CALLBACK_PORTS)
 }
 
 async fn run_callback_server(
-    port: u16,
+    std_listener: std::net::TcpListener,
     tx: oneshot::Sender<OAuthCallbackData>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+    let port = std_listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Social 回调服务器启动失败 (port {}): {}", port, e);
+            tracing::error!("Social 回调服务器初始化失败 (port {}): {}", port, e);
             return;
         }
     };
@@ -115,9 +121,13 @@ async fn run_callback_server(
             .and_then(|s| s.strip_suffix(" HTTP/1.1").or_else(|| s.strip_suffix(" HTTP/1.0")))
         {
             if let Some(callback) = parse_callback(path_and_query) {
-                // 重定向到 Kiro 成功页
-                let response = "HTTP/1.1 302 Found\r\nLocation: https://app.kiro.dev/signin?auth_status=success&redirect_from=KiroIDE\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
                 let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
 
                 if let Some(sender) = tx.take() {
                     let _ = sender.send(callback);
@@ -134,12 +144,16 @@ async fn run_callback_server(
                     })
                     .unwrap_or_else(|| "未知错误".to_string());
 
-                let redirect_url = format!(
-                    "https://app.kiro.dev/signin?auth_status=error&redirect_from=KiroIDE&error_message={}",
-                    urlencoding::encode(&error_msg)
+                let body = format!(
+                    "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
+                    error_msg
                 );
-                let response = format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", redirect_url);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
                 let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
                 break;
             }
         }

@@ -452,7 +452,7 @@ impl AdminService {
         req: UpdateRefreshTokenRequest,
     ) -> Result<(), AdminServiceError> {
         self.token_manager
-            .update_refresh_token(id, req.refresh_token)
+            .update_refresh_token(id, req.refresh_token, req.access_token, req.expires_at)
             .map_err(|e| {
                 let msg = e.to_string();
                 if msg.contains("不存在") {
@@ -703,11 +703,16 @@ impl AdminService {
             msg.contains("服务器错误") ||
             msg.contains("Token 刷新失败") ||
             msg.contains("暂时不可用") ||
-            // 网络错误（reqwest 错误）
+            // 网络错误（reqwest 错误格式）
+            msg.contains("error sending request") ||
             msg.contains("error trying to connect") ||
             msg.contains("connection") ||
             msg.contains("timeout") ||
-            msg.contains("timed out");
+            msg.contains("timed out") ||
+            msg.contains("proxy") ||
+            msg.contains("SOCKS") ||
+            msg.contains("dns") ||
+            msg.contains("DNS");
 
         if is_upstream_error {
             AdminServiceError::UpstreamError(msg)
@@ -929,10 +934,13 @@ impl AdminService {
 
         // 重新登录模式：更新已有凭据而非创建新凭据
         if let Some(target_id) = session.relogin_target_id {
-            if let Some(refresh_token) = token.refresh_token {
-                self.do_relogin_update(target_id, refresh_token)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-            }
+            let refresh_token = token.refresh_token.ok_or_else(|| {
+                AdminServiceError::InternalError(
+                    "Social 登录未返回 refreshToken，无法更新凭据".to_string(),
+                )
+            })?;
+            self.do_relogin_update(target_id, refresh_token)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
             tracing::info!("Social 重新登录成功，凭据 #{} Token 已更新", target_id);
             return Ok(PollIdcLoginResponse::Success { credential_id: target_id });
         }
@@ -1151,7 +1159,7 @@ impl AdminService {
         // 先禁用（update_refresh_token 要求凭据处于禁用状态）
         self.token_manager.set_disabled(target_id, true)?;
         // 更新 refreshToken（同时清空 accessToken 和 expiresAt，系统会在下次使用时自动刷新）
-        self.token_manager.update_refresh_token(target_id, refresh_token)?;
+        self.token_manager.update_refresh_token(target_id, refresh_token, None, None)?;
         // 重置失败计数并重新启用
         self.token_manager.reset_and_enable(target_id)?;
         Ok(())

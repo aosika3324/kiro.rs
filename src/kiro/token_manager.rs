@@ -2013,7 +2013,13 @@ impl MultiTokenManager {
     /// 3. 更新 refreshToken
     /// 4. 重置 refresh_failure_count（保持 disabled 状态，让用户手动启用）
     /// 5. 持久化到文件
-    pub fn update_refresh_token(&self, id: u64, new_refresh_token: String) -> anyhow::Result<()> {
+    pub fn update_refresh_token(
+        &self,
+        id: u64,
+        new_refresh_token: String,
+        new_access_token: Option<String>,
+        new_expires_at: Option<String>,
+    ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
 
@@ -2050,8 +2056,10 @@ impl MultiTokenManager {
 
             let entry = &mut entries[idx];
             entry.credentials.refresh_token = Some(new_refresh_token);
-            entry.credentials.access_token = None;
-            entry.credentials.expires_at = None;
+            // 若调用方提供了 accessToken（来自 KAM 导出），则直接保留，无需立即调认证服务器
+            // 否则清空，下次使用时系统会自动刷新
+            entry.credentials.access_token = new_access_token;
+            entry.credentials.expires_at = new_expires_at;
             entry.refresh_failure_count = 0;
         }
         self.persist_credentials()?;

@@ -100,6 +100,8 @@ export interface UpdateCredentialRequest {
 // 更新 refreshToken 请求
 export interface UpdateRefreshTokenRequest {
   refreshToken: string
+  accessToken?: string
+  expiresAt?: string
 }
 
 // 代理池条目
