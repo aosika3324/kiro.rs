@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - master
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -71,10 +69,8 @@ jobs:
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "is_beta=false" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            RAW_VERSION="${{ github.event.inputs.version }}"
+            echo "version=${RAW_VERSION#v}" >> $GITHUB_OUTPUT
             echo "is_beta=false" >> $GITHUB_OUTPUT
           else
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
@@ -133,13 +129,15 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Always push latest
-          docker manifest create ${IMAGE}:latest \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:latest
+          # Stable/manual builds update latest.
+          if [ "${IS_BETA}" != "true" ]; then
+            docker manifest create ${IMAGE}:latest \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:latest
+          fi
 
-          # Also push beta alias for branch pushes
+          # Beta branch builds only update the beta alias.
           if [ "${IS_BETA}" = "true" ]; then
             docker manifest create ${IMAGE}:beta \
               ${IMAGE}:${VERSION}-amd64 \
