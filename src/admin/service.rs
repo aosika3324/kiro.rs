@@ -221,10 +221,43 @@ fn parse_semver_core(value: &str) -> [u32; 3] {
 const BUILD_TYPE: &str = "binary";
 
 /// 暂存路径：下载到 `<exe>.staged`，原子替换前再 mv 到 `<exe>`。
-fn staged_binary_path(exe: &std::path::Path) -> std::path::PathBuf {
+/// 暂存路径：下载到 `<exe>.staged-<version>`，原子替换前再 mv 到 `<exe>`。
+/// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
+fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
     let mut s = exe.as_os_str().to_os_string();
-    s.push(".staged");
+    s.push(format!(".staged-{}", version.trim().trim_start_matches('v')));
     std::path::PathBuf::from(s)
+}
+
+/// 清理目标版本之外的所有 staged 文件，避免之前下载的旧版本残留干扰。
+fn cleanup_other_staged(exe: &std::path::Path, keep_version: &str) {
+    let dir = match exe.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let exe_name = match exe.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return,
+    };
+    let keep = format!(
+        "{}.staged-{}",
+        exe_name,
+        keep_version.trim().trim_start_matches('v')
+    );
+    let prefix = format!("{}.staged-", exe_name);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if name.starts_with(&prefix) && name != keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// GitHub Release 仓库名（owner/repo）。
@@ -840,19 +873,36 @@ impl AdminService {
 
     /// 下载新版二进制并通过校验和验证（对应前端「拉取镜像」按钮）。
     /// 不替换当前可执行文件，便于用户在正式应用前先确认下载成功。
+    /// 下载产物保存到 `<exe>.staged-<version>`，下次 apply 命中同版本时复用。
     pub async fn pull_update_image(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
         let proxy = self.token_manager.proxy().map(|p| p.url.clone());
         let exe = super::binary_update::current_executable()?;
-        let staged = staged_binary_path(&exe);
 
         let version = self.resolve_target_version(false).await?;
-        super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged).await?;
+        let staged = staged_binary_path(&exe, &version);
+
+        // 已经下载过同版本时直接复用，避免重复网络请求
+        let reused = staged.exists();
+        if !reused {
+            super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged)
+                .await?;
+        }
+        // 清理其它版本的旧 staged 文件，避免占用磁盘
+        cleanup_other_staged(&exe, &version);
 
         Ok(ImageUpdateResponse {
             success: true,
-            message: format!("已下载并校验 v{} 二进制", version),
+            message: if reused {
+                format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
+            } else {
+                format!(
+                    "已下载并校验 v{} 二进制，可直接执行「更新并重启」",
+                    version
+                )
+            },
             output: Some(format!(
-                "downloaded: v{}\nstaged: {}",
+                "{}: v{}\nstaged: {}",
+                if reused { "reused" } else { "downloaded" },
                 version,
                 staged.display()
             )),
@@ -863,13 +913,20 @@ impl AdminService {
 
     /// 下载新版二进制并替换当前可执行文件，随后让进程退出由
     /// `restart: unless-stopped` 接管重启（对应前端「更新并重启」按钮）。
+    /// 若 pull 已经把目标版本下载到 `<exe>.staged-<version>`，跳过重复下载。
     pub async fn apply_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
         let proxy = self.token_manager.proxy().map(|p| p.url.clone());
         let exe = super::binary_update::current_executable()?;
-        let staged = staged_binary_path(&exe);
 
         let version = self.resolve_target_version(true).await?;
-        super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged).await?;
+        let staged = staged_binary_path(&exe, &version);
+
+        let reused = staged.exists();
+        if !reused {
+            super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged)
+                .await?;
+        }
+        cleanup_other_staged(&exe, &version);
 
         // 记录当前版本作为「上一版本」，供前端展示「回退」按钮
         let previous_version = env!("CARGO_PKG_VERSION").to_string();
@@ -898,8 +955,10 @@ impl AdminService {
                 version
             ),
             output: Some(format!(
-                "previous: v{}\ninstalled: v{}",
-                previous_version, version
+                "previous: v{}\n{}: v{}",
+                previous_version,
+                if reused { "reused-staged" } else { "installed" },
+                version
             )),
             applied: true,
             need_restart: true,
@@ -924,6 +983,8 @@ impl AdminService {
 
         let exe = super::binary_update::current_executable()?;
         super::binary_update::restore_backup(&exe)?;
+        // 回退后清掉所有 staged：用户已表态"上一次更新是错的"，残留只会误导
+        cleanup_other_staged(&exe, "");
 
         // 回退视为撤销最近一次更新：清空 previous_version 和 last_applied_at
         {
