@@ -20,3 +20,5 @@
 *.staged-*
 *.backup
 .ace-tool/
+.codegraph/
+.claude/

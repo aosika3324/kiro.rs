@@ -109,6 +109,21 @@ function parseNestedErrorMessage(message: string): { title: string; detail?: str
 
 
 /**
+ * 数量语义的紧凑展示（K / M / B）。
+ *
+ * 规则：< 1000 原样输出；≥ 1000 使用 Intl 的 compact notation，最多保留 1 位小数（如 1.2K / 3.4M / 5.6B）。
+ * 仅用于"数量 / 金额 / 大小"语义；ID / 端口号 / 版本号 / 页码 / 状态码请勿使用。
+ */
+export function formatNumber(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return '0'
+  if (Math.abs(value) < 1000) return String(value)
+  return new Intl.NumberFormat('en-US', {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value)
+}
+
+/**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
 export function maskProxyUrl(url: string): string {

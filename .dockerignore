@@ -83,3 +83,7 @@ Dockerfile.*
 .dockerignore
 docker-compose*.yml
 docker-compose.*.yml
+
+.ace-tool/
+.codegraph/
+.claude/

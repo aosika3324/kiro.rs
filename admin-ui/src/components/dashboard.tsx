@@ -8,6 +8,7 @@ import {
   Plus,
   Upload,
   FileUp,
+  FileDown,
   Trash2,
   RotateCcw,
   CheckCircle2,
@@ -92,8 +93,9 @@ import {
   disableQuotaExceeded,
   updateApiKey,
   enableOverageForAllCapable,
+  exportKamCredentials,
 } from "@/api/credentials";
-import { extractErrorMessage, parseError, generateApiKey } from "@/lib/utils";
+import { extractErrorMessage, parseError, generateApiKey, formatNumber } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
 
 interface DashboardProps {
@@ -619,6 +621,49 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
+  const [exportingKam, setExportingKam] = useState(false);
+  const handleExportKam = async () => {
+    if (selectedIds.size === 0) {
+      toast.info("请先勾选要导出的凭据");
+      return;
+    }
+    const ids = Array.from(selectedIds);
+    setExportingKam(true);
+    try {
+      const exportData = await exportKamCredentials(ids);
+      const accountCount = exportData.accounts?.length ?? 0;
+      if (accountCount === 0) {
+        toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
+        return;
+      }
+      const json = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const ts = new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .replace("T", "_")
+        .slice(0, 19);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `kiro-account-manager-export-${ts}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      const skipped = ids.length - accountCount;
+      toast.success(
+        skipped > 0
+          ? `已导出 ${accountCount} 个账号，${skipped} 个无效已跳过`
+          : `已导出 ${accountCount} 个账号`,
+      );
+    } catch (err) {
+      toast.error("导出失败: " + extractErrorMessage(err));
+    } finally {
+      setExportingKam(false);
+    }
+  };
+
   const handleUpdateAdminKey = async (e: React.FormEvent) => {
     e.preventDefault();
     const key = newAdminKey.trim();
@@ -844,7 +889,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 凭据总数
               </div>
               <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums">
-                {data?.total || 0}
+                {formatNumber(data?.total)}
               </div>
             </CardContent>
           </Card>
@@ -854,7 +899,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 可用凭据
               </div>
               <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
-                {data?.available || 0}
+                {formatNumber(data?.available)}
               </div>
             </CardContent>
           </Card>
@@ -938,6 +983,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
                   恢复异常
+                </Button>
+                <Button
+                  onClick={handleExportKam}
+                  size="sm"
+                  variant="outline"
+                  disabled={exportingKam}
+                  title="导出勾选的凭据为 KAM JSON"
+                >
+                  <FileDown className="h-3.5 w-3.5" />
+                  {exportingKam ? "导出中…" : "导出 KAM"}
                 </Button>
                 <Button
                   onClick={handleBatchDelete}

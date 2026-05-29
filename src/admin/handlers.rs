@@ -30,6 +30,34 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/credentials/export
+/// 导出凭据为 KAM 兼容 JSON（含 refreshToken 等敏感字段）
+///
+/// 可选 query 参数 `ids`（逗号分隔）限定导出哪些凭据；省略则导出全部。
+pub async fn export_kam_credentials(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let id_filter: Option<std::collections::HashSet<u64>> = params
+        .get("ids")
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<u64>().ok()
+                    }
+                })
+                .collect::<std::collections::HashSet<u64>>()
+        })
+        .filter(|s| !s.is_empty());
+
+    let response = state.service.export_kam_credentials(id_filter.as_ref());
+    Json(response)
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(

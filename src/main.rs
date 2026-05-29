@@ -168,16 +168,6 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-    anthropic::cache::set_debug_logging(config.cache_debug_logging);
-    anthropic::cache::set_max_read_ratio(config.cache_max_read_ratio);
-
-    // 初始化 Redis（如果配置了）
-    if let Some(redis_url) = &config.redis_url {
-        if let Err(e) = anthropic::cache::init_redis(redis_url).await {
-            tracing::warn!("Failed to initialize Redis cache: {}", e);
-        }
-    }
-
     // 客户端 Key 管理器 + 用量记录器 + 聚合器（与凭据文件同目录）
     let cache_dir = token_manager
         .cache_dir()

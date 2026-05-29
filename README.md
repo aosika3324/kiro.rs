@@ -193,10 +193,9 @@ docker compose up -d
     └── proxy_pool.json            # 代理池（如启用）
 ```
 
-`docker-compose.yml` 默认包含 `kiro-rs` + `redis` 两个服务：
+`docker-compose.yml` 默认包含 `kiro-rs` 服务：
 
 - **kiro-rs**：监听 `8990`，挂载 `./data/:/app/config/`，`restart: unless-stopped`
-- **redis**：用于 prompt cache 加速；`appendonly` 开启，数据持久化到 named volume `redis-data`，附带 healthcheck
 
 #### 二、首次启动获取密钥
 
@@ -242,7 +241,7 @@ KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0 docker compose up -d
 KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0
 ```
 
-**关闭 Redis**：如果不需要 prompt cache，删除 `docker-compose.yml` 里的 `redis` 服务和 `kiro-rs.depends_on`，并把 `data/config.json` 中的 `redisUrl` 字段删除（或保持留空）。
+**关闭 Redis**：v0.4.0+ 已移除 prompt cache 与 Redis 依赖，无需额外配置。如果你之前在 `data/config.json` 里留有 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 字段，可以一并删除。
 
 **配置 HTTP 代理**：在 `data/config.json` 加 `proxyUrl`，或在 Admin UI 的代理池里管理。
 
@@ -276,7 +275,6 @@ tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
 
 - **首次启动看不到日志中的密钥** — 改用 `docker compose logs --tail=200 kiro-rs`，或直接看 `data/config.json` 里的 `apiKey` / `adminApiKey` 字段
 - **想从 Docker Hub 之外的镜像源拉取** — 把 `docker-compose.yml` 里的 `image:` 改成你自己镜像源的地址（如 `ghcr.io/...`、阿里云镜像加速等）
-- **客户端连接 Redis 失败** — 容器之间用服务名通信，`redisUrl` 应保持为 `redis://redis:6379`（不是 `127.0.0.1`）
 - **Admin UI 显示 "暂无数据"** — 仪表盘需要至少一次请求才会有数据，先用 curl 调一次 `/v1/messages` 即可看到趋势开始填充
 
 ## 配置详解

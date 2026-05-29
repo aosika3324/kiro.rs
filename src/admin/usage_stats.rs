@@ -62,8 +62,16 @@ struct RecorderState {
 
 impl UsageRecorder {
     pub fn new(dir: PathBuf) -> Self {
+        // 兜底：调用方传入空路径时归一为 "."，避免 join 出无目录前缀的路径导致写入 CWD
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
         if !dir.exists() {
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("创建 usage_log 目录失败 {}: {}", dir.display(), e);
+            }
         }
         Self {
             inner: Mutex::new(RecorderState {
@@ -268,9 +276,20 @@ impl UsageAggregator {
 
     /// 启动时从历史 JSONL 重建聚合
     pub fn rebuild_from_logs(&self, dir: &Path) {
+        // 兜底：空路径归一为 "."，否则 read_dir("") 会失败导致重建为 0
+        let dir_buf;
+        let dir = if dir.as_os_str().is_empty() {
+            dir_buf = PathBuf::from(".");
+            dir_buf.as_path()
+        } else {
+            dir
+        };
         let entries = match std::fs::read_dir(dir) {
             Ok(it) => it,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("读取 usage_log 目录失败 {}: {}", dir.display(), e);
+                return;
+            }
         };
         let cutoff = Local::now().date_naive() - Duration::days(RETENTION_DAYS);
         let mut count = 0u64;
@@ -299,7 +318,11 @@ impl UsageAggregator {
                 }
             }
         }
-        tracing::info!("UsageAggregator 重建完成：装载 {} 条历史记录", count);
+        tracing::info!(
+            "UsageAggregator 重建完成：从 {} 装载 {} 条历史记录",
+            dir.display(),
+            count
+        );
     }
 
     /// 接收一条记录并落入对应桶
