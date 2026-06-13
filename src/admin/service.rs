@@ -444,6 +444,11 @@ impl AdminService {
         svc
     }
 
+    /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
     pub fn with_log_governance(
         mut self,
@@ -499,6 +504,8 @@ impl AdminService {
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    groups: entry.groups,
+                    source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
                 }
@@ -950,6 +957,8 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            groups: req.groups,
+            source_channel: req.source_channel,
         };
 
         // 调用 token_manager 添加凭据
@@ -988,6 +997,9 @@ impl AdminService {
                 req.proxy_username
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.proxy_password
+                    .map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.groups,
+                req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
             )
             .map_err(|e| self.classify_error(e, id))
@@ -2082,6 +2094,8 @@ impl AdminService {
                 Some(proxy_url), // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
                 None,            // proxy_username 不修改
                 None,            // proxy_password 不修改
+                None,            // groups 不修改
+                None,            // source_channel 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2151,7 +2165,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

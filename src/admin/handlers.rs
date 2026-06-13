@@ -750,6 +750,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        group: k.group.clone(),
     }
 }
 
@@ -785,6 +786,10 @@ pub async fn create_client_key(
             .description
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
+        payload
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty()),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -825,7 +830,13 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    if state.client_keys.update_meta(id, payload.name, description) {
+    let group = payload
+        .group
+        .map(|g| {
+            let t = g.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        });
+    if state.client_keys.update_meta(id, payload.name, description, group) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -881,6 +892,34 @@ pub async fn reset_client_key_stats(
     }
 }
 
+/// POST /api/admin/client-keys/:id/rotate
+///
+/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
+/// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
+pub async fn rotate_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    match state.client_keys.rotate(id) {
+        Some(entry) => Json(CreateClientKeyResponse {
+            id: entry.id,
+            key: entry.key,
+            name: entry.name,
+            created_at: entry.created_at,
+        })
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 // ============ 用量统计 ============
 
 fn parse_range(params: &std::collections::HashMap<String, String>) -> Result<Range, String> {
@@ -898,6 +937,33 @@ fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String>
             .map_err(|_| "keyId 必须是数字".to_string()),
         None => Ok(None),
     }
+}
+
+/// 解析可选的分组筛选参数。空字符串视为不传。
+fn parse_group_filter(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 把 group 名转换为该分组下所有凭据 id 的白名单，给 UsageAggregator 用。
+/// 返回 None 表示未指定分组（不过滤）；返回 Some(空集) 也是合法值——意味着该分组下没有凭据，
+/// 所有 query 都会自然返回空结果。
+fn group_to_cred_ids(
+    state: &AdminState,
+    group: Option<&str>,
+) -> Option<std::collections::HashSet<u64>> {
+    let g = group?;
+    let snapshot = state.service.get_all_credentials();
+    Some(
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect(),
+    )
 }
 
 fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularity, String> {
@@ -987,7 +1053,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
-/// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day
+/// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
 pub async fn stats_timeseries(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -996,7 +1062,9 @@ pub async fn stats_timeseries(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let points = state.usage_aggregator.query_timeseries(window, key_id);
+    let group = parse_group_filter(&params);
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let points = state.usage_aggregator.query_timeseries(window, key_id, cred_ids.as_ref());
     Json(points).into_response()
 }
 
@@ -1022,14 +1090,24 @@ pub async fn stats_by_credential(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    // 拉一份凭据快照，把 email 附加到响应里方便前端展示
+    let group = parse_group_filter(&params);
+    // 拉一份凭据快照（既给响应附加 email，也用来按 group 构建 cred_ids 白名单，
+    // 避免分别查两次）
     let snapshot = state.service.get_all_credentials();
     let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
         .map(|c| (c.id, c.email.clone()))
         .collect();
-    let data = state.usage_aggregator.query_by_credential(window, key_id);
+    let cred_ids: Option<std::collections::HashSet<u64>> = group.as_deref().map(|g| {
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+    let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1061,6 +1139,7 @@ pub async fn list_traces(
         credential_id: params
             .get("credentialId")
             .and_then(|s| s.parse::<u64>().ok()),
+        key_id: params.get("keyId").and_then(|s| s.parse::<u64>().ok()),
         failed_attempt_credential_id: params
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
@@ -1094,12 +1173,24 @@ pub async fn list_traces(
         .into_iter()
         .map(|k| (k.id, k.name))
         .collect();
+    // 客户端 Key 名称解析：master apiKey (key_id=0) 在前端显示为"管理员API密钥"，
+    // 其余客户端 Key 命中名称表则取名称、未命中则回退 #id。
+    let key_label = |key_id: u64| -> String {
+        if key_id == 0 {
+            "master".to_string()
+        } else {
+            client_key_name_map
+                .get(&key_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", key_id))
+        }
+    };
 
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
-            let key_name = client_key_name_map.get(&r.key_id).cloned();
+            let key_name = key_label(r.key_id);
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
                 .attempts
@@ -1138,8 +1229,9 @@ pub async fn list_traces(
                 "outputTokens": r.output_tokens,
                 "cacheCreationTokens": r.cache_creation_tokens,
                 "cacheReadTokens": r.cache_read_tokens,
-                "totalTokens": r.input_tokens + r.output_tokens
-                    + r.cache_creation_tokens + r.cache_read_tokens,
+                "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
+                "credits": r.credits,
+                "firstTokenMs": r.first_token_ms,
                 "attempts": attempts,
             })
         })
@@ -1166,4 +1258,217 @@ pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoRe
         })
         .collect();
     Json(map)
+}
+
+// ============ 账号分组（独立实体）============
+
+fn group_to_item(
+    g: &super::groups::Group,
+    state: &AdminState,
+) -> super::types::GroupItem {
+    super::types::GroupItem {
+        name: g.name.clone(),
+        description: g.description.clone(),
+        created_at: g.created_at.clone(),
+        credential_count: state
+            .service
+            .token_manager()
+            .count_credentials_with_group(&g.name),
+        client_key_count: state.client_keys.count_with_group(&g.name),
+    }
+}
+
+/// GET /api/admin/groups
+pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
+    let groups = state.groups.list();
+    let items: Vec<super::types::GroupItem> =
+        groups.iter().map(|g| group_to_item(g, &state)).collect();
+    Json(super::types::GroupsResponse {
+        total: items.len(),
+        groups: items,
+    })
+}
+
+/// POST /api/admin/groups
+pub async fn create_group(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::CreateGroupRequest>,
+) -> impl IntoResponse {
+    match state
+        .groups
+        .create(payload.name, payload.description)
+    {
+        Ok(g) => Json(group_to_item(&g, &state)).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            // "已存在" → 409；其他校验失败 → 400
+            let (code, resp) = if msg.contains("已存在") {
+                (
+                    StatusCode::CONFLICT,
+                    super::types::AdminErrorResponse::invalid_request(msg),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    super::types::AdminErrorResponse::invalid_request(msg),
+                )
+            };
+            (code, Json(resp)).into_response()
+        }
+    }
+}
+
+/// PATCH /api/admin/groups/:name
+///
+/// 改名 / 改备注。改名时级联更新所有引用该分组的凭据 / 客户端 Key。
+pub async fn update_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(payload): Json<super::types::UpdateGroupRequest>,
+) -> impl IntoResponse {
+    if !state.groups.exists(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "分组 {} 不存在",
+                name
+            ))),
+        )
+            .into_response();
+    }
+
+    // 1. 改名（先校验目标名再级联）
+    let mut current_name = name.clone();
+    if let Some(new_name) = payload.new_name.as_deref() {
+        let trimmed = new_name.trim();
+        if !trimmed.is_empty() && trimmed != name {
+            // GroupManager 内做唯一性 / 长度 / 空校验
+            match state.groups.rename(&name, trimmed) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    let code = if msg.contains("已存在") {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    return (
+                        code,
+                        Json(super::types::AdminErrorResponse::invalid_request(msg)),
+                    )
+                        .into_response();
+                }
+            }
+            // 级联：失败时尝试回滚分组改名（避免注册表与凭据 / Key 不一致）
+            let cred_res = state
+                .service
+                .token_manager()
+                .rename_credential_group(&name, trimmed);
+            if let Err(e) = cred_res {
+                let _ = state.groups.rename(trimmed, &name);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(super::types::AdminErrorResponse::internal_error(format!(
+                        "级联更新凭据失败: {}",
+                        e
+                    ))),
+                )
+                    .into_response();
+            }
+            state.client_keys.rename_group(&name, trimmed);
+            current_name = trimmed.to_string();
+        }
+    }
+
+    // 2. 改备注
+    if let Some(desc) = payload.description {
+        let desc_opt = if desc.trim().is_empty() {
+            None
+        } else {
+            Some(desc)
+        };
+        if let Err(e) = state.groups.update_description(&current_name, desc_opt) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+            )
+                .into_response();
+        }
+    }
+
+    let group = match state.groups.get(&current_name) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(
+                    "分组在更新过程中消失，状态异常",
+                )),
+            )
+                .into_response();
+        }
+    };
+    Json(group_to_item(&group, &state)).into_response()
+}
+
+/// DELETE /api/admin/groups/:name?force=true
+///
+/// 默认拒绝删除仍被引用的分组；带 `force=true` 时级联清理所有引用并删除。
+pub async fn delete_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Query(query): Query<super::types::DeleteGroupQuery>,
+) -> impl IntoResponse {
+    if !state.groups.exists(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "分组 {} 不存在",
+                name
+            ))),
+        )
+            .into_response();
+    }
+
+    let cred_count = state
+        .service
+        .token_manager()
+        .count_credentials_with_group(&name);
+    let key_count = state.client_keys.count_with_group(&name);
+
+    if (cred_count > 0 || key_count > 0) && !query.force {
+        return (
+            StatusCode::CONFLICT,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "分组仍被引用（凭据 {} / 客户端 Key {}），传 ?force=true 级联清理",
+                cred_count, key_count
+            ))),
+        )
+            .into_response();
+    }
+
+    if query.force {
+        if let Err(e) = state
+            .service
+            .token_manager()
+            .remove_credential_group(&name)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(format!(
+                    "级联清理凭据失败: {}",
+                    e
+                ))),
+            )
+                .into_response();
+        }
+        state.client_keys.clear_group(&name);
+    }
+
+    state.groups.delete(&name);
+    Json(super::types::SuccessResponse::new(format!(
+        "分组 {} 已删除",
+        name
+    )))
+    .into_response()
 }

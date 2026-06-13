@@ -49,6 +49,12 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 绑定的账号分组名（可选）
+    ///
+    /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
+    /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// 客户端 Key 管理器
@@ -140,7 +146,7 @@ impl ClientKeyManager {
     }
 
     /// 创建新 Key（生成明文随机串），返回新建条目
-    pub fn create(&self, name: String, description: Option<String>) -> ClientKey {
+    pub fn create(&self, name: String, description: Option<String>, group: Option<String>) -> ClientKey {
         let key = generate_client_key();
         let mut inner = self.inner.write();
         let id = inner.next_id;
@@ -159,6 +165,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            group: group.filter(|g| !g.trim().is_empty()),
         };
         inner.by_key.insert(key, id);
         inner.entries.insert(id, entry.clone());
@@ -201,6 +208,7 @@ impl ClientKeyManager {
         id: u64,
         name: Option<String>,
         description: Option<Option<String>>,
+        group: Option<Option<String>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -211,6 +219,9 @@ impl ClientKeyManager {
                 if let Some(d) = description {
                     e.description = d;
                 }
+                if let Some(g) = group {
+                    e.group = g.filter(|s| !s.trim().is_empty());
+                }
                 true
             }
             None => false,
@@ -219,6 +230,87 @@ impl ClientKeyManager {
             self.save_locked(&inner);
         }
         updated
+    }
+
+    /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
+    pub fn group_of(&self, id: u64) -> Option<String> {
+        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 列出所有当前被引用的分组名（仅去重，不带计数）。
+    pub fn used_group_names(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in inner.entries.values() {
+            if let Some(g) = &e.group {
+                set.insert(g.clone());
+            }
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    /// 统计指定分组被多少把 Key 绑定（用于分组管理页 / 删除前提示）。
+    pub fn count_with_group(&self, group: &str) -> usize {
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| e.group.as_deref() == Some(group))
+            .count()
+    }
+
+    /// 把所有引用 `old` 的 Key 的 group 字段改为 `new`（分组改名级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn rename_group(&self, old: &str, new: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(old) {
+                entry.group = Some(new.to_string());
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
+    /// 把所有引用 `name` 的 Key 的 group 字段清空（强删分组级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn clear_group(&self, name: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(name) {
+                entry.group = None;
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
+    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled。
+    /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
+    /// 命中且替换成功时返回新条目（含新明文）；id 不存在时返回 None。
+    pub fn rotate(&self, id: u64) -> Option<ClientKey> {
+        let new_key = generate_client_key();
+        let mut inner = self.inner.write();
+        // 取出旧条目并从 by_key 索引摘除
+        let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
+        inner.by_key.remove(&old_key);
+        // 写入新明文 + 索引
+        let entry = inner.entries.get_mut(&id)?;
+        entry.key = new_key.clone();
+        let snapshot = entry.clone();
+        inner.by_key.insert(new_key, id);
+        self.save_locked(&inner);
+        Some(snapshot)
     }
 
     /// 重置计数（保留 Key 与名称）
@@ -343,7 +435,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -353,7 +445,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -363,7 +455,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -378,5 +470,36 @@ mod tests {
     fn mask_format() {
         assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
+    }
+
+    #[test]
+    fn rotate_replaces_key_but_keeps_metadata_and_stats() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        // 累计一些统计
+        mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
+        let old_key = entry.key.clone();
+        let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
+        // 新 Key 与旧 Key 不同、且仍带前缀
+        assert_ne!(rotated.key, old_key);
+        assert!(rotated.key.starts_with(CLIENT_KEY_PREFIX));
+        // 元数据保留
+        assert_eq!(rotated.id, entry.id);
+        assert_eq!(rotated.name, "kb");
+        assert_eq!(rotated.description.as_deref(), Some("desc"));
+        assert_eq!(rotated.group.as_deref(), Some("groupA"));
+        // 统计保留
+        assert_eq!(rotated.total_input_tokens, 100);
+        assert_eq!(rotated.total_output_tokens, 50);
+        // 旧 Key 立即失效
+        assert_eq!(mgr.verify_and_touch(&old_key), None);
+        // 新 Key 命中
+        assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
+    }
+
+    #[test]
+    fn rotate_unknown_id_returns_none() {
+        let mgr = ClientKeyManager::new();
+        assert!(mgr.rotate(999).is_none());
     }
 }

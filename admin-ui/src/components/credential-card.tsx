@@ -464,6 +464,18 @@ export function CredentialCard({
                       .join(" · ")}
                   </Badge>
                 )}
+                {/* 账号所属分组 */}
+                {(credential.groups ?? []).map((g) => (
+                  <Badge key={g} variant="outline" title="账号分组">
+                    {g}
+                  </Badge>
+                ))}
+                {/* 账号来源渠道 */}
+                {credential.sourceChannel && (
+                  <Badge variant="outline" title="账号来源渠道">
+                    来源: {credential.sourceChannel}
+                  </Badge>
+                )}
               </div>
             </div>
             <Switch

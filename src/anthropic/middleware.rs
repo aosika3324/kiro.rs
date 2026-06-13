@@ -21,10 +21,12 @@ use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyContext {
     /// 命中的客户端 Key id；0 表示用 master apiKey 调用
     pub key_id: u64,
+    /// 该 Key 绑定的账号分组；None 表示未绑定（含 master apiKey），可使用全部账号
+    pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
 }
@@ -45,7 +47,7 @@ pub struct AppState {
     pub usage_recorder: Option<SharedRecorder>,
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
-    /// 中转层 prompt cache（基于 cache_control 断点的内存缓存）
+    /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
@@ -103,7 +105,7 @@ impl AppState {
         self
     }
 
-    /// 注入 CacheMeter
+    /// 注入缓存计量器
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
         self.cache_meter = cache;
         self
@@ -138,6 +140,7 @@ pub async fn auth_middleware(
     if auth::constant_time_eq(&presented, &master) {
         request.extensions_mut().insert(KeyContext {
             key_id: 0,
+            group: None,
             key_source: TraceKeySource::MasterApiKey,
         });
         return next.run(request).await;
@@ -146,8 +149,10 @@ pub async fn auth_middleware(
     // 2) 客户端 Key
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
+            let group = mgr.group_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
+                group,
                 key_source: TraceKeySource::ClientKey,
             });
             return next.run(request).await;
