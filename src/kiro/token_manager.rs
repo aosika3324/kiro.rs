@@ -5,17 +5,18 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
-use tokio::time::sleep;
+use tokio::time::timeout;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -908,6 +909,174 @@ struct CredentialEntry {
     throttled_until: Option<Instant>,
 }
 
+/// 单凭据的运行时并发状态。
+///
+/// Tokio `Semaphore` 没有固定容量概念，只有当前可用 permit 数；动态缩容到低于
+/// 当前在途数时，后续释放的 permit 必须被吞掉，否则容量会涨回旧值。因此这里显式
+/// 保存目标容量、在途数和待吞掉的释放数。
+struct CredentialRuntime {
+    semaphore: Arc<Semaphore>,
+    capacity: AtomicUsize,
+    in_flight: AtomicUsize,
+    shrink_debt: AtomicUsize,
+    resize_lock: Mutex<()>,
+}
+
+struct CredentialCandidate {
+    id: u64,
+    priority: u32,
+    success_count: u64,
+    capacity: usize,
+    in_flight: usize,
+    runtime: Arc<CredentialRuntime>,
+}
+
+impl CredentialCandidate {
+    fn load_per_mille(&self) -> usize {
+        self.in_flight.saturating_mul(1000) / self.capacity.max(1)
+    }
+}
+
+impl CredentialRuntime {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity: AtomicUsize::new(capacity),
+            in_flight: AtomicUsize::new(0),
+            shrink_debt: AtomicUsize::new(0),
+            resize_lock: Mutex::new(()),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Relaxed).max(1)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    fn try_acquire_lease(
+        self: &Arc<Self>,
+        credential_id: u64,
+        metrics: MetricsStore,
+    ) -> Result<CredentialLease, tokio::sync::TryAcquireError> {
+        let _guard = self.resize_lock.lock();
+        let permit = self.semaphore.clone().try_acquire_owned()?;
+        if self.shrink_debt.load(Ordering::Relaxed) > 0 {
+            self.shrink_debt.fetch_sub(1, Ordering::Relaxed);
+            permit.forget();
+            return Err(tokio::sync::TryAcquireError::NoPermits);
+        }
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let req_id = metrics
+            .lock()
+            .entry(credential_id)
+            .or_default()
+            .on_acquire();
+        Ok(CredentialLease {
+            permit: Some(permit),
+            runtime: self.clone(),
+            credential_id,
+            req_id,
+            metrics,
+        })
+    }
+
+    async fn acquire_lease(
+        self: Arc<Self>,
+        credential_id: u64,
+        metrics: MetricsStore,
+    ) -> Result<CredentialLease, tokio::sync::AcquireError> {
+        loop {
+            let permit = self.semaphore.clone().acquire_owned().await?;
+            // 在 resize_lock 内登记在途/指标，随后必须释放该 guard 才能把 self 移入 lease
+            // （guard 借用 self，move 与借用不能共存）。用块作用域显式收束 guard 生命周期。
+            let req_id = {
+                let _guard = self.resize_lock.lock();
+                if self.shrink_debt.load(Ordering::Relaxed) > 0 {
+                    self.shrink_debt.fetch_sub(1, Ordering::Relaxed);
+                    permit.forget();
+                    continue;
+                }
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .lock()
+                    .entry(credential_id)
+                    .or_default()
+                    .on_acquire()
+            };
+            return Ok(CredentialLease {
+                permit: Some(permit),
+                runtime: self,
+                credential_id,
+                req_id,
+                metrics,
+            });
+        }
+    }
+
+    fn set_capacity(&self, new_capacity: usize) {
+        let new_capacity = new_capacity.max(1);
+        let _guard = self.resize_lock.lock();
+        let old_capacity = self.capacity.swap(new_capacity, Ordering::Relaxed).max(1);
+
+        if new_capacity == old_capacity {
+            return;
+        }
+
+        if new_capacity > old_capacity {
+            let mut to_add = new_capacity - old_capacity;
+            let debt = self.shrink_debt.load(Ordering::Relaxed);
+            let cancel = debt.min(to_add);
+            if cancel > 0 {
+                self.shrink_debt.fetch_sub(cancel, Ordering::Relaxed);
+                to_add -= cancel;
+            }
+            if to_add > 0 {
+                self.semaphore.add_permits(to_add);
+            }
+            return;
+        }
+
+        let mut debt = old_capacity - new_capacity;
+        let removed_now = self.semaphore.forget_permits(debt);
+        debt -= removed_now;
+        if debt > 0 {
+            self.shrink_debt.fetch_add(debt, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 一个账号并发租约。释放时同步维护运行时在途数，并在动态缩容期间吞掉多余 permit。
+struct CredentialLease {
+    permit: Option<OwnedSemaphorePermit>,
+    runtime: Arc<CredentialRuntime>,
+    credential_id: u64,
+    req_id: u64,
+    metrics: MetricsStore,
+}
+
+impl Drop for CredentialLease {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let _guard = self.runtime.resize_lock.lock();
+        self.runtime.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if self.runtime.shrink_debt.load(Ordering::Relaxed) > 0 {
+            self.runtime.shrink_debt.fetch_sub(1, Ordering::Relaxed);
+            permit.forget();
+        } else {
+            drop(permit);
+        }
+        if let Some(m) = self.metrics.lock().get_mut(&self.credential_id) {
+            m.on_finish(self.req_id);
+        }
+    }
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -1051,8 +1220,8 @@ pub struct MultiTokenManager {
     /// 凭据文件写入锁。`persist_credentials` 用整文件覆写，并发调用会互相踩踏，
     /// 故用此锁串行化所有写盘操作（批量导入等场景会并发触发）。
     persist_lock: Mutex<()>,
-    /// 账号级并发租约。每个凭据最多持有配置数量的 permit，避免单账号无限并发。
-    credential_locks: Mutex<HashMap<u64, Arc<Semaphore>>>,
+    /// 账号级并发运行时状态。每个凭据最多持有配置数量的 lease，避免单账号无限并发。
+    credential_locks: Mutex<HashMap<u64, Arc<CredentialRuntime>>>,
     /// 是否为多凭据格式（数组格式才回写；通过 add_credential 动态升级为 true）
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
@@ -1138,20 +1307,7 @@ pub struct CallContext {
     /// 访问 Token
     pub token: String,
     /// 账号级并发租约；随上下文/响应生命周期释放。
-    _permit: OwnedSemaphorePermit,
-    /// 本次请求在指标表中的序号；Drop 时据此结算耗时并移除在途记录。
-    req_id: u64,
-    /// 指标表句柄（用于 Drop 时结算）
-    metrics: MetricsStore,
-}
-
-impl Drop for CallContext {
-    fn drop(&mut self) {
-        // 请求结束（permit 释放）时结算耗时 EWMA 并移除在途记录
-        if let Some(m) = self.metrics.lock().get_mut(&self.id) {
-            m.on_finish(self.req_id);
-        }
-    }
+    _permit: CredentialLease,
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1283,7 +1439,7 @@ impl MultiTokenManager {
                     .max_concurrency
                     .filter(|n| *n > 0)
                     .unwrap_or(account_max_concurrency);
-                (entry.id, Arc::new(Semaphore::new(cap)))
+                (entry.id, Arc::new(CredentialRuntime::new(cap)))
             })
             .collect();
 
@@ -1449,14 +1605,11 @@ impl MultiTokenManager {
         }
     }
 
-    fn lock_for_credential(&self, id: u64) -> Arc<Semaphore> {
-        // 首次创建用全局默认容量；凭据级覆盖由构造器与 set_credential_concurrency 权威设置，
-        // 不在此处锁 entries（ranked_available_credentials 持有 entries 时会调用本函数，
-        // 再锁 entries 会造成不可重入死锁）。
+    fn runtime_for_credential(&self, id: u64, capacity: usize) -> Arc<CredentialRuntime> {
         let mut locks = self.credential_locks.lock();
         locks
             .entry(id)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.config.account_max_concurrency.max(1))))
+            .or_insert_with(|| Arc::new(CredentialRuntime::new(capacity)))
             .clone()
     }
 
@@ -1473,12 +1626,6 @@ impl MultiTokenManager {
             .clone()
     }
 
-    /// 当前在途数 = 容量 - 可用 permit。容量由调用方传入（避免在持有 entries 锁时再锁 entries）。
-    fn in_flight_with_cap(&self, id: u64, capacity: usize) -> usize {
-        let available = self.lock_for_credential(id).available_permits();
-        capacity.saturating_sub(available)
-    }
-
     /// 某凭据的有效并发上限（直接由其 credentials 计算，不锁 entries）。
     fn cap_of(&self, c: &KiroCredentials) -> usize {
         c.max_concurrency
@@ -1486,61 +1633,92 @@ impl MultiTokenManager {
             .unwrap_or_else(|| self.config.account_max_concurrency.max(1))
     }
 
+    fn clone_credentials(&self, id: u64) -> Option<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
+    }
+
+    fn clone_available_credentials(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<KiroCredentials> {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| {
+                e.id == id
+                    && !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && credential_matches_request(&e.credentials, model, group)
+            })
+            .map(|e| e.credentials.clone())
+    }
+
     fn ranked_available_credentials(
         &self,
         model: Option<&str>,
         group: Option<&str>,
-    ) -> Vec<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+    ) -> Vec<CredentialCandidate> {
         let now = Instant::now();
         let mode = self.load_balancing_mode.lock().clone();
-        let mut available: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                !e.disabled
-                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                    && credential_matches_request(&e.credentials, model, group)
+        let available_entries: Vec<_> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
+                })
+                .map(|e| {
+                    let cap = self.cap_of(&e.credentials);
+                    (e.id, e.credentials.priority, e.success_count, cap)
+                })
+                .collect()
+        };
+
+        let mut available: Vec<_> = available_entries
+            .into_iter()
+            .map(|(id, priority, success_count, cap)| {
+                let runtime = self.runtime_for_credential(id, cap);
+                runtime.set_capacity(cap);
+                CredentialCandidate {
+                    id,
+                    priority,
+                    success_count,
+                    capacity: runtime.capacity(),
+                    in_flight: runtime.in_flight(),
+                    runtime,
+                }
             })
             .collect();
 
         if mode == "balanced" {
-            available.sort_by_key(|e| {
-                let cap = self.cap_of(&e.credentials);
-                (
-                    self.in_flight_with_cap(e.id, cap),
-                    e.success_count,
-                    e.credentials.priority,
-                    e.id,
-                )
-            });
+            available.sort_by_key(|e| (e.load_per_mille(), e.success_count, e.priority, e.id));
         } else {
-            available.sort_by_key(|e| {
-                let cap = self.cap_of(&e.credentials);
-                (
-                    self.in_flight_with_cap(e.id, cap),
-                    e.credentials.priority,
-                    e.id,
-                )
-            });
+            available.sort_by_key(|e| (e.load_per_mille(), e.priority, e.id));
         }
 
         available
-            .into_iter()
-            .map(|e| (e.id, e.credentials.clone()))
-            .collect()
     }
 
     async fn acquire_idle_permit(
         &self,
         model: Option<&str>,
         group: Option<&str>,
-    ) -> anyhow::Result<(u64, KiroCredentials, OwnedSemaphorePermit)> {
+    ) -> anyhow::Result<(u64, KiroCredentials, CredentialLease)> {
         let total = self.total_count_in_group(group).max(1);
         let wait_timeout = StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1));
         let started_at = Instant::now();
         let mut logged_busy_wait = false;
 
-        loop {
+        'acquire_loop: loop {
             let mut candidates = self.ranked_available_credentials(model, group);
 
             if candidates.is_empty() {
@@ -1569,17 +1747,25 @@ impl MultiTokenManager {
                 anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
             };
 
-            for (id, credentials) in &candidates {
-                let semaphore = self.lock_for_credential(*id);
-                match semaphore.try_acquire_owned() {
+            for candidate in &candidates {
+                match candidate
+                    .runtime
+                    .try_acquire_lease(candidate.id, self.metrics.clone())
+                {
                     Ok(permit) => {
-                        *self.current_id.lock() = *id;
-                        tracing::trace!("凭据 #{} 获取账号并发租约", id);
-                        return Ok((*id, credentials.clone(), permit));
+                        if let Some(credentials) =
+                            self.clone_available_credentials(candidate.id, model, group)
+                        {
+                            *self.current_id.lock() = candidate.id;
+                            tracing::trace!("凭据 #{} 获取账号并发租约", candidate.id);
+                            return Ok((candidate.id, credentials, permit));
+                        }
+                        drop(permit);
+                        continue 'acquire_loop;
                     }
                     Err(tokio::sync::TryAcquireError::NoPermits) => {}
                     Err(tokio::sync::TryAcquireError::Closed) => {
-                        anyhow::bail!("凭据 #{} 并发租约已关闭，无法获取账号", id);
+                        anyhow::bail!("凭据 #{} 并发租约已关闭，无法获取账号", candidate.id);
                     }
                 }
             }
@@ -1599,7 +1785,41 @@ impl MultiTokenManager {
                 );
                 logged_busy_wait = true;
             }
-            sleep((wait_timeout - elapsed).min(StdDuration::from_millis(50))).await;
+
+            let remaining = wait_timeout - elapsed;
+            let mut waiters = FuturesUnordered::new();
+            for candidate in candidates {
+                let runtime = candidate.runtime.clone();
+                let metrics = self.metrics.clone();
+                waiters.push(async move {
+                    (
+                        candidate.id,
+                        runtime.acquire_lease(candidate.id, metrics).await,
+                    )
+                });
+            }
+
+            match timeout(remaining, waiters.next()).await {
+                Ok(Some((id, Ok(permit)))) => {
+                    if let Some(credentials) = self.clone_available_credentials(id, model, group) {
+                        *self.current_id.lock() = id;
+                        tracing::trace!("凭据 #{} 获取账号并发租约", id);
+                        return Ok((id, credentials, permit));
+                    }
+                    drop(permit);
+                    continue;
+                }
+                Ok(Some((id, Err(_)))) => {
+                    anyhow::bail!("凭据 #{} 并发租约已关闭，无法获取账号", id);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    anyhow::bail!(
+                        "等待账号并发槽超时（{}s），所有匹配凭据都在忙",
+                        wait_timeout.as_secs()
+                    );
+                }
+            }
         }
     }
 
@@ -1696,7 +1916,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         credentials: &KiroCredentials,
-        permit: OwnedSemaphorePermit,
+        permit: CredentialLease,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1780,19 +2000,13 @@ impl MultiTokenManager {
         id: u64,
         credentials: KiroCredentials,
         token: String,
-        permit: OwnedSemaphorePermit,
+        permit: CredentialLease,
     ) -> CallContext {
-        let req_id = {
-            let mut m = self.metrics.lock();
-            m.entry(id).or_default().on_acquire()
-        };
         CallContext {
             id,
             credentials,
             token,
             _permit: permit,
-            req_id,
-            metrics: self.metrics.clone(),
         }
     }
 
@@ -2373,14 +2587,6 @@ impl MultiTokenManager {
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let global_conc = self.config.account_max_concurrency.max(1);
-        // 先于 entries 锁采集 semaphore 可用数与指标，避免锁顺序倒置
-        let avail_permits: HashMap<u64, usize> = {
-            let locks = self.credential_locks.lock();
-            locks
-                .iter()
-                .map(|(k, v)| (*k, v.available_permits()))
-                .collect()
-        };
         let metrics_map: HashMap<u64, (usize, Option<u64>, f64, f64, u64)> = {
             let m = self.metrics.lock();
             m.iter()
@@ -2484,15 +2690,7 @@ impl MultiTokenManager {
                         .filter(|n| *n > 0)
                         .unwrap_or(global_conc),
                     max_concurrency_override: e.credentials.max_concurrency.filter(|n| *n > 0),
-                    in_flight: {
-                        let cap = e
-                            .credentials
-                            .max_concurrency
-                            .filter(|n| *n > 0)
-                            .unwrap_or(global_conc);
-                        let avail = avail_permits.get(&e.id).copied().unwrap_or(cap);
-                        cap.saturating_sub(avail)
-                    },
+                    in_flight: metrics_map.get(&e.id).map(|m| m.0).unwrap_or(0),
                     oldest_in_flight_secs: metrics_map.get(&e.id).and_then(|m| m.1),
                     ewma_duration_ms: metrics_map
                         .get(&e.id)
@@ -2628,8 +2826,8 @@ impl MultiTokenManager {
     /// 设置单账号并发覆盖（Admin API）。
     ///
     /// `value = Some(n)`：该账号专属并发上限设为 n；`None`：清除覆盖，回退全局值。
-    /// 更新凭据字段并持久化，然后用新容量重建该账号的并发信号量——已持有的旧 permit
-    /// 仍绑定在旧信号量上、释放无副作用，新请求按新容量获取。
+    /// 更新凭据字段并持久化，然后原地调整该账号的运行时容量；缩容低于当前在途数时，
+    /// 已在途请求继续完成，释放出来的多余 permit 会被吞掉，直到实际容量降到目标值。
     pub fn set_credential_concurrency(&self, id: u64, value: Option<usize>) -> anyhow::Result<()> {
         let new_cap = {
             let mut entries = self.entries.lock();
@@ -2643,11 +2841,8 @@ impl MultiTokenManager {
                 .max_concurrency
                 .unwrap_or_else(|| self.config.account_max_concurrency.max(1))
         };
-        // 用新容量替换信号量
-        {
-            let mut locks = self.credential_locks.lock();
-            locks.insert(id, Arc::new(Semaphore::new(new_cap)));
-        }
+        self.runtime_for_credential(id, new_cap)
+            .set_capacity(new_cap);
         if let Err(e) = self.persist_credentials() {
             tracing::warn!("设置并发覆盖后持久化失败（已生效，仅未落盘）: {}", e);
         }
@@ -3237,6 +3432,13 @@ impl MultiTokenManager {
                 throttled_until: None,
             });
         }
+        {
+            let cap = self
+                .clone_credentials(new_id)
+                .map(|c| self.cap_of(&c))
+                .unwrap_or_else(|| self.config.account_max_concurrency.max(1));
+            self.runtime_for_credential(new_id, cap).set_capacity(cap);
+        }
 
         // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
         self.is_multiple_format.store(true, Ordering::Relaxed);
@@ -3430,6 +3632,10 @@ impl MultiTokenManager {
                 tracing::info!("所有凭据已删除，current_id 已重置为 0");
             }
         }
+
+        self.credential_locks.lock().remove(&id);
+        self.refresh_locks.lock().remove(&id);
+        self.metrics.lock().remove(&id);
 
         // 持久化更改
         self.persist_credentials()?;
@@ -4584,6 +4790,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn test_delete_credential_cleans_runtime_tables() {
+        let path = tmp_creds_path("delete_cleans_runtime_tables");
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.kiro_api_key = Some("ksk_delete_cleanup".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        cred.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.refresh_lock_for(1);
+        manager.metrics.lock().entry(1).or_default();
+        assert!(manager.credential_locks.lock().contains_key(&1));
+        assert!(manager.refresh_locks.lock().contains_key(&1));
+        assert!(manager.metrics.lock().contains_key(&1));
+
+        manager.delete_credential(1).unwrap();
+
+        assert!(!manager.credential_locks.lock().contains_key(&1));
+        assert!(!manager.refresh_locks.lock().contains_key(&1));
+        assert!(!manager.metrics.lock().contains_key(&1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── 并发去重（TOCTOU 回归守卫） ───────────────────────────────────────────
 
     /// 并发添加多个相同的 API Key 凭据，必须只插入一条。
@@ -4865,6 +5103,150 @@ mod tests {
         assert_eq!(
             third.id, 1,
             "both accounts have one request in flight, so priority order should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_ranks_by_load_ratio_not_absolute_in_flight() {
+        let mut small = grouped_cred("small", &["small"]);
+        small.max_concurrency = Some(2);
+        let mut large = grouped_cred("large", &["large"]);
+        large.max_concurrency = Some(20);
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![small, large], None, None, false)
+                .unwrap();
+
+        let a1 = manager.acquire_context(None, Some("small")).await.unwrap();
+        assert_eq!(a1.id, 1);
+        let a2 = manager.acquire_context(None, Some("small")).await.unwrap();
+        assert_eq!(a2.id, 1);
+
+        let mut large_contexts = Vec::new();
+        for _ in 0..5 {
+            let ctx = manager.acquire_context(None, Some("large")).await.unwrap();
+            assert_eq!(ctx.id, 2);
+            large_contexts.push(ctx);
+        }
+
+        let next = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            next.id, 2,
+            "small account is 2/2 busy while large is 5/20 busy, so load ratio should pick large"
+        );
+
+        drop(next);
+        drop(large_contexts);
+        drop(a2);
+        drop(a1);
+    }
+
+    #[tokio::test]
+    async fn test_set_credential_concurrency_shrinks_without_replacing_runtime() {
+        let mut cred = grouped_cred("a", &[]);
+        cred.max_concurrency = Some(3);
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let second = manager.acquire_context(None, None).await.unwrap();
+        let third = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight, 3);
+
+        manager.set_credential_concurrency(1, Some(1)).unwrap();
+        assert_eq!(manager.snapshot().entries[0].max_concurrency, 1);
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            3,
+            "shrinking capacity must not hide existing in-flight requests"
+        );
+
+        let manager_for_task = Arc::clone(&manager);
+        let handle =
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "new acquisitions must wait while in-flight requests exceed the shrunken cap"
+        );
+
+        drop(first);
+        drop(second);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "capacity debt should consume releases until in-flight falls below the new cap"
+        );
+
+        drop(third);
+        let acquired = handle.await.unwrap().unwrap();
+        assert_eq!(acquired.id, 1);
+        drop(acquired);
+    }
+
+    /// 高并发回归守卫:断言"实测同时在途从不超过 cap",包含运行中动态扩缩竞态。
+    /// 守护 A2(信号量不替换 + shrink_debt)/A3(在途单一权威计数)/C(无死锁) 的安全不变式——
+    /// 旧版"替换信号量"缺陷在此场景会让 peak 冲到 old_inflight+new_cap=6 而被本测试捕获。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_in_flight_never_exceeds_cap_under_load_and_shrink() {
+        let mut cred = grouped_cred("a", &[]);
+        cred.max_concurrency = Some(4);
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+
+        // 全局观测到的最大同时在途数
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+
+        // 中途把 cap 从 4 缩到 2,再扩回 3,持续制造扩缩竞态
+        {
+            let m = Arc::clone(&manager);
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    let _ = m.set_credential_concurrency(1, Some(2));
+                    tokio::time::sleep(StdDuration::from_millis(3)).await;
+                    let _ = m.set_credential_concurrency(1, Some(4));
+                    tokio::time::sleep(StdDuration::from_millis(3)).await;
+                    let _ = m.set_credential_concurrency(1, Some(3));
+                    tokio::time::sleep(StdDuration::from_millis(3)).await;
+                }
+            });
+        }
+
+        let mut tasks = Vec::new();
+        for _ in 0..200 {
+            let m = Arc::clone(&manager);
+            let max_seen = Arc::clone(&max_seen);
+            let live = Arc::clone(&live);
+            tasks.push(tokio::spawn(async move {
+                let ctx = m.acquire_context(None, None).await.unwrap();
+                // 进入临界区:当前真实在途 = live+1。断言不超过 acquire 当下的 cap。
+                let now_live = live.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now_live, Ordering::SeqCst);
+                // 持有一小段时间模拟请求
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+                live.fetch_sub(1, Ordering::SeqCst);
+                drop(ctx);
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // cap 全程在 [2,4] 波动,实测同时在途绝不应超过历史最大 cap=4。
+        let peak = max_seen.load(Ordering::SeqCst);
+        assert!(
+            peak <= 4,
+            "observed concurrency {peak} exceeded max cap 4 — over-subscription bug"
+        );
+        // 收尾:所有租约释放后,在途必须归零(计数无泄漏)
+        assert_eq!(live.load(Ordering::SeqCst), 0, "live counter leaked");
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            0,
+            "runtime in_flight leaked after all leases dropped"
         );
     }
 

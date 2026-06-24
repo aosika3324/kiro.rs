@@ -181,9 +181,102 @@ let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
 
 ---
 
+## 问题 C：高并发下凭据调度「喂不满」所有账号（性能瓶颈）
+
+### 现象
+
+高并发时无法充分利用所有凭据的合并并发容量，吞吐随并发上升而恶化（CPU 浪费 + 延迟
+抬高），即使账号还有空闲 slot 也喂不满。
+
+### 先纠正一个措辞
+
+当前其实**不是 round-robin**。`current_id`（`src/kiro/token_manager.rs:1040`）只是
+「最后选中」的记录（给故障转移 / Admin 展示用，写入点 `:1576`），**不限制选择**。真正
+的选择是 `ranked_available_credentials` 按「最少在途」排序后取第一个能拿到 permit 的。
+所以系统**能**用到所有凭据，瓶颈不在 round-robin 本身，而在**等待机制是 50ms 轮询
+（poll），不是信号量异步唤醒**，外加排序热路径持有全局锁 + 全量克隆。
+
+### 热路径（`acquire_idle_permit`，`src/kiro/token_manager.rs:1558-1602`）
+
+```rust
+loop {
+    let mut candidates = self.ranked_available_credentials(model, group); // ① 重量级
+    ...
+    for (id, credentials) in &candidates {
+        match self.lock_for_credential(*id).try_acquire_owned() {  // ② 仅 try，非阻塞
+            Ok(permit) => return ...,
+            Err(NoPermits) => {}   // 满了就跳过
+        }
+    }
+    ...
+    sleep(... .min(50ms)).await;  // ③ 全满 → 睡 50ms 再重来
+}
+```
+
+三处代价，每个并发请求都在跑，全满时**每 50ms 重跑一遍**：
+
+**① `ranked_available_credentials` 是序列化热点**
+（`src/kiro/token_manager.rs:1496-1546`）：
+- 全程持有全局 `entries: Mutex<Vec<_>>`。**所有** acquire / report_success /
+  report_failure / snapshot 都抢这把锁（`:2109`、`:2402` 等）。
+- 持锁期间对 N 个凭据 filter + `sort_by_key`，key 函数里每个凭据都
+  `lock_for_credential(id)` 锁一次 `credential_locks`（N 次嵌套加锁）。
+- 最后 `.map(|e| (e.id, e.credentials.clone()))` —— 把每个候选的完整 `KiroCredentials`
+  克隆一遍，该结构 **49 个字段、十几个 `Option<String>`**（含 token / profile_arn 等
+  长串）。N 个账号克隆 N 份，真正只用到 1 份。
+
+**② 只用 `try_acquire_owned()`，没有 `semaphore.acquire().await`**：permit 释放时不会
+唤醒等待者。
+
+**③ 全满 → `sleep(50ms)`**（`src/kiro/token_manager.rs:1602`）：under-utilization 的
+直接原因。
+
+### 为什么高并发下「喂不满」
+
+两个叠加效应：
+
+1. **释放到再利用之间最多 50ms 空窗**：总并发逼近所有账号容量之和时，某 slot 释放后
+   等待者要等下一次 poll（≤50ms）才抢得到，这段时间该 slot 闲置。设单账号 cap=C、
+   请求耗时 L，理论吞吐 ∝ C/L；每个 slot 每轮多出 ≤50ms 空转，有效吞吐被拉低。L 越短
+   （短请求）、并发越高，50ms 占比越大，损失越严重。
+2. **惊群 + 同序**：所有等待者醒来看到同一份排序快照，都从同一个「最少在途」账号开始
+   try，只有 cap 个成功、其余全 `NoPermits` 落空，然后一起重跑①那套加锁 + 克隆。CPU
+   浪费在失败 try 和重复 ranking 上，`entries` 锁争用进一步放大。叠加问题 A1（按绝对
+   在途数排序），小 cap 账号被排在前面反复试满，惊群更集中。
+
+### 结论
+
+系统**能**用到所有凭据（不是硬卡在一个），但在「接近总容量」时，50ms poll 空窗 +
+惊群重排 + 全局锁争用，使其**无法把所有账号的合并容量真正吃满**，CPU / 延迟随并发恶化。
+
+### 建议修复（按收益）
+
+1. **用真正的异步等待替代 poll**（治本，消除 50ms 空窗 + 惊群）：为 ranked 候选各取一个
+   `Arc<Semaphore>::acquire_owned()` future，用 `futures::future::select_all` /
+   `FuturesUnordered` 取**最先释放**的那个 → permit 一释放立即交接，零空窗，也不需要
+   全员重跑 ranking。带超时用 `tokio::time::timeout` 包一层。
+2. **缩短 `entries` 锁临界区 + 去克隆**：持锁时只摘出轻量快照
+   `(id, priority, success_count, cap, in_flight)` 到小 Vec，立刻 drop 锁，再排序；选中后
+   才 clone 那**一份**凭据（或把 `credentials` 包成 `Arc<KiroCredentials>`，clone 变成
+   原子加 1）。
+3. **把 `Arc<Semaphore>` 直接存进 `CredentialEntry`**：排序时读 `available_permits()`
+   不必再去 `credential_locks` HashMap 锁一次。顺带解决 A2 / A3 里两套计数脱节的问题
+   （信号量成为唯一权威）。
+
+1 + 2 组合可把这条路径从「每请求 O(N) 克隆 + 加锁 + 50ms 轮询」降到「一次轻量快照 +
+事件驱动唤醒」。
+
+> 注：问题 C 与问题 A 是同一条热路径（`ranked_available_credentials` /
+> `acquire_idle_permit`）。若决定动手，A1 / A2 / A3 与 C 宜一并重构。
+
+---
+
 ## 想请教的问题
 
 1. 问题 A 的 **A1**（排序改负载率）与 **A2**（信号量不替换、改增量调整）诊断是否成立？
    修复方向有无更稳妥的做法？
 2. 问题 B 中「优先信任上游百分比、丢弃本地真实计数」是否就是 auto-compact 不触发的
    根因？建议修复 #1（取 `max`）会不会带来 usage 口径 / 计费上的副作用？
+3. 问题 C 的瓶颈定位（50ms poll 空窗 + 惊群 + 全局锁持锁排序 + 全量克隆）是否成立？
+   用 `select_all` / `FuturesUnordered` 做事件驱动唤醒是否是高并发下最稳妥的方案，
+   还是有更适合「N 个信号量取最先可用」语义的并发原语 / 模式？

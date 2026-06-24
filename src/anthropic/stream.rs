@@ -1101,10 +1101,19 @@ pub struct StreamContext {
 impl StreamContext {
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// total 真值取 `max(contextUsage 折算值, 本地 input_tokens)`，再由
+    /// [`CacheUsage::split_against_total`] 做互斥分摊。
+    ///
+    /// 取 max 而非直接信任上游：contextUsage 是上游按百分比×窗口折算的估算值，
+    /// 取整/低估时会盖过本地 count_all_tokens 的真实转发量，导致上报 input_tokens
+    /// 长期偏低、客户端永不触发 auto-compact。max 保证上报量不低于本地真值，从而
+    /// 正确驱动客户端压缩。仅影响上报口径与 cache split 展示，不动真实计费
+    /// （计费 credits 独立来自上游 metering.usage 事件）。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let total_real = self
+            .context_input_tokens
+            .map(|c| c.max(self.input_tokens))
+            .unwrap_or(self.input_tokens);
         self.cache_usage.split_against_total(total_real)
     }
     /// 创建 StreamContext
@@ -4540,5 +4549,30 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
+    }
+
+    /// resolved_usage 取 max(本地真值, 上游折算值)，不让上游低估盖过本地真实转发量。
+    /// 默认 CacheUsage 无缓存覆盖，split_against_total 全量计入 input，故 .0 == total_real。
+    #[test]
+    fn resolved_usage_takes_max_of_local_and_upstream() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            120_000, // 本地 count_all_tokens 真值（大）
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+
+        // 上游 contextUsage 折算偏低：不得盖过本地真值。
+        ctx.context_input_tokens = Some(90_000);
+        assert_eq!(ctx.resolved_usage().0, 120_000, "上游低估时取本地真值");
+
+        // 上游折算更大：取上游。
+        ctx.context_input_tokens = Some(150_000);
+        assert_eq!(ctx.resolved_usage().0, 150_000, "上游更大时取上游");
+
+        // 无上游信号：回退到本地 input_tokens。
+        ctx.context_input_tokens = None;
+        assert_eq!(ctx.resolved_usage().0, 120_000, "None 回退本地 fallback");
     }
 }

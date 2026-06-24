@@ -362,11 +362,18 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 }
 
 /// 计算 Anthropic usage 口径的 input_tokens
+///
+/// 取 `max(contextUsage 折算值, 本地 fallback)`：contextUsage 是上游按百分比×窗口
+/// 折算的估算值，低估时会盖过本地真实转发量，导致上报 input_tokens 偏低、客户端
+/// 永不触发 auto-compact。max 保证上报量不低于本地真值，正确驱动客户端压缩。
+/// 仅影响上报口径，不动真实计费。
 fn resolve_usage_input_tokens(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
 ) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+    context_total_input_tokens
+        .map(|c| c.max(fallback_total_input_tokens))
+        .unwrap_or(fallback_total_input_tokens)
 }
 
 fn compute_cache_usage_for_key(
@@ -1917,5 +1924,17 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    /// resolve_usage_input_tokens 取 max(本地 fallback, 上游折算值)，
+    /// 不让上游低估盖过本地真实转发量，从而正确驱动客户端 auto-compact。
+    #[test]
+    fn resolve_usage_input_tokens_takes_max() {
+        // 上游折算偏低：取本地 fallback。
+        assert_eq!(resolve_usage_input_tokens(120_000, Some(90_000)), 120_000);
+        // 上游折算更大：取上游。
+        assert_eq!(resolve_usage_input_tokens(120_000, Some(150_000)), 150_000);
+        // 无上游信号：回退本地 fallback。
+        assert_eq!(resolve_usage_input_tokens(120_000, None), 120_000);
     }
 }

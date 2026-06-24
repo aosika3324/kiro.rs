@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.11] - 2026-06-24
+
+主题：**多账号调度热路径重构 + 客户端 auto-compact 修复**。针对凭据级并发上限引入后暴露的调度正确性问题(排序误判、信号量替换导致瞬时超额、在途计数脱节)与高并发下"喂不满所有账号"的性能瓶颈做了一次内聚重构;同时修复经客户端(如 Claude Code)使用时上下文不自动压缩、越用越慢的问题。
+
+### 🐛 修复 — 调度正确性
+
+- **按负载率而非绝对在途数排序**:候选凭据排序主键改为负载率 `in_flight * 1000 / cap`(整数千分比),不同账号 cap 不一致时不再误把已打满的小账号排在低负载大账号之前。`balanced` 模式下 `success_count` 退为次级 tiebreaker(它仅在请求完成后 +1,流式请求期间陈旧,不应作主键)。
+- **动态调整并发不再替换信号量**:`set_credential_concurrency` 改为在固定信号量上增量调整——扩容 `add_permits`、缩容 `forget_permits` + `shrink_debt`(不足吞的额度由后续释放/获取逐步 forget)。消除原"整体替换信号量"导致的瞬时突破上限(旧在途仍持旧信号量 permit + 新信号量从满额开始)与在途瞬间被低估。
+- **在途计数单一权威**:在途数改用独立 `AtomicUsize`(获取 permit 即 +1、`CredentialLease` Drop 即 -1),不再用 `cap − available_permits` 反推;登记时机前移到拿到 permit 那一刻(早于 token 刷新),消除刷新窗口内"信号量已占但在途未登记"的脱节。snapshot 的 `inFlight` 与 `oldestInFlightSecs` 统一同源,不再自相矛盾。
+- **凭据删除清理运行时表**:`delete_credential` 现清理 `credential_locks`/`refresh_locks`/`metrics` 三张表,避免长期增删账号导致无界增长。
+
+### ⚡ 优化 — 高并发调度性能
+
+- **事件驱动唤醒替代 50ms 轮询**:`acquire_idle_permit` 先按 ranked 顺序非阻塞 `try_acquire`,全满时改用 `FuturesUnordered` 对候选信号量各取一个 `acquire_owned().await`、取最先释放者——permit 一释放立即交接,消除最高 50ms 的空窗;复用 tokio Semaphore 自带 FIFO 等待队列,每释放一个 permit 只唤醒一个等待者,消除惊群。
+- **缩短锁临界区 + 去全量克隆**:排序时持 `entries` 锁仅摘取轻量元组 `(id, priority, success_count, cap)` 即释放锁,再排序;仅对最终选中的一份凭据 `clone`,不再每候选克隆完整 `KiroCredentials`(49 字段)。
+
+### 🐛 修复 — 客户端 auto-compact 不触发
+
+- 回报给客户端的 `usage.input_tokens` 改为取**上游 contextUsage 折算值与本地真实计数的较大值**(`resolved_usage` / `resolve_usage_input_tokens` 两处),不让上游低估盖过本地真实转发量,使客户端能正确逼近压缩阈值、触发 auto-compact。该改动仅影响上报口径,不影响真实计费(credits 独立来自上游 metering 事件)。
+
+### ✅ 测试
+
+- 新增:负载率排序(非绝对在途)断言、缩容期间不替换信号量且不突破上限、单账号占满时等待者被事件唤醒、删除凭据清理运行时表、usage 取 max 三情形。
+- 新增高并发回归守卫 `stress_in_flight_never_exceeds_cap_under_load_and_shrink`:200 并发 + 运行中 cap 2↔4 扩缩竞态下,实测同时在途从不超过历史最大 cap、无计数泄漏、无死锁(连跑 10 次稳定)。
+
 ## [0.6.10] - 2026-06-24
 
 主题：**账号卡片调度可观测性 + 单账号并发覆盖**。账号卡片新增"调度"信息面板，实时展示每账号的当前在途并发(N/上限)、近期错误率、耗时 EWMA、最老在途请求年龄、累计调度次数，方便直观判断各账号的调度负载与健康度；并支持给单个账号设置独立于全局的并发上限（点击"当前并发"的上限数字即可编辑，留空回退全局值）。
