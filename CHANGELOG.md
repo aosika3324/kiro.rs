@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.12] - 2026-06-24
+
+主题：**连接复用修复 + 长上下文耗时可观测性 + 并发监控视图**。修复了一个废掉连接池的遗留头、新增定位"慢在传输/排队/prefill/输出"的 trace 诊断字段,并把账号卡片的实时调度信息独立成专门的「监控」视图。
+
+### 🐛 修复 — 上游连接无法复用(性能遗留)
+
+- 移除发往上游所有请求的 `Connection: close` 头(`provider.rs` 主 API/MCP、`token_manager.rs` 的 token 刷新/balance/profile 等 8 处)。此前 `http_client` 已配置连接池(`pool_idle_timeout=90s`、`pool_max_idle_per_host=8`)并按账号缓存 client,但每个请求强制 `Connection: close`,使连接池完全失效——每次请求都重做 TCP+TLS 握手。移除后空闲连接得以复用,降低握手开销与首字节延迟,并解锁潜在 HTTP/2 协商。保留 `social.rs` OAuth 本地回调响应的 `Connection: close`(那是回给浏览器的本地响应,非上游)。
+
+### ✨ 新功能 — 长上下文耗时可观测性
+
+- trace 新增 3 个诊断字段:`requestBytes`(实际转发上游的 Kiro wire body 字节数)、`localInputTokens`(本地 `count_all_tokens` 真值)、`contextInputTokens`(上游 contextUsage 折算值)。配合已有的 `firstTokenMs` / `durationMs` / 每跳 endpoint / 重试次数,可定位单请求慢在传输、排队、模型 prefill 还是输出生成。
+- trace_db schema 幂等迁移(老库自动补列)。前端 trace 日志展开行新增「诊断指标」面板。
+
+### ✨ 新功能 — 并发监控视图 + 凭证卡片精简
+
+- 凭据页新增第三个视图「监控」(卡片/列表之外):紧凑网格,按 活跃(在途多者优先) → 冷却 → 空闲 → 禁用 排序,展示每账号实时在途/上限 + 负载进度条、状态点、近期错误率、平均耗时,顶部汇总总在途/合并容量/整体负载/活跃账号。监控视图下轮询从 30s 缩短到 3s(切走自动恢复),近实时反映调度。
+- 单账号并发上限覆盖控件移到监控视图(点上限数字即可编辑)。
+- 凭证卡片移除 v0.6.10 的「调度」面板(在途/错误率/耗时/总调度/最老在途),回归基础管理职责:身份、优先级、失败/成功计数、最后调用、余额(积分实时变动保留)、操作。监控与管理分离。
+
+### ✅ 测试
+
+- 新增 `diagnostics_fields_roundtrip`:验证 3 个诊断字段经 schema + insert + read 往返保真。全套 445 测试通过。
+
 ## [0.6.11] - 2026-06-24
 
 主题：**多账号调度热路径重构 + 客户端 auto-compact 修复**。针对凭据级并发上限引入后暴露的调度正确性问题(排序误判、信号量替换导致瞬时超额、在途计数脱节)与高并发下"喂不满所有账号"的性能瓶颈做了一次内聚重构;同时修复经客户端(如 Claude Code)使用时上下文不自动压缩、越用越慢的问题。

@@ -130,6 +130,10 @@ pub(crate) struct RequestTracer {
     model: String,
     is_stream: bool,
     started_at: Instant,
+    /// 实际转发上游的请求体字节数（Kiro wire body）
+    request_bytes: u64,
+    /// 本地 count_all_tokens 估算输入 token
+    local_input_tokens: u64,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
@@ -143,6 +147,8 @@ pub(crate) struct TraceUsage {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    /// 上游 contextUsage 折算 token（无 contextUsageEvent 时为 None）
+    pub context_input_tokens: Option<u64>,
 }
 
 impl TraceUsage {
@@ -156,6 +162,8 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    request_bytes: u64,
+    local_input_tokens: u64,
 }
 
 impl RequestTracer {
@@ -169,6 +177,8 @@ impl RequestTracer {
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
+            request_bytes: options.request_bytes,
+            local_input_tokens: options.local_input_tokens,
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
         }
@@ -219,6 +229,9 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            request_bytes: self.request_bytes,
+            local_input_tokens: self.local_input_tokens,
+            context_input_tokens: usage.context_input_tokens,
             attempts,
         };
         store.insert(&rec);
@@ -727,6 +740,8 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                request_bytes: request_body.len() as u64,
+                local_input_tokens: total_input_tokens.max(0) as u64,
             },
         ));
         handle_stream_request(
@@ -752,6 +767,8 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                request_bytes: request_body.len() as u64,
+                local_input_tokens: total_input_tokens.max(0) as u64,
             },
         ));
         handle_non_stream_request(
@@ -984,6 +1001,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         } else {
             0.0
         },
+        context_input_tokens: ctx.context_input_tokens.map(|v| v.max(0) as u64),
     }
 }
 
@@ -1237,6 +1255,7 @@ async fn handle_non_stream_request(
             } else {
                 0.0
             },
+            context_input_tokens: context_input_tokens.map(|v| v.max(0) as u64),
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1522,6 +1541,8 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                request_bytes: request_body.len() as u64,
+                local_input_tokens: total_input_tokens.max(0) as u64,
             },
         ));
         handle_stream_request_buffered(
@@ -1547,6 +1568,8 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                request_bytes: request_body.len() as u64,
+                local_input_tokens: total_input_tokens.max(0) as u64,
             },
         ));
         handle_non_stream_request(
@@ -1717,6 +1740,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        context_input_tokens: ctx.context_input_tokens().map(|v| v.max(0) as u64),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -1741,6 +1765,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        context_input_tokens: ctx.context_input_tokens().map(|v| v.max(0) as u64),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

@@ -2280,6 +2280,11 @@ impl BufferedStreamContext {
             self.inner.credits,
         )
     }
+
+    /// 上游 contextUsage 折算的输入 token（无 contextUsageEvent 时为 None），用于 trace 落库。
+    pub fn context_input_tokens(&self) -> Option<i32> {
+        self.inner.context_input_tokens
+    }
 }
 
 /// 简单的 token 估算（中英文字符混合）

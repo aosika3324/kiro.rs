@@ -113,6 +113,13 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
+/** 字节格式化（KB/MB） */
+function formatBytes(n: number): string {
+  if (n >= 1_048_576) return (n / 1_048_576).toFixed(2) + ' MB'
+  if (n >= 1_024) return (n / 1_024).toFixed(1) + ' KB'
+  return `${n} B`
+}
+
 /** 千位分隔的完整数值（用于明细悬浮框） */
 function formatTokenFull(n: number): string {
   return n.toLocaleString('en-US')
@@ -302,6 +309,16 @@ function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   )
 }
 
+/** 单条诊断指标小块 */
+function DiagStat({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="flex flex-col gap-0.5" title={hint}>
+      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="font-semibold tabular-nums">{value}</span>
+    </div>
+  )
+}
+
 /** 展开后的链路详情：错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
@@ -316,6 +333,13 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
           中断前已发送 {rec.interruptedAfterBytes} 字节
         </div>
       )}
+      {/* 诊断指标：定位慢在传输 / 排队 / prefill / 输出 */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 rounded-lg border border-border/50 bg-background/40 p-3 text-[12px] sm:grid-cols-4">
+        <DiagStat label="请求体大小" value={rec.requestBytes != null ? formatBytes(rec.requestBytes) : '—'} hint="实际转发上游的 Kiro wire body" />
+        <DiagStat label="本地估算 token" value={rec.localInputTokens != null ? formatTokens(rec.localInputTokens) : '—'} hint="count_all_tokens，真实转发量口径" />
+        <DiagStat label="上游折算 token" value={rec.contextInputTokens != null ? formatTokens(rec.contextInputTokens) : '—'} hint="上游 contextUsage 折算；无 event 时为空" />
+        <DiagStat label="首Token / 总耗时" value={`${rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'} / ${formatDuration(rec.durationMs)}`} hint="首字节慢=prefill 主导；尾段慢=输出生成" />
+      </div>
       <div className="text-[12px] font-medium text-muted-foreground">
         尝试链路（{rec.attempts.length} 次
         {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）

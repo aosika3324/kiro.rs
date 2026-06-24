@@ -532,6 +532,12 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 实际转发上游的请求体字节数（Kiro wire body） */
+  requestBytes?: number
+  /** 本地 count_all_tokens 估算输入 token */
+  localInputTokens?: number
+  /** 上游 contextUsage 折算输入 token（无 contextUsageEvent 时为 null） */
+  contextInputTokens?: number | null
   attempts: TraceAttempt[]
 }
 

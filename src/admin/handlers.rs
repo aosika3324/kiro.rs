@@ -1468,6 +1468,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "requestBytes": r.request_bytes,
+                "localInputTokens": r.local_input_tokens,
+                "contextInputTokens": r.context_input_tokens,
                 "attempts": attempts,
             })
         })

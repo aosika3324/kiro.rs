@@ -194,7 +194,6 @@ async fn refresh_social_token(
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -291,7 +290,6 @@ async fn refresh_idc_token(
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -386,7 +384,6 @@ async fn refresh_external_idp_token(
         .post(token_endpoint)
         .header("accept", "application/json")
         .header("content-type", "application/x-www-form-urlencoded")
-        .header("Connection", "close")
         .form(&form)
         .send()
         .await?;
@@ -511,8 +508,7 @@ pub(crate) async fn get_usage_limits(
             .header("host", &host)
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
+            .header("Authorization", format!("Bearer {}", token));
 
         if is_external_idp {
             request = request.header("TokenType", "EXTERNAL_IDP");
@@ -615,8 +611,7 @@ pub(crate) async fn get_available_models(
             .header("host", &host)
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
+            .header("Authorization", format!("Bearer {}", token));
 
         if is_external_idp {
             request = request.header("TokenType", "EXTERNAL_IDP");
@@ -714,7 +709,6 @@ pub(crate) async fn list_available_profiles(
                 .header("amz-sdk-request", "attempt=1; max=1")
                 .header("Authorization", format!("Bearer {}", token))
                 .header("TokenType", "EXTERNAL_IDP")
-                .header("Connection", "close")
                 .body(r#"{"maxResults":10}"#)
         } else {
             let host = format!("q.{}.amazonaws.com", region);
@@ -732,7 +726,6 @@ pub(crate) async fn list_available_profiles(
                 .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=1")
                 .header("Authorization", format!("Bearer {}", token))
-                .header("Connection", "close")
                 .body(r#"{"maxResults":10}"#);
             if credentials.is_api_key_credential() {
                 req = req.header("tokentype", "API_KEY");
@@ -831,7 +824,6 @@ pub(crate) async fn set_user_preference(
             .header("amz-sdk-request", "attempt=1; max=1")
             .header("Authorization", format!("Bearer {}", token))
             .header("content-type", "application/json")
-            .header("Connection", "close")
             .json(&body);
 
         if is_external_idp {

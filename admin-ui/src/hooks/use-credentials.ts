@@ -25,11 +25,12 @@ import {
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
 // 查询凭据列表
-export function useCredentials() {
+// refetchInterval 可覆盖默认 30s；监控视图下传更短间隔（如 3s）以近实时展示在途并发。
+export function useCredentials(refetchInterval: number = 30000) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval,
   })
 }
 

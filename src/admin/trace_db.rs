@@ -125,6 +125,17 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 实际转发给上游的请求体字节数（Kiro wire body，含完整对话历史）。
+    /// 用于定位"慢在传输 vs 模型 prefill"：bytes 大但 first_token 慢 → prefill 主导。
+    #[serde(default)]
+    pub request_bytes: u64,
+    /// 本地 count_all_tokens 估算的输入 token（随对话单调增长的真实转发量口径）。
+    #[serde(default)]
+    pub local_input_tokens: u64,
+    /// 上游 contextUsage 百分比折算的输入 token（仅上游下发 contextUsageEvent 时有值）。
+    /// 与 local_input_tokens 对比可看出上游自报口径与本地真值的差异。
+    #[serde(default)]
+    pub context_input_tokens: Option<u64>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -256,7 +267,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 7] = [
+        let columns: [(&str, &str); 10] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -264,6 +275,9 @@ impl TraceStore {
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("request_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("local_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("context_input_tokens", "INTEGER"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -325,8 +339,8 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 credits, first_token_ms, request_bytes, local_input_tokens, context_input_tokens) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -348,6 +362,9 @@ impl TraceStore {
                     rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
+                    rec.request_bytes as i64,
+                    rec.local_input_tokens as i64,
+                    rec.context_input_tokens.map(|v| v as i64),
                 ],
             )?;
             for a in &rec.attempts {
@@ -478,7 +495,8 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
+             request_bytes, local_input_tokens, context_input_tokens \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -505,6 +523,9 @@ impl TraceStore {
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                request_bytes: row.get::<_, i64>(19)? as u64,
+                local_input_tokens: row.get::<_, i64>(20)? as u64,
+                context_input_tokens: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;
@@ -681,7 +702,10 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
-    first_token_ms    INTEGER
+    first_token_ms    INTEGER,
+    request_bytes        INTEGER NOT NULL DEFAULT 0,
+    local_input_tokens   INTEGER NOT NULL DEFAULT 0,
+    context_input_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -741,6 +765,9 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            request_bytes: 0,
+            local_input_tokens: 0,
+            context_input_tokens: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -801,6 +828,34 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn diagnostics_fields_roundtrip() {
+        // 新增可观测性字段（request_bytes / local_input_tokens / context_input_tokens）
+        // 经 schema + insert + read 往返后必须保真。
+        let store = mem_store();
+        let mut rec = sample(TraceSample {
+            trace_id: "diag1",
+            status: "success",
+            credential_id: 3,
+            model: "claude-opus-4-8",
+        });
+        rec.request_bytes = 204_800;
+        rec.local_input_tokens = 198_000;
+        rec.context_input_tokens = Some(165_000);
+        rec.first_token_ms = Some(8_300);
+        store.insert(&rec);
+
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].request_bytes, 204_800);
+        assert_eq!(out[0].local_input_tokens, 198_000);
+        assert_eq!(out[0].context_input_tokens, Some(165_000));
+        assert_eq!(out[0].first_token_ms, Some(8_300));
     }
 
     #[test]

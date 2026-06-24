@@ -32,6 +32,7 @@ import {
   ChevronDown,
   LayoutGrid,
   List,
+  Gauge,
   Search,
   X,
 } from "lucide-react";
@@ -72,6 +73,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard } from "@/components/credential-card";
+import { ConcurrencyMonitor } from "@/components/concurrency-monitor";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -232,7 +234,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
 
   const queryClient = useQueryClient();
-  const { data, isLoading, error, refetch } = useCredentials();
+  // 监控视图需要近实时数据，缩短轮询到 3s；其余视图维持 30s。
+  const { data, isLoading, error, refetch } = useCredentials(
+    viewMode === "monitor" ? 3000 : 30000,
+  );
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
@@ -1489,6 +1494,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <List className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">列表</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => changeViewMode("monitor")}
+                  aria-pressed={viewMode === "monitor"}
+                  title="并发监控视图"
+                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                    viewMode === "monitor"
+                      ? "bg-background text-foreground shadow-apple-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Gauge className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">监控</span>
+                </button>
               </div>
             </div>
 
@@ -1744,6 +1763,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
+        ) : viewMode === "monitor" ? (
+          <ConcurrencyMonitor credentials={filteredCredentials} />
         ) : (
           <>
             <DndContext
