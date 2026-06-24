@@ -297,6 +297,7 @@ Admin API 鉴权同样支持：
 | `accountAcquireTimeoutSecs` | `30` | 所有匹配凭据并发槽都满时，请求排队等待槽位的最长秒数；超时报错 |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `rateLimitCooldownSecs` | `5` | 单账号请求速率超限（429 `USER_REQUEST_RATE_EXCEEDED`）后的短冷却秒数。命中后对该账号短暂冷却并立即切换到其它账号，避免反复命中同一速率超限账号、浪费重试预算与并发槽；不计入失败统计、不会推动禁用 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
@@ -706,6 +707,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 高并发下首 token 变慢的常见原因是**排队**：总并发槽 = 账号数 × `accountMaxConcurrency`（默认 2），每个请求从开始到整个响应结束都占着一个槽，后到的请求在槽位耗尽时排队，排队时间计入首 token。
 
 - token 刷新按**凭据分锁**：同一凭据的并发刷新串行去重，不同凭据的刷新并行，避免 token 临近同时过期时所有请求堵在一把全局锁后排队。
+- 命中单账号请求速率超限（429 `USER_REQUEST_RATE_EXCEEDED`）时，对该账号施加 `rateLimitCooldownSecs` 短冷却并**立即切换到其它账号**，而非反复重试同一速率超限账号——后者会浪费重试预算并空占并发槽。该限制是 per-account 的**请求速率**（不是并发数）：实测每账号约 ≤3-4 请求/分钟时几乎无损，超过 6/分钟开始明显丢请求。降低单账号速率的根本手段是**加账号**横向扩容（balanced 模式自动均摊），而非调高单账号并发。
 - 槽位不足时优先**加账号**横向扩容（不增加单账号真实并发压力），其次再考虑调高 `accountMaxConcurrency`（有触发 429 风控的风险，建议小步试）。
 - 配合上面的 HTTP 传输层调优，避免挂死连接长时间霸占槽位。
 

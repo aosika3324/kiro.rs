@@ -781,6 +781,50 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
+            // 429 + USER_REQUEST_RATE_EXCEEDED = 单账号请求速率超限。
+            // 必须在下方通用瞬态分支之前拦截：通用分支会 sleep 后重试，而重试时
+            // acquire_context 按在途数排序、并不排除刚超限的账号，常把同一账号重复选中
+            // （实测每账号 >6 req/min 时 429 显著上升、平均重试 4 次、白占槽 ~26s）。
+            // 这里对该账号施加短冷却（不计失败统计），让本次重试 acquire_context 自然
+            // 跳过它、切换到有余量的账号；速率窗口在冷却后恢复。
+            if status.as_u16() == 429 && endpoint.is_user_rate_limited(&body) {
+                let cooldown_secs = self.token_manager.config().rate_limit_cooldown_secs.max(1);
+                let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                let remaining = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                tracing::warn!(
+                    "API 请求失败（账号 #{} 请求速率超限，短冷却 {}s 并切换，尝试 {}/{}，剩余可用 {}）: {}",
+                    ctx.id,
+                    cooldown_secs,
+                    attempt + 1,
+                    max_retries,
+                    remaining,
+                    body
+                );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(429),
+                    outcome::RATE_LIMITED,
+                    Some(&body),
+                    attempt_start,
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账号 #{} 请求速率超限）: {} {}",
+                    api_type,
+                    ctx.id,
+                    status,
+                    body
+                ));
+                // 所有账号都在冷却时，短暂等待让最早的冷却到期，而非立即失败
+                // （速率冷却很短，等待远比放弃划算）。
+                if remaining == 0 && attempt + 1 < max_retries {
+                    sleep(cooldown).await;
+                }
+                continue;
+            }
+
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {

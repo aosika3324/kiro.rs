@@ -139,6 +139,14 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 单账号请求速率超限（429 USER_REQUEST_RATE_EXCEEDED）后的短冷却时长（秒，默认 5）。
+    ///
+    /// 命中 per-user 速率限制时对该账号施加此短冷却，使本次重试自然切换到其它账号，
+    /// 避免反复命中同一速率超限账号、白白浪费重试预算与并发槽。冷却很短，速率窗口
+    /// 恢复后该账号即重新参与调度；不计入失败统计、不会推动禁用。
+    #[serde(default = "default_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+
     /// 单账号最大并发请求数（默认 2）。
     ///
     /// 用于避免同一账号被无限并发打爆；不是串行，多个账号的整体并发约为
@@ -234,6 +242,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_rate_limit_cooldown_secs() -> u64 {
+    5
+}
+
 fn default_account_max_concurrency() -> usize {
     2
 }
@@ -296,6 +308,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
             account_max_concurrency: default_account_max_concurrency(),
             account_acquire_timeout_secs: default_account_acquire_timeout_secs(),
             extract_thinking: default_extract_thinking(),

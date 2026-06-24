@@ -70,6 +70,16 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_account_throttled(body)
     }
 
+    /// 判断响应体是否表示"单账号请求速率超限"（429 + USER_REQUEST_RATE_EXCEEDED）
+    ///
+    /// 与账号级风控（suspicious activity）区分：这是对**当前账号**的 per-user 速率限制，
+    /// 短时间内对同一账号发请求过快即触发。普通的瞬态重试会反复命中同一账号（重试时
+    /// 排序按在途数，速率超限的账号未被排除，常被重新选中），白白浪费重试预算与槽位。
+    /// 识别后应对该账号施加**短冷却**并立即切换到其它账号，让速率窗口自然恢复。
+    fn is_user_rate_limited(&self, body: &str) -> bool {
+        default_is_user_rate_limited(body)
+    }
+
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
     ///
     /// 这类错误（tool_use↔tool_result 不配对、消息序列非法等）的根因是调用方的
@@ -151,6 +161,14 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 /// 提到 "suspicious activity" 与具体账号 ID。
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity") && body.contains("temporary limits")
+}
+
+/// 默认的"单账号请求速率超限"判断逻辑（429 + USER_REQUEST_RATE_EXCEEDED）。
+///
+/// 上游对 per-user 速率限制返回的 reason 为 `USER_REQUEST_RATE_EXCEEDED`。
+/// 用精确 reason 子串匹配即可（该取值不会出现在正常响应里）。
+pub fn default_is_user_rate_limited(body: &str) -> bool {
+    body.contains("USER_REQUEST_RATE_EXCEEDED")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -267,6 +285,20 @@ mod tests {
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled(
             "suspicious activity detected"
+        ));
+    }
+
+    #[test]
+    fn test_default_is_user_rate_limited() {
+        let body = r#"{"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
+        assert!(default_is_user_rate_limited(body));
+        // 账号级风控不应被识别为速率超限
+        assert!(!default_is_user_rate_limited(
+            r#"{"message":"suspicious activity ... temporary limits"}"#
+        ));
+        // 普通 429 也不命中
+        assert!(!default_is_user_rate_limited(
+            r#"{"message":"Too many requests"}"#
         ));
     }
 

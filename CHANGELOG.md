@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.9] - 2026-06-24
+
+主题：**单账号请求速率超限（429 `USER_REQUEST_RATE_EXCEEDED`）快速切换账号**。基于线上 trace 分析发现：高并发下 72% 的失败是 per-user 速率超限 429，而原逻辑把它当作通用瞬态错误重试——重试时 `acquire_context` 按在途数排序、并不排除刚超限的账号，常把同一账号重复选中（实测平均重试 4 次、每次空占并发槽约 26s 后仍失败），白白浪费重试预算与稀缺并发槽，同时其它有速率余量的账号闲置。本版新增对该 429 的精确识别与短冷却切换：命中后对该账号施加 `rateLimitCooldownSecs`（默认 5s）短冷却并立即切换到其它账号，速率窗口恢复后该账号自动重新参与调度。
+
+### ⚡ 优化 — 请求速率超限快速切换
+
+- **精确识别 `USER_REQUEST_RATE_EXCEEDED`**：新增 endpoint 层 `is_user_rate_limited` 判定（与账号级 "suspicious activity" 风控区分），在通用瞬态重试分支之前拦截。
+- **短冷却 + 切换**：新增 `MultiTokenManager::report_rate_limited`，复用 `throttled_until` 排除通路对超限账号施加短冷却，使本次重试自然切换到有余量的账号；**不计入失败统计、不推动禁用**（速率超限是调度路由问题，非账号故障）。
+- **全账号冷却兜底**：若所有账号都在速率冷却中，短暂等待最早冷却到期后重试，而非立即失败（速率冷却很短，等待远比放弃划算）。
+- **新增 trace outcome `rate_limited`**：与通用 `transient` 区分，便于在请求日志中单独统计速率超限占比。
+- **新增配置 `rateLimitCooldownSecs`**（默认 5s）。
+
+### 📝 文档
+
+- README 配置表新增 `rateLimitCooldownSecs`，「高并发首 token 调优」一节补充 per-account 速率限制说明与实测阈值（每账号 ≤3-4 请求/分钟几乎无损，加账号横向扩容是根本解）。
+
 ## [0.6.8] - 2026-06-24
 
 主题：**高并发首 token 延迟优化（token 刷新按凭据分锁 + HTTP 分层超时与连接复用）+ 入站文本字段裁剪兜底 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`**。这一版聚焦高并发下首 token 暴涨问题：将原先一把全局 token 刷新锁改为按凭据分锁，消除 token 临近同时过期时所有请求（含不同账号）堵在同一把锁后串行刷新的排队；HTTP 客户端引入分层超时（connect / read）、TCP keepalive 与连接池复用，避免少数挂死连接长时间霸占稀缺的账号并发槽。同时新增入站文本字段的本地裁剪，在请求发往上游之前把超大字段（最常见为 `tool_result.text`）裁到安全范围，从源头规避 AWS Q 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`（400）。所有改动均不触碰工具定义 / 工具名 / 工具调用入参与对话语义。

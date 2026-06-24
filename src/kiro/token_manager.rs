@@ -2403,6 +2403,42 @@ impl MultiTokenManager {
         }
     }
 
+    /// 报告指定凭据触发"单账号请求速率超限"（429 USER_REQUEST_RATE_EXCEEDED）。
+    ///
+    /// 与 [`Self::report_account_throttled`] 共用 `throttled_until` 排除通路（被冷却的凭据
+    /// 不再参与 `ranked_available_credentials` 调度），但用**短冷却**、且**不计入失败统计**：
+    /// 速率超限是调度路由问题（对同一账号发太快），不是账号故障，冷却结束即恢复，
+    /// 不应污染 `total_failure_count` 或推动禁用。
+    ///
+    /// 返回施加冷却后仍可用（未禁用、未冷却）的凭据数量。
+    pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> usize {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let until = now + cooldown;
+            entry.throttled_until = Some(match entry.throttled_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+            tracing::debug!(
+                "凭据 #{} 触发请求速率超限，短冷却 {} 秒后重新参与调度",
+                id,
+                cooldown.as_secs()
+            );
+        }
+        let throttled_now = Instant::now();
+        entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e
+                        .throttled_until
+                        .map(|t| t > throttled_now)
+                        .unwrap_or(false)
+            })
+            .count()
+    }
+
     /// 手动解除指定凭据的临时冷却（Admin API）
     ///
     /// 即使冷却尚未到期也立即清除，让该凭据重新参与调度。
@@ -3675,6 +3711,36 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_report_rate_limited_cools_down_and_excludes() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.priority = 0;
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        assert_eq!(manager.available_count(), 2);
+
+        // 对凭据 #1 施加 60s 速率冷却：剩余可用应为 1（#2），且 #1 被排除
+        let remaining = manager.report_rate_limited(1, StdDuration::from_secs(60));
+        assert_eq!(remaining, 1);
+        assert_eq!(manager.available_count(), 1);
+
+        // 速率冷却不应计入失败统计（不污染 total_failure_count、不推动禁用）
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|s| s.id == 1).unwrap();
+        assert_eq!(e1.total_failure_count, 0);
+        assert!(!e1.disabled);
+
+        // 手动解除后恢复
+        manager.clear_throttle(1).unwrap();
         assert_eq!(manager.available_count(), 2);
     }
 
