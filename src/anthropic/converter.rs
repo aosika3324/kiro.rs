@@ -898,28 +898,33 @@ fn remove_orphaned_tool_uses(
     }
 }
 
-/// 按位置移除"结果非邻接"的 tool_use。
+/// 按位置双向修正 tool_use ↔ tool_result 邻接，满足 Bedrock 不变式。
 ///
-/// Bedrock 不变式：assistant 消息里的每个 `tool_use`，其 `tool_result` 必须出现在
-/// **紧邻的下一条 user 消息**的 `tool_results` 里。只要某个 `tool_use` 的结果不在紧邻
-/// 下一条 user 消息中（中间夹了别的消息、或下一条不是 user），就移除该 `tool_use`——
-/// 保留它只会让上游 400。移除后若该 assistant 消息的 `tool_uses` 变空则置 None。
+/// Bedrock 要求严格邻接配对：
+/// 1. assistant 消息里每个 `tool_use`，其 `tool_result` 必须在**紧邻下一条 user 消息**里；
+/// 2. user 消息里每个 `tool_result`，其 `tool_use` 必须在**紧邻上一条 assistant 消息**里。
 ///
-/// `current_result_ids` 是**当前消息**（currentMessage，不在 history 里）携带的
-/// tool_result id 集合：history 的最后一条 assistant 的 tool_use 结果通常就在当前消息里
-/// （"assistant 调工具 → user 现在返回结果"的常规流），故把它当作"history 末尾之后的下一条
-/// user 消息"来配对，避免误删合法 tool_use。
+/// flat-set 配对检查（`validate_tool_pairing`）只看"历史里是否存在"，会漏掉中间夹了文本轮
+/// 等导致的非邻接 → 上游报 `TOOL_USE_RESULT_MISMATCH` 400。这里做两遍位置修正：
+/// - **Pass 1**：移除"结果不在紧邻下一条 user 消息"的 `tool_use`；
+/// - **Pass 2**：移除"tool_use 不在紧邻上一条 assistant 消息"的 `tool_result`
+///   （含 Pass 1 刚移除 tool_use 后被孤立的那些结果——否则上游会因
+///   `toolResult blocks exceeds toolUse blocks` 再报 400）。
+///
+/// `current_result_ids` 是**当前消息**（currentMessage，不在 history 里）的 tool_result id：
+/// history 末尾 assistant 的 tool_use 结果通常就在当前消息里（assistant 调工具→当前 user
+/// 返回结果的常规流），故 Pass 1 把它当作"末尾之后的下一条 user"参与配对，避免误删合法 tool_use。
+/// Pass 2 只清理 history 内的 user 消息，不动当前消息。
 fn remove_non_adjacent_tool_uses(
     history: &mut [Message],
     current_result_ids: &std::collections::HashSet<String>,
 ) {
+    use std::collections::HashSet;
     let len = history.len();
+
+    // Pass 1：移除结果非邻接的 tool_use
     for i in 0..len {
-        // "紧邻下一条 user 消息"的 tool_result id 集合：
-        // - i+1 仍在 history 内且为 User → 取其 tool_results
-        // - i 是 history 最后一条 → 紧邻的"下一条"就是当前消息，用 current_result_ids
-        // - 其余（下一条是 assistant 等）→ 空集
-        let next_result_ids: std::collections::HashSet<String> = match history.get(i + 1) {
+        let next_result_ids: HashSet<String> = match history.get(i + 1) {
             Some(Message::User(user_msg)) => user_msg
                 .user_input_message
                 .user_input_message_context
@@ -927,7 +932,7 @@ fn remove_non_adjacent_tool_uses(
                 .iter()
                 .map(|r| r.tool_use_id.clone())
                 .collect(),
-            Some(Message::Assistant(_)) => std::collections::HashSet::new(),
+            Some(Message::Assistant(_)) => HashSet::new(),
             None => current_result_ids.clone(),
         };
 
@@ -944,6 +949,43 @@ fn remove_non_adjacent_tool_uses(
                 }
                 if tool_uses.is_empty() {
                     assistant_msg.assistant_response_message.tool_uses = None;
+                }
+            }
+        }
+    }
+
+    // Pass 2：移除 tool_use 非邻接（含 Pass 1 后被孤立）的 tool_result
+    for i in 0..len {
+        // 紧邻上一条 assistant 消息的 tool_use id 集合（已经过 Pass 1 修剪）；
+        // 上一条不是 assistant（或 i==0）则为空集 → 该 user 的所有 tool_result 都算孤立。
+        let prev_use_ids: HashSet<String> = if i == 0 {
+            HashSet::new()
+        } else {
+            match &history[i - 1] {
+                Message::Assistant(a) => a
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map(|tus| tus.iter().map(|tu| tu.tool_use_id.clone()).collect())
+                    .unwrap_or_default(),
+                Message::User(_) => HashSet::new(),
+            }
+        };
+
+        if let Message::User(user_msg) = &mut history[i] {
+            let results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            if !results.is_empty() {
+                let original_len = results.len();
+                results.retain(|r| prev_use_ids.contains(&r.tool_use_id));
+                let removed = original_len - results.len();
+                if removed > 0 {
+                    tracing::warn!(
+                        "移除 {} 个 tool_use 非邻接的 tool_result（其 tool_use 不在紧邻上一条 assistant 消息中，避免上游 toolResult>toolUse 400）",
+                        removed
+                    );
                 }
             }
         }
@@ -2398,6 +2440,62 @@ mod tests {
             );
         } else {
             panic!("history[1] 应为 assistant");
+        }
+    }
+
+    #[test]
+    fn test_remove_non_adjacent_also_prunes_orphaned_result() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 交替序列(survive merge):
+        // [0] user q1
+        // [1] assistant tool_use na1   ← 结果不在紧邻[2] → Pass1 移除 na1
+        // [2] user "no result"
+        // [3] assistant "ack"
+        // [4] user tool_result na1     ← tool_use 不在紧邻[3] → Pass2 移除该结果(否则 toolResult>toolUse 400)
+        let mut a1 = AssistantMessage::new("");
+        a1 = a1.with_tool_uses(vec![
+            ToolUseEntry::new("na1", "Read").with_input(serde_json::json!({"path": "/a"})),
+        ]);
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(vec![ToolResult::success("na1", "A contents")]);
+        let mut user_with_result = UserMessage::new("", "claude-sonnet-4.5");
+        user_with_result = user_with_result.with_context(ctx);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("q1", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: a1,
+            }),
+            Message::User(HistoryUserMessage::new("no result", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage::new("ack")),
+            Message::User(HistoryUserMessage {
+                user_input_message: user_with_result,
+            }),
+        ];
+
+        remove_non_adjacent_tool_uses(&mut history, &std::collections::HashSet::new());
+
+        // Pass1: [1] 的 tool_use 被移除
+        if let Message::Assistant(a) = &history[1] {
+            assert!(
+                a.assistant_response_message.tool_uses.is_none(),
+                "非邻接 tool_use 应被移除"
+            );
+        } else {
+            panic!("history[1] 应为 assistant");
+        }
+        // Pass2: [4] 的孤立 tool_result 也应被移除(否则上游 toolResult>toolUse 400)
+        if let Message::User(u) = &history[4] {
+            assert!(
+                u.user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty(),
+                "孤立的 tool_result 应被移除"
+            );
+        } else {
+            panic!("history[4] 应为 user");
         }
     }
 
