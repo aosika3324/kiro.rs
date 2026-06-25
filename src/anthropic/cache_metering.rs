@@ -24,8 +24,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
+/// 默认条目上限（防止内存无限增长）。
+///
+/// 这是**容量churn**的关键旋钮：表满后按 last_hit LRU 淘汰，写入速率 ×
+/// 平均存活时长 一旦超过此值，条目就会活不到自己的 TTL 被提前挤掉，跨轮
+/// 前缀就此 miss。生产实测 ~90 req/min、每轮写数十段时，旧值 4096 约 60s
+/// 翻一遍整表——人肉长会话（轮间隔常 >60s）的历史前缀等不到复用就被淘汰，
+/// 表现为「cache_creation 恒高、cache_read=0、每轮重建整段」。
+///
+/// 容量须 ≥ 写入速率 × TTL。131072 在上述负载下可撑约 30min 才轮替一次，
+/// 远大于 300s TTL，使绑定约束回归到 TTL（与 Anthropic 5min 缓存语义一致）。
+/// 内存成本可忽略：每条 ~80B，满载约 10MiB。可经配置 `cacheMeterCapacity` 调整。
+#[allow(dead_code)]
+const DEFAULT_CAPACITY: usize = 131072;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
@@ -109,6 +120,8 @@ impl CacheUsage {
 pub struct CacheMeter {
     inner: Mutex<Inner>,
     persist_path: Option<PathBuf>,
+    /// 条目容量上限（超出按 last_hit LRU 淘汰）。见 [`DEFAULT_CAPACITY`]。
+    capacity: usize,
 }
 
 #[derive(Default)]
@@ -119,8 +132,21 @@ struct Inner {
 }
 
 impl CacheMeter {
-    /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    /// 创建一个空 cache，使用默认容量 [`DEFAULT_CAPACITY`]。
+    /// `persist_path` 为 `Some` 时会自动从该文件加载历史。
+    ///
+    /// 生产入口走 [`CacheMeter::with_capacity`]（接 `config.cacheMeterCapacity`）；
+    /// 本构造保留作便捷默认入口，供测试与库使用方用默认容量快速创建。
+    #[allow(dead_code)]
     pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self::with_capacity(persist_path, DEFAULT_CAPACITY)
+    }
+
+    /// 创建一个空 cache 并指定条目容量上限。容量会被 clamp 到 `>= 256`，
+    /// 防止配置成过小值导致缓存无意义地频繁淘汰。`persist_path` 为 `Some`
+    /// 时会自动从该文件加载历史（仅保留未过期条目）。
+    pub fn with_capacity(persist_path: Option<PathBuf>, capacity: usize) -> Self {
+        let capacity = capacity.max(256);
         let mut inner = Inner::default();
         if let Some(path) = persist_path.as_ref() {
             if let Ok(bytes) = std::fs::read(path) {
@@ -132,9 +158,10 @@ impl CacheMeter {
                         }
                     }
                     tracing::info!(
-                        "CacheMeter 重建：从 {} 加载 {} 条有效记录",
+                        "CacheMeter 重建：从 {} 加载 {} 条有效记录（容量上限 {}）",
                         path.display(),
-                        inner.entries.len()
+                        inner.entries.len(),
+                        capacity
                     );
                 }
             }
@@ -142,6 +169,7 @@ impl CacheMeter {
         Self {
             inner: Mutex::new(inner),
             persist_path,
+            capacity,
         }
     }
 
@@ -186,8 +214,8 @@ impl CacheMeter {
         }
         inner.dirty = true;
         // 容量超限：按 last_hit_at 淘汰最旧的若干条
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
+        if inner.entries.len() > self.capacity {
+            let drop_n = inner.entries.len() - self.capacity;
             let mut victims: Vec<(u64, i64)> = inner
                 .entries
                 .iter()
@@ -858,6 +886,32 @@ mod tests {
         }
         cache.evict_expired();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn capacity_is_clamped_to_minimum() {
+        // 配置成 0 / 极小值时 clamp 到 256，避免缓存被无意义地频繁淘汰。
+        assert_eq!(CacheMeter::with_capacity(None, 0).capacity, 256);
+        assert_eq!(CacheMeter::with_capacity(None, 10).capacity, 256);
+    }
+
+    #[test]
+    fn larger_capacity_retains_entries_small_cap_would_evict() {
+        // 复现容量churn：写入 cap+N 条不同 hash 时，小容量表被限制在上限（多出的
+        // 被 LRU 淘汰 → 历史前缀 miss）；大容量则全部存活（不再 churn → 仍可命中）。
+        let small = CacheMeter::with_capacity(None, 256);
+        for h in 0u64..512 {
+            small.record(&[h], &[1], 300);
+        }
+        assert_eq!(small.len(), 256, "小容量稳定维持在上限，多出的被淘汰");
+
+        let big = CacheMeter::with_capacity(None, 131072);
+        for h in 0u64..512 {
+            big.record(&[h], &[1], 300);
+        }
+        assert_eq!(big.len(), 512, "大容量保留全部写入，不发生 churn");
+        // 大容量下最早写入的条目仍在 → 跨轮可命中（churn 不再吃掉历史前缀）。
+        assert!(big.lookup(&[0], &[1])[0].hit, "大容量应保留最早条目");
     }
 
     #[test]

@@ -258,9 +258,12 @@ async fn main() {
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    // 容量上限可经 config.cacheMeterCapacity 配置：太小会在高并发下提前 LRU 淘汰
+    // 历史前缀，导致长会话跨轮 miss、每轮重建整段（cache_read 恒为 0）。
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_capacity(
+        Some(cache_dir.join("cache_metering.json")),
+        config.cache_meter_capacity,
+    ));
     cache_meter.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router(

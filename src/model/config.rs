@@ -186,6 +186,15 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 中转层 prompt cache（CacheMeter）的条目容量上限（默认 131072）。
+    ///
+    /// 这是缓存命中率的关键旋钮：表满后按 LRU 淘汰，容量须 ≥ 写入速率 × TTL，
+    /// 否则历史前缀会在跨轮复用前被挤掉，长会话表现为 cache_read 恒为 0、
+    /// 每轮重建整段。高并发生产可按 `峰值 req/min × 每轮段数 × (300s/60)` 估算下限。
+    /// 运行时会被 clamp 到 `>= 256`。每条约 80B，131072 满载约 10MiB。
+    #[serde(default = "default_cache_meter_capacity")]
+    pub cache_meter_capacity: usize,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -278,6 +287,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_cache_meter_capacity() -> usize {
+    131072
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -316,6 +329,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            cache_meter_capacity: default_cache_meter_capacity(),
             endpoints: HashMap::new(),
             config_path: None,
         }
