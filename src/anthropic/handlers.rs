@@ -431,6 +431,25 @@ fn compute_cache_usage_for_key(
     }
 }
 
+/// 按 per-key 开关应用历史上限（History Cap）。仅在该 Key 启用时裁剪 payload.messages。
+/// 必须在 count_all_tokens / convert_request / cache 计量之前调用，使下游都基于裁剪后的口径。
+fn maybe_apply_history_cap(state: &AppState, payload: &mut MessagesRequest, key_ctx: &KeyContext) {
+    if !key_ctx.history_cap_enabled {
+        return;
+    }
+    let before = payload.messages.len();
+    let cfg = state.history_cap.to_cap_config();
+    if super::converter::apply_history_cap(&mut payload.messages, &cfg) {
+        tracing::info!(
+            key_id = key_ctx.key_id,
+            messages_before = before,
+            messages_after = payload.messages.len(),
+            max_bytes = cfg.max_bytes,
+            "History Cap 命中：已裁剪历史以贴合字节预算"
+        );
+    }
+}
+
 fn available_models() -> Vec<Model> {
     vec![
         Model {
@@ -621,6 +640,9 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
+    // 历史上限（per-key 开关）：必须在 count_all_tokens / convert_request / 缓存计量之前，
+    // 使全部下游口径都基于裁剪后的历史。
+    maybe_apply_history_cap(&state, &mut payload, &key_ctx);
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1440,6 +1462,8 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    // 历史上限（per-key 开关）：在任何 token 计量 / 转换之前裁剪历史。
+    maybe_apply_history_cap(&state, &mut payload, &key_ctx);
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用

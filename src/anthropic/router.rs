@@ -37,6 +37,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        super::middleware::HistoryCapState::default(),
     )
 }
 
@@ -50,6 +51,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    history_cap: super::middleware::HistoryCapState,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -58,6 +60,7 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_history_cap(history_cap);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

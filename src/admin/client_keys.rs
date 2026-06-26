@@ -51,6 +51,11 @@ pub struct ClientKey {
     /// 老数据无此字段时默认 true，避免升级后已有 Key 行为变化。
     #[serde(default = "default_cache_enabled")]
     pub cache_enabled: bool,
+    /// 历史上限（History Cap）三态开关。`None`=随全局默认；`Some(true)`=强制开；
+    /// `Some(false)`=强制关。开启后发往上游的历史会按字节预算裁剪（见
+    /// `converter::apply_history_cap`）。老数据无此字段时为 None（随全局，默认关）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_cap: Option<bool>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -214,6 +219,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             cache_enabled,
+            history_cap: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -288,6 +294,7 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     cache_enabled: true,
+                    history_cap: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -340,6 +347,7 @@ impl ClientKeyManager {
         description: Option<Option<String>>,
         group: Option<Option<String>>,
         cache_enabled: Option<bool>,
+        history_cap: Option<Option<bool>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -355,6 +363,10 @@ impl ClientKeyManager {
                 }
                 if let Some(enabled) = cache_enabled {
                     e.cache_enabled = enabled;
+                }
+                // 外层 Some 表示"本次更新此字段"；内层值即三态设定（None=随全局）。
+                if let Some(hc) = history_cap {
+                    e.history_cap = hc;
                 }
                 true
             }
@@ -383,6 +395,15 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| e.cache_enabled)
             .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 的 History Cap 三态设定（None=随全局默认；Key 不存在亦为 None）。
+    pub fn history_cap_of(&self, id: u64) -> Option<bool> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.history_cap)
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -643,8 +664,28 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None, false);
         assert!(!mgr.cache_enabled_of(entry.id));
-        assert!(mgr.update_meta(entry.id, None, None, None, Some(true)));
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None));
         assert!(mgr.cache_enabled_of(entry.id));
+    }
+
+    #[test]
+    fn history_cap_three_state_update() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("hc".to_string(), None, None, true);
+        // 默认随全局（None）。
+        assert_eq!(mgr.history_cap_of(entry.id), None);
+        // 强制开。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(true))));
+        assert_eq!(mgr.history_cap_of(entry.id), Some(true));
+        // 强制关。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(false))));
+        assert_eq!(mgr.history_cap_of(entry.id), Some(false));
+        // 改回随全局。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(None)));
+        assert_eq!(mgr.history_cap_of(entry.id), None);
+        // 外层 None = 不动该字段。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None));
+        assert_eq!(mgr.history_cap_of(entry.id), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -206,12 +207,22 @@ pub struct TraceQuery {
 
 /// SQLite 持久化存储
 pub struct TraceStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     /// 是否启用 trace 写入（运行时可改）。false 时 insert 直接短路。
     enabled: AtomicBool,
     /// 记录保留天数（运行时可改），cleanup 时读取。
     retention_days: AtomicU64,
+    /// 后台写入通道。`Some` = 异步落库（生产路径，热路径仅做非阻塞 send，
+    /// 由后台线程批量入库；满载丢弃并告警，绝不阻塞请求）；`None` = 同步入库
+    /// （内存/测试库，保证 insert 后立即可查）。
+    writer_tx: Option<SyncSender<TraceRecord>>,
 }
+
+/// 后台 trace 写入通道容量。满载时 insert 丢弃当条 trace（仅诊断数据，可丢）
+/// 而非阻塞请求——保证高并发/磁盘抖动时请求路径永不被写盘拖慢。
+const TRACE_WRITER_QUEUE_CAP: usize = 16_384;
+/// 单次事务最多批量写入的 trace 条数（一次 fsync 覆盖多条，提升高并发吞吐）。
+const TRACE_WRITER_BATCH_MAX: usize = 256;
 
 impl TraceStore {
     /// 打开（或创建）数据库并建表。空路径归一为当前目录下的 traces.db。
@@ -234,23 +245,132 @@ impl TraceStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
+        let conn = Arc::new(Mutex::new(conn));
+        // 生产路径：起后台批量写入线程，热路径只 send（见 spawn_writer）。
+        let writer_tx = Some(Self::spawn_writer(Arc::clone(&conn)));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn,
             enabled: AtomicBool::new(enabled),
             retention_days: AtomicU64::new(retention_days.max(1) as u64),
+            writer_tx,
         })
     }
 
-    /// 内存数据库（traces.db 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）
+    /// 内存数据库（traces.db 打开失败时的兜底；进程退出即丢，但保证 Admin 查询不崩）。
+    /// 同步入库（`writer_tx=None`），保证 insert 后可立即查询（测试/兜底场景）。
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            writer_tx: None,
         })
+    }
+
+    /// 起后台 trace 写入线程：阻塞收一条后尽量 drain 通道，把多条合并进**一个事务**
+    /// （一次 fsync 覆盖整批），显著降低高并发下的写放大。返回的 sender 满载即丢。
+    fn spawn_writer(conn: Arc<Mutex<Connection>>) -> SyncSender<TraceRecord> {
+        let (tx, rx) = sync_channel::<TraceRecord>(TRACE_WRITER_QUEUE_CAP);
+        std::thread::Builder::new()
+            .name("trace-writer".into())
+            .spawn(move || {
+                // 阻塞等待首条；通道关闭（所有 sender drop）即退出线程。
+                while let Ok(first) = rx.recv() {
+                    let mut batch = Vec::with_capacity(TRACE_WRITER_BATCH_MAX);
+                    batch.push(first);
+                    // 尽量 drain，凑批（上限 BATCH_MAX），不阻塞等待。
+                    while batch.len() < TRACE_WRITER_BATCH_MAX {
+                        match rx.try_recv() {
+                            Ok(rec) => batch.push(rec),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut guard = conn.lock();
+                    Self::write_batch(&mut guard, &batch);
+                }
+            })
+            .expect("spawn trace-writer thread");
+        tx
+    }
+
+    /// 把一批 trace 记录写进单个事务（失败仅告警，不影响后续批次）。
+    fn write_batch(conn: &mut Connection, batch: &[TraceRecord]) {
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trace 事务开启失败: {}", e);
+                return;
+            }
+        };
+        for rec in batch {
+            if let Err(e) = Self::write_one(&tx, rec) {
+                tracing::warn!("trace 写入失败: {}", e);
+            }
+        }
+        if let Err(e) = tx.commit() {
+            tracing::warn!("trace 提交失败: {}", e);
+        }
+    }
+
+    /// 在给定事务内写入单条 trace（汇总 + N 条 attempt）。
+    fn write_one(tx: &rusqlite::Transaction<'_>, rec: &TraceRecord) -> rusqlite::Result<()> {
+        let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+            .map(|d| d.timestamp())
+            .unwrap_or_else(|_| Utc::now().timestamp());
+        tx.execute(
+            "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
+             is_stream, final_status, final_credential_id, error_type, error_message, \
+             total_attempts, duration_ms, interrupted_after_bytes, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
+             credits, first_token_ms, request_bytes, local_input_tokens, context_input_tokens) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+            rusqlite::params![
+                rec.trace_id,
+                rec.ts,
+                ts_epoch,
+                rec.key_id as i64,
+                rec.key_source.as_str(),
+                rec.model,
+                rec.is_stream as i64,
+                rec.final_status,
+                rec.final_credential_id as i64,
+                rec.error_type,
+                rec.error_message,
+                rec.total_attempts as i64,
+                rec.duration_ms as i64,
+                rec.interrupted_after_bytes.map(|v| v as i64),
+                rec.input_tokens as i64,
+                rec.output_tokens as i64,
+                rec.cache_creation_tokens as i64,
+                rec.cache_read_tokens as i64,
+                rec.credits,
+                rec.first_token_ms.map(|v| v as i64),
+                rec.request_bytes as i64,
+                rec.local_input_tokens as i64,
+                rec.context_input_tokens.map(|v| v as i64),
+            ],
+        )?;
+        for a in &rec.attempts {
+            tx.execute(
+                "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
+                 endpoint, http_status, outcome, error_snippet, duration_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    rec.trace_id,
+                    a.attempt as i64,
+                    a.credential_id as i64,
+                    a.endpoint,
+                    a.http_status.map(|v| v as i64),
+                    a.outcome,
+                    a.error_snippet,
+                    a.duration_ms as i64,
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
@@ -318,82 +438,27 @@ impl TraceStore {
 
     /// 写入一条完整链路（traces + attempts 在一个事务里）。失败仅 warn，不阻塞请求。
     /// trace 关闭时直接短路。
+    ///
+    /// 生产路径（`writer_tx=Some`）：仅做一次**非阻塞** channel send，由后台
+    /// `trace-writer` 线程批量入库 —— 请求热路径不再持锁、不再等 fsync。
+    /// 通道满（极端高并发或磁盘卡死）时丢弃当条 trace 并告警，绝不阻塞请求。
+    /// 内存/测试库（`writer_tx=None`）：同步入库，保证 insert 后立即可查。
     pub fn insert(&self, rec: &TraceRecord) {
         if !self.is_enabled() {
             return;
         }
-        let mut conn = self.conn.lock();
-        let tx = match conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("trace 事务开启失败: {}", e);
-                return;
-            }
-        };
-        let ts_epoch = chrono::DateTime::parse_from_rfc3339(&rec.ts)
-            .map(|d| d.timestamp())
-            .unwrap_or_else(|_| Utc::now().timestamp());
-        let res = (|| -> rusqlite::Result<()> {
-            tx.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
-                 is_stream, final_status, final_credential_id, error_type, error_message, \
-                 total_attempts, duration_ms, interrupted_after_bytes, \
-                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, request_bytes, local_input_tokens, context_input_tokens) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
-                rusqlite::params![
-                    rec.trace_id,
-                    rec.ts,
-                    ts_epoch,
-                    rec.key_id as i64,
-                    rec.key_source.as_str(),
-                    rec.model,
-                    rec.is_stream as i64,
-                    rec.final_status,
-                    rec.final_credential_id as i64,
-                    rec.error_type,
-                    rec.error_message,
-                    rec.total_attempts as i64,
-                    rec.duration_ms as i64,
-                    rec.interrupted_after_bytes.map(|v| v as i64),
-                    rec.input_tokens as i64,
-                    rec.output_tokens as i64,
-                    rec.cache_creation_tokens as i64,
-                    rec.cache_read_tokens as i64,
-                    rec.credits,
-                    rec.first_token_ms.map(|v| v as i64),
-                    rec.request_bytes as i64,
-                    rec.local_input_tokens as i64,
-                    rec.context_input_tokens.map(|v| v as i64),
-                ],
-            )?;
-            for a in &rec.attempts {
-                tx.execute(
-                    "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
-                     endpoint, http_status, outcome, error_snippet, duration_ms) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    rusqlite::params![
-                        rec.trace_id,
-                        a.attempt as i64,
-                        a.credential_id as i64,
-                        a.endpoint,
-                        a.http_status.map(|v| v as i64),
-                        a.outcome,
-                        a.error_snippet,
-                        a.duration_ms as i64,
-                    ],
-                )?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => {
-                if let Err(e) = tx.commit() {
-                    tracing::warn!("trace 提交失败: {}", e);
+        match &self.writer_tx {
+            Some(tx) => {
+                // 非阻塞投递；满载即丢（trace 仅诊断数据，丢可接受，绝不拖慢请求）。
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(rec.clone()) {
+                    tracing::warn!("trace 写入队列已满，丢弃当条 trace（高并发或磁盘卡顿）");
                 }
+                // Disconnected（writer 线程异常退出）：静默丢弃，不影响请求。
             }
-            Err(e) => {
-                tracing::warn!("trace 写入失败: {}", e);
+            None => {
+                // 同步路径（内存/测试库）。
+                let mut conn = self.conn.lock();
+                Self::write_batch(&mut conn, std::slice::from_ref(rec));
             }
         }
     }
@@ -799,9 +864,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         TraceStore {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+            // 测试库走同步入库路径，保证 insert 后立即可查（无后台线程竞态）。
+            writer_tx: None,
         }
     }
 
@@ -1034,5 +1101,43 @@ mod tests {
         let out = truncate_snippet(&long).unwrap();
         assert!(out.ends_with("…(truncated)"));
         assert!(out.len() <= ERROR_SNIPPET_MAX + 20);
+    }
+
+    /// 异步落库路径端到端：file-backed store 会起后台 writer 线程；
+    /// insert 仅 send，后台批量入库。轮询等待落库后应能查到全部记录。
+    #[test]
+    fn async_writer_persists_all_records() {
+        let dir = std::env::temp_dir().join(format!("kiro_trace_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("traces.db");
+        let store = TraceStore::open(path, true, 7).unwrap();
+        assert!(store.writer_tx.is_some(), "file-backed store 应走异步写入");
+
+        const N: usize = 200;
+        for i in 0..N {
+            store.insert(&sample(TraceSample {
+                trace_id: &format!("async-{i}"),
+                status: "success",
+                credential_id: 1,
+                model: "claude-sonnet-4.5",
+            }));
+        }
+
+        // 轮询等待后台 writer 落库（最多 ~2s）。
+        let mut total = 0;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let (_, t) = store.query_paged(&TraceQuery {
+                limit: 1,
+                ..Default::default()
+            });
+            total = t;
+            if total >= N {
+                break;
+            }
+        }
+        assert_eq!(total, N, "后台 writer 应最终落库全部 {N} 条");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

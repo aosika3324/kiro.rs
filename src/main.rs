@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
+use axum::serve::ListenerExt;
 use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -274,6 +275,11 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        anthropic::middleware::HistoryCapState {
+            default_enabled: config.history_cap_enabled,
+            max_bytes: config.history_cap_max_bytes,
+            head_turns: config.history_cap_head_turns,
+        },
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -350,6 +356,15 @@ async fn main() {
     tracing::info!("  GET  /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // 对每条接入连接关闭 Nagle（TCP_NODELAY=true）。SSE 是逐 token 的小包，
+    // Nagle + 对端延迟 ACK 会把小包攒成簇、间隔最高 ~40ms 才发出，表现为
+    // 流式输出「一顿一顿、间隔很长」。tokio TcpStream 默认 nodelay=false，
+    // axum::serve 不会代设，故在此显式打开（Go 的 net/http 默认即开此项）。
+    let listener = listener.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            tracing::warn!("设置 TCP_NODELAY 失败（流式输出可能出现顿挫）: {err:#}");
+        }
+    });
     axum::serve(listener, app).await.unwrap();
 }
 

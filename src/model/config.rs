@@ -195,6 +195,26 @@ pub struct Config {
     #[serde(default = "default_cache_meter_capacity")]
     pub cache_meter_capacity: usize,
 
+    /// 历史上限（History Cap）全局默认开关。默认 false（关）。
+    ///
+    /// 开启后，发往上游的 `messages` 会按字节预算裁剪（保留头部若干轮 + 预算内的
+    /// 最近若干轮，中间插占位说明），用于压住超长会话的 prefill 成本、追平
+    /// 速度优先的同类实现。per-client-key 的 `historyCap` 可三态覆盖此默认值。
+    ///
+    /// 注意：裁剪会让缓存前缀逐轮变动，与 prompt cache 部分冲突——要缓存命中率
+    /// 的 Key 不要开 cap，要速度的 Key 才开。
+    #[serde(default)]
+    pub history_cap_enabled: bool,
+
+    /// 历史上限的字节预算（序列化后的 messages 累计字节）。默认 900_000（~900KB）。
+    /// 运行时 clamp 到 `>= 50_000`，避免配得过小把当前轮也挤掉。
+    #[serde(default = "default_history_cap_max_bytes")]
+    pub history_cap_max_bytes: usize,
+
+    /// 历史上限始终保留的头部轮数（原始任务上下文）。默认 1。
+    #[serde(default = "default_history_cap_head_turns")]
+    pub history_cap_head_turns: usize,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -291,6 +311,14 @@ fn default_cache_meter_capacity() -> usize {
     131072
 }
 
+fn default_history_cap_max_bytes() -> usize {
+    900_000
+}
+
+fn default_history_cap_head_turns() -> usize {
+    1
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -330,6 +358,9 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_meter_capacity: default_cache_meter_capacity(),
+            history_cap_enabled: false,
+            history_cap_max_bytes: default_history_cap_max_bytes(),
+            history_cap_head_turns: default_history_cap_head_turns(),
             endpoints: HashMap::new(),
             config_path: None,
         }

@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// JSONL 文件保留天数
@@ -51,14 +50,25 @@ pub struct UsageRecord {
     pub status: String,
 }
 
-/// 按天 rotate 的 JSONL writer
+/// 按天 rotate 的 JSONL writer。
+///
+/// 写盘在**后台线程**进行：`record` 仅做一次非阻塞 channel send，由后台
+/// `usage-writer` 线程按天 rotate 并批量写入（一批一次 flush），请求热路径
+/// 不再持锁、不再每条 fsync。通道满则丢弃当条并告警，绝不阻塞请求。
 pub struct UsageRecorder {
-    inner: Mutex<RecorderState>,
     dir: PathBuf,
     /// 保留天数（运行时可改），cleanup_old_logs 时读取。
     retention_days: std::sync::atomic::AtomicI64,
+    /// 后台写入通道（非阻塞投递）。
+    writer_tx: std::sync::mpsc::SyncSender<UsageRecord>,
 }
 
+/// 后台 usage 写入通道容量。满载丢弃当条（仅统计数据，真实计费来自上游 metering）。
+const USAGE_WRITER_QUEUE_CAP: usize = 16_384;
+/// 单批最多写入条数（一次 flush 覆盖整批）。
+const USAGE_WRITER_BATCH_MAX: usize = 512;
+
+/// 后台 writer 线程持有的落盘状态（按天 rotate 的 BufWriter）。
 struct RecorderState {
     /// 当前打开的 writer 与对应日期
     current_date: Option<NaiveDate>,
@@ -79,35 +89,49 @@ impl UsageRecorder {
                 tracing::warn!("创建 usage_log 目录失败 {}: {}", dir.display(), e);
             }
         }
+        let writer_tx = Self::spawn_writer(dir.clone());
         Self {
-            inner: Mutex::new(RecorderState {
-                current_date: None,
-                writer: None,
-            }),
             dir,
             retention_days: std::sync::atomic::AtomicI64::new(retention_days.max(1)),
+            writer_tx,
         }
     }
 
-    fn log_path(&self, date: NaiveDate) -> PathBuf {
-        self.dir
-            .join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+    /// 起后台 usage 写入线程：阻塞收一条后尽量 drain，凑批后按天 rotate 写入并**一次 flush**。
+    fn spawn_writer(dir: PathBuf) -> std::sync::mpsc::SyncSender<UsageRecord> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<UsageRecord>(USAGE_WRITER_QUEUE_CAP);
+        let mut state = RecorderState {
+            current_date: None,
+            writer: None,
+        };
+        std::thread::Builder::new()
+            .name("usage-writer".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut batch = Vec::with_capacity(USAGE_WRITER_BATCH_MAX);
+                    batch.push(first);
+                    while batch.len() < USAGE_WRITER_BATCH_MAX {
+                        match rx.try_recv() {
+                            Ok(rec) => batch.push(rec),
+                            Err(_) => break,
+                        }
+                    }
+                    Self::write_batch(&dir, &mut state, &batch);
+                }
+            })
+            .expect("spawn usage-writer thread");
+        tx
     }
 
-    /// 同步写入一条记录。失败仅 warn，不阻塞请求。
-    pub fn record(&self, rec: &UsageRecord) {
-        let line = match serde_json::to_string(rec) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("usage_log 序列化失败: {}", e);
-                return;
-            }
-        };
+    fn log_path_in(dir: &Path, date: NaiveDate) -> PathBuf {
+        dir.join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+    }
+
+    /// 把一批记录写入当日 JSONL（按需 rotate），整批结束**一次 flush**。失败仅 warn。
+    fn write_batch(dir: &Path, state: &mut RecorderState, batch: &[UsageRecord]) {
         let today = Local::now().date_naive();
-        let mut state = self.inner.lock();
         if state.current_date != Some(today) || state.writer.is_none() {
-            // 切换到当日文件
-            let path = self.log_path(today);
+            let path = Self::log_path_in(dir, today);
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(file) => {
                     state.writer = Some(BufWriter::new(file));
@@ -119,13 +143,31 @@ impl UsageRecorder {
                 }
             }
         }
-        if let Some(w) = state.writer.as_mut() {
+        let Some(w) = state.writer.as_mut() else {
+            return;
+        };
+        for rec in batch {
+            let line = match serde_json::to_string(rec) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("usage_log 序列化失败: {}", e);
+                    continue;
+                }
+            };
             if let Err(e) = writeln!(w, "{}", line) {
                 tracing::warn!("写入 usage_log 失败: {}", e);
                 return;
             }
-            // 立即 flush，保证崩溃时不丢失最近一条
-            let _ = w.flush();
+        }
+        // 整批一次 flush：把多条记录的 fsync 合并，崩溃最多丢失尚在通道/缓冲中的极少量记录。
+        let _ = w.flush();
+    }
+
+    /// 投递一条用量记录到后台写入线程（非阻塞）。失败仅 warn，不阻塞请求。
+    /// 通道满（极端高并发或磁盘卡死）时丢弃当条 —— 统计数据可丢，真实计费来自上游 metering。
+    pub fn record(&self, rec: &UsageRecord) {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = self.writer_tx.try_send(rec.clone()) {
+            tracing::warn!("usage_log 写入队列已满，丢弃当条记录（高并发或磁盘卡顿）");
         }
     }
 

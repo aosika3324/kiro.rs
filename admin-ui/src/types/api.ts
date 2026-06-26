@@ -396,6 +396,8 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 是否启用中转层 prompt cache */
   cacheEnabled: boolean
+  /** 历史上限三态：undefined=随全局默认；true/false=强制开/关 */
+  historyCap?: boolean
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -412,6 +414,8 @@ export interface CreateClientKeyRequest {
   description?: string
   group?: string
   cacheEnabled?: boolean
+  /** 历史上限三态：省略=随全局默认；true/false=强制开/关 */
+  historyCap?: boolean | null
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -427,6 +431,8 @@ export interface UpdateClientKeyRequest {
   description?: string
   group?: string
   cacheEnabled?: boolean
+  /** 历史上限三态更新：省略=不变更；null=改为随全局；true/false=强制开/关 */
+  historyCap?: boolean | null
 }
 
 // ============ 用量统计 ============

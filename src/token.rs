@@ -183,6 +183,86 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// 单张内联 base64 图片的保底 token 数。
+///
+/// 不在此处解码图片取真实尺寸：`count_all_tokens` 处于请求热路径、且在转换器
+/// 之前运行，为"上报下限"而解码数 MB base64 不划算。用 Anthropic 单图上限附近
+/// 的固定值，确保图片始终贡献非零 token，把本地估算抬到接近真实即可。
+const IMAGE_TOKEN_ESTIMATE: u64 = 1_600;
+
+/// 统计单个 ContentBlock(裸 JSON)的 token。
+///
+/// 按块 `type` 完整分派，覆盖 agent 负载里的全部块类型：
+/// - `text` / `thinking`：直接计文本
+/// - `tool_use`：name + 序列化后的 input(工具调用参数)
+/// - `tool_result`：递归统计 content(string 或 [{text}|{image}] 数组)
+/// - `image`：固定保底值
+///
+/// 用 `.get()` 宽松取值而非严格反序列化：单个字段缺失/异形时只少计该块，
+/// 不会整块丢弃，保证下限估算的鲁棒性。
+fn count_block_tokens(item: &serde_json::Value) -> u64 {
+    let mut sum = 0u64;
+
+    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+        sum += count_tokens(text);
+    }
+    if let Some(thinking) = item.get("thinking").and_then(|v| v.as_str()) {
+        sum += count_tokens(thinking);
+    }
+
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("tool_use") => {
+            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                sum += count_tokens(name);
+            }
+            if let Some(input) = item.get("input") {
+                let s = serde_json::to_string(input).unwrap_or_default();
+                sum += count_tokens(&s);
+            }
+        }
+        Some("tool_result") => {
+            sum += count_tool_result_content_tokens(item.get("content"));
+        }
+        Some("image") => {
+            // 仅内联 base64 计入；url 模式图片不直接进消息体，跳过。
+            if item
+                .get("source")
+                .and_then(|s| s.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("base64")
+            {
+                sum += IMAGE_TOKEN_ESTIMATE;
+            }
+        }
+        _ => {}
+    }
+
+    sum
+}
+
+/// 统计 tool_result.content 的 token。content 可能是 string，或
+/// `[{type:text,text}|{type:image,source}]` 数组——与转换器
+/// `extract_tool_result_content` 的解析形态一致。
+fn count_tool_result_content_tokens(content: Option<&serde_json::Value>) -> u64 {
+    match content {
+        Some(serde_json::Value::String(s)) => count_tokens(s),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut sum = 0u64;
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    sum += count_tokens(text);
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    sum += IMAGE_TOKEN_ESTIMATE;
+                }
+            }
+            sum
+        }
+        // 其它异形(如对象):序列化兜底，宁可略多计也不漏。
+        Some(v) => count_tokens(&v.to_string()),
+        None => 0,
+    }
+}
+
 /// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
     system: &Option<Vec<SystemMessage>>,
@@ -198,16 +278,22 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 用户/助手消息
+    //
+    // content 可能是裸 string，或 ContentBlock 数组。数组里除 `text` 块外，
+    // 还有 `tool_result`(text 嵌在 content[] 里，顶层无 text)、`tool_use`
+    // (参数在 input)、`image`、`thinking`。对 agent 负载，tool_result 往往是
+    // 历史里体量最大的部分——这些块都必须计入，否则本地估算会系统性低估，
+    // 导致客户端永不触发 auto-compact 而撞上游上下文上限。
     for msg in messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
+        match &msg.content {
+            serde_json::Value::String(s) => total += count_tokens(s),
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    total += count_block_tokens(item);
                 }
             }
+            _ => {}
         }
     }
 
@@ -277,5 +363,109 @@ mod tests {
         })]);
 
         assert!(tokens >= 8);
+    }
+
+    fn msg(content: serde_json::Value) -> Message {
+        Message {
+            role: "user".to_string(),
+            content,
+        }
+    }
+
+    // 回归核心：历史里最大头的 tool_result 文本必须被计入。
+    // 修复前只数顶层 `text` 块，tool_result 的 text 嵌在 content[] 里，整段被漏掉。
+    #[test]
+    fn tool_result_string_content_is_counted() {
+        let big = "x".repeat(4000); // ~1000+ tokens
+        let messages = vec![msg(json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": big,
+        }]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        assert!(
+            total > 500,
+            "tool_result string content 必须计入，实得 {total}"
+        );
+    }
+
+    #[test]
+    fn tool_result_array_text_blocks_are_counted() {
+        let big = "y".repeat(4000);
+        let messages = vec![msg(json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [{"type": "text", "text": big}],
+        }]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        assert!(
+            total > 500,
+            "tool_result 数组内的 text 块必须计入，实得 {total}"
+        );
+    }
+
+    #[test]
+    fn tool_use_input_is_counted() {
+        let big = "z".repeat(4000);
+        let messages = vec![msg(json!([{
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "write_file",
+            "input": {"path": "a.rs", "content": big},
+        }]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        assert!(total > 500, "tool_use.input 必须计入，实得 {total}");
+    }
+
+    #[test]
+    fn inline_base64_image_contributes_nonzero() {
+        let messages = vec![msg(json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+        }]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        assert!(
+            total >= IMAGE_TOKEN_ESTIMATE,
+            "内联 base64 图片必须贡献非零 token，实得 {total}"
+        );
+    }
+
+    #[test]
+    fn url_image_is_skipped() {
+        // url 模式图片不直接进消息体，不应贡献图片 token。
+        let messages = vec![msg(json!([{
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/a.png"},
+        }]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        assert!(total < IMAGE_TOKEN_ESTIMATE, "url 图片应跳过，实得 {total}");
+    }
+
+    #[test]
+    fn plain_text_block_and_string_still_work() {
+        // 回归：原有的顶层 text 块与裸 string 仍正常计数。
+        let from_block = count_all_tokens_local(
+            &None,
+            &[msg(json!([{"type": "text", "text": "hello world"}]))],
+            &None,
+        );
+        let from_string =
+            count_all_tokens_local(&None, &[msg(json!("hello world"))], &None);
+        assert_eq!(from_block, from_string);
+        assert!(from_block > 1);
+    }
+
+    #[test]
+    fn mixed_blocks_sum_all_contributions() {
+        let messages = vec![msg(json!([
+            {"type": "text", "text": "前导说明"},
+            {"type": "tool_use", "id": "t1", "name": "read", "input": {"p": "f.rs"}},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "file body here"},
+        ]))];
+        let total = count_all_tokens_local(&None, &messages, &None);
+        // 应同时包含三块；明显大于任一单块。
+        let only_text =
+            count_all_tokens_local(&None, &[msg(json!([{"type": "text", "text": "前导说明"}]))], &None);
+        assert!(total > only_text, "混合块应累加全部贡献");
     }
 }

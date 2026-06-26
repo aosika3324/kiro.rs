@@ -31,6 +31,20 @@ function formatTokens(n: number): string {
   return n.toString()
 }
 
+/** 三态字符串 → 提交值。'inherit'→null（随全局）；'on'→true；'off'→false。 */
+function historyCapToValue(s: 'inherit' | 'on' | 'off'): boolean | null {
+  if (s === 'on') return true
+  if (s === 'off') return false
+  return null
+}
+
+/** 后端 historyCap（boolean|undefined）→ 三态字符串。 */
+function valueToHistoryCap(v?: boolean): 'inherit' | 'on' | 'off' {
+  if (v === true) return 'on'
+  if (v === false) return 'off'
+  return 'inherit'
+}
+
 function formatRelative(ts?: string): string {
   if (!ts) return '从未使用'
   const t = new Date(ts).getTime()
@@ -58,6 +72,7 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
   const [createCacheEnabled, setCreateCacheEnabled] = useState(true)
+  const [createHistoryCap, setCreateHistoryCap] = useState<'inherit' | 'on' | 'off'>('inherit')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -67,6 +82,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editCacheEnabled, setEditCacheEnabled] = useState(true)
+  const [editHistoryCap, setEditHistoryCap] = useState<'inherit' | 'on' | 'off'>('inherit')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -81,6 +97,7 @@ export function ClientKeysPage() {
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
         cacheEnabled: createCacheEnabled,
+        historyCap: historyCapToValue(createHistoryCap),
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -88,6 +105,7 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroup('')
       setCreateCacheEnabled(true)
+      setCreateHistoryCap('inherit')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -170,6 +188,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditCacheEnabled(item.cacheEnabled)
+    setEditHistoryCap(valueToHistoryCap(item.historyCap))
     setEditOpen(true)
   }
 
@@ -184,6 +203,7 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           cacheEnabled: editCacheEnabled,
+          historyCap: historyCapToValue(editHistoryCap),
         },
       })
       toast.success('已更新')
@@ -298,11 +318,15 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      {k.cacheEnabled ? (
-                        <Badge variant="secondary">开启</Badge>
-                      ) : (
-                        <Badge variant="outline">关闭</Badge>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {k.cacheEnabled ? (
+                          <Badge variant="secondary">开启</Badge>
+                        ) : (
+                          <Badge variant="outline">关闭</Badge>
+                        )}
+                        {k.historyCap === true && <Badge variant="secondary">Cap开</Badge>}
+                        {k.historyCap === false && <Badge variant="outline">Cap关</Badge>}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -422,6 +446,30 @@ export function ClientKeysPage() {
                 disabled={createKey.isPending}
               />
             </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">历史上限 History Cap</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    开启后按字节预算裁剪历史（保留头部+最近，中间插占位），压低超长会话延迟。与 prompt cache 部分冲突，按需取舍。
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  {(['inherit', 'on', 'off'] as const).map((opt) => (
+                    <Button
+                      key={opt}
+                      type="button"
+                      size="sm"
+                      variant={createHistoryCap === opt ? 'default' : 'outline'}
+                      onClick={() => setCreateHistoryCap(opt)}
+                      disabled={createKey.isPending}
+                    >
+                      {opt === 'inherit' ? '随全局' : opt === 'on' ? '开' : '关'}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -528,6 +576,30 @@ export function ClientKeysPage() {
                 onCheckedChange={setEditCacheEnabled}
                 disabled={updateKey.isPending}
               />
+            </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">历史上限 History Cap</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    随全局=跟随服务端默认；开/关=对此 Key 强制。开启后按字节预算裁剪历史，压低超长会话延迟。
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  {(['inherit', 'on', 'off'] as const).map((opt) => (
+                    <Button
+                      key={opt}
+                      type="button"
+                      size="sm"
+                      variant={editHistoryCap === opt ? 'default' : 'outline'}
+                      onClick={() => setEditHistoryCap(opt)}
+                      disabled={updateKey.isPending}
+                    >
+                      {opt === 'inherit' ? '随全局' : opt === 'on' ? '开' : '关'}
+                    </Button>
+                  ))}
+                </div>
+              </div>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

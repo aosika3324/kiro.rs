@@ -436,21 +436,38 @@ async fn refresh_external_idp_token(
 }
 
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
-/// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
+/// setUserPreference）的区域候选列表。
 ///
-/// 依据凭据的 SSO 区域选择主端点，并返回另一个端点作为 403 回退候选：
-/// - `eu-central-1` 或任何 `eu-*` 区域 → 主端点 `eu-central-1`
-/// - 其余区域 → 主端点 `us-east-1`
+/// 采用「自适应」策略，不再硬编码固定两区：
+/// 1. 凭据自身 SSO 区域优先（账号在哪个区，就先打哪个区）；
+/// 2. 再追加已知长期可用的兜底区域 `us-east-1` 与 `eu-central-1`；
+/// 3. 去重，保持首次出现顺序。
 ///
-/// 这样导入的 Enterprise / IAM Identity Center (IdC) 账号即使 SSO 区域不是
-/// `us-east-1`，也能命中正确的端点，避免 `403 {"message":"Invalid token"}`。
-fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
-    let primary_eu = sso_region == "eu-central-1" || sso_region.starts_with("eu-");
-    if primary_eu {
-        ["eu-central-1", "us-east-1"]
-    } else {
-        ["us-east-1", "eu-central-1"]
+/// 配合调用处的「传输层错误也回退到下一个候选」逻辑，即使某区域端点
+/// 不存在（如 external IdP 的 `codewhisperer.*` 仅在 us-east-1 有 DNS 记录），
+/// 或日后上游新增/调整了区域，都能自动适配而无需改这张表：
+/// - 命中自身区域 → 直接成功；
+/// - 自身区域无端点/无权限 → 自动回退到 us-east-1 / eu-central-1。
+fn rest_api_region_candidates(sso_region: &str) -> Vec<String> {
+    // 已知长期提供这些 REST 接口的兜底区域，顺序即回退优先级
+    const FALLBACK_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
+
+    let mut candidates: Vec<String> = Vec::with_capacity(FALLBACK_REGIONS.len() + 1);
+    let mut push_unique = |region: &str| {
+        let region = region.trim();
+        if !region.is_empty() && !candidates.iter().any(|r| r == region) {
+            candidates.push(region.to_string());
+        }
+    };
+
+    // 1) 凭据自身区域优先
+    push_unique(sso_region);
+    // 2) 追加已知兜底区域
+    for region in FALLBACK_REGIONS {
+        push_unique(region);
     }
+
+    candidates
 }
 
 /// 获取使用额度信息
@@ -516,7 +533,24 @@ pub(crate) async fn get_usage_limits(
             request = request.header("tokentype", "API_KEY");
         }
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 与 403 一样回退到下一个候选端点，而不是直接中断
+                if idx + 1 < candidates.len() {
+                    tracing::debug!(
+                        "getUsageLimits 连接 {} 失败，尝试备用端点 {}: {}",
+                        region,
+                        candidates[idx + 1],
+                        e
+                    );
+                    last_error = Some(format!("连接 {} 失败: {}", region, e));
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
 
         let status = response.status();
         if status.is_success() {
@@ -619,7 +653,24 @@ pub(crate) async fn get_available_models(
             request = request.header("tokentype", "API_KEY");
         }
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 与 403 一样回退到下一个候选端点，而不是直接中断
+                if idx + 1 < candidates.len() {
+                    tracing::debug!(
+                        "ListAvailableModels 连接 {} 失败，尝试备用端点 {}: {}",
+                        region,
+                        candidates[idx + 1],
+                        e
+                    );
+                    last_error = Some(format!("连接 {} 失败: {}", region, e));
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
 
         let status = response.status();
         if status.is_success() {
@@ -733,7 +784,16 @@ pub(crate) async fn list_available_profiles(
             req
         };
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 记录并尝试下一个候选端点
+                tracing::debug!("ListAvailableProfiles 连接 {} 失败: {}", region, e);
+                last_error = Some(format!("连接 {} 失败: {}", region, e));
+                continue;
+            }
+        };
         let status = response.status();
 
         if status.is_success() {
@@ -832,7 +892,24 @@ pub(crate) async fn set_user_preference(
             request = request.header("tokentype", "API_KEY");
         }
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 与 403 一样回退到下一个候选端点，而不是直接中断
+                if idx + 1 < candidates.len() {
+                    tracing::debug!(
+                        "setUserPreference 连接 {} 失败，尝试备用端点 {}: {}",
+                        region,
+                        candidates[idx + 1],
+                        e
+                    );
+                    last_error = Some(format!("连接 {} 失败: {}", region, e));
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
 
         let status = response.status();
         if status.is_success() {
@@ -4649,35 +4726,50 @@ mod tests {
 
     #[test]
     fn test_rest_api_region_candidates_us_default() {
-        // 非 EU 区域 → 主端点 us-east-1，回退 eu-central-1
+        // 自身区域优先，再追加兜底区域；自身已是 us-east-1 时去重
         assert_eq!(
             rest_api_region_candidates("us-east-1"),
             ["us-east-1", "eu-central-1"]
         );
+        // 自身区域非兜底区 → 排首位，兜底区依次追加
         assert_eq!(
             rest_api_region_candidates("us-east-2"),
-            ["us-east-1", "eu-central-1"]
+            ["us-east-2", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
             rest_api_region_candidates("ap-southeast-1"),
-            ["us-east-1", "eu-central-1"]
+            ["ap-southeast-1", "us-east-1", "eu-central-1"]
         );
     }
 
     #[test]
     fn test_rest_api_region_candidates_eu() {
-        // EU 区域 → 主端点 eu-central-1，回退 us-east-1
+        // eu-central-1 自身即兜底区 → 去重后排首位
         assert_eq!(
             rest_api_region_candidates("eu-central-1"),
             ["eu-central-1", "us-east-1"]
         );
+        // 其他 EU 区域 → 自身优先，再回退 us-east-1 / eu-central-1
         assert_eq!(
             rest_api_region_candidates("eu-west-1"),
-            ["eu-central-1", "us-east-1"]
+            ["eu-west-1", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
             rest_api_region_candidates("eu-north-1"),
-            ["eu-central-1", "us-east-1"]
+            ["eu-north-1", "us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_empty_falls_back() {
+        // 空/空白自身区域被忽略，直接用兜底区域
+        assert_eq!(
+            rest_api_region_candidates(""),
+            ["us-east-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("  "),
+            ["us-east-1", "eu-central-1"]
         );
     }
 
@@ -4692,7 +4784,7 @@ mod tests {
         let sso_region = eu_cred.effective_auth_region(&config);
         assert_eq!(
             rest_api_region_candidates(sso_region),
-            ["eu-central-1", "us-east-1"]
+            ["eu-west-1", "us-east-1", "eu-central-1"]
         );
 
         // 未配置任何 region 的凭据回退到 config 默认 us-east-1
