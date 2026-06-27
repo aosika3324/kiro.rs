@@ -96,11 +96,15 @@ impl ResponseCache {
         }
     }
 
-    /// 计算缓存键：`hex(sha256(isolation_seed || model || messages_json || tools_json))`。
+    /// 计算缓存键：`hex(sha256(isolation_seed || model || stream || messages_json || tools_json))`。
     ///
     /// 在请求**转换/裁剪之前**用原始 `MessagesRequest` 计算，使键反映客户端真正发的内容；
     /// `isolation_seed` 复用 cache_metering 的会话隔离口径。序列化失败时退回空串参与哈希
     /// （极少见；只会降低命中率，不会错误命中）。
+    ///
+    /// `stream` 纳入键：流式（SSE）与非流式（JSON）响应体格式不同，命中回放时按 `is_sse`
+    /// 重建 Content-Type。若键不含 stream，`stream=false` 请求可能命中流式写入的 SSE 条目、
+    /// 收到 `text/event-stream` 而非期待的 `application/json`，导致客户端解析失败。
     pub fn compute_key(req: &MessagesRequest, key_id: u64) -> String {
         let seed = super::cache_metering::isolation_seed(req, key_id);
         let messages_json = serde_json::to_string(&req.messages).unwrap_or_default();
@@ -111,6 +115,7 @@ impl ResponseCache {
         h.update(b"\x00");
         h.update(req.model.as_bytes());
         h.update(b"\x00");
+        h.update(if req.stream { b"s\x00" } else { b"j\x00" });
         h.update(messages_json.as_bytes());
         h.update(b"\x00");
         h.update(tools_json.as_bytes());
@@ -330,6 +335,21 @@ mod tests {
         let a = ResponseCache::compute_key(&req_with("claude-opus-4-8", "hi"), 1);
         let b = ResponseCache::compute_key(&req_with("claude-opus-4-8", "hi"), 2);
         assert_ne!(a, b, "different client keys must not collide");
+    }
+
+    #[test]
+    fn stream_flag_changes_cache_key() {
+        // 回归：流式与非流式响应体格式不同（SSE vs JSON），不可共用同一缓存条目，
+        // 否则 stream=false 请求可能命中 SSE 条目、收到错误的 Content-Type。
+        let mut non_stream = req_with("claude-opus-4-8", "hi");
+        non_stream.stream = false;
+        let mut stream = req_with("claude-opus-4-8", "hi");
+        stream.stream = true;
+        assert_ne!(
+            ResponseCache::compute_key(&non_stream, 1),
+            ResponseCache::compute_key(&stream, 1),
+            "stream 与非 stream 必须产生不同缓存键"
+        );
     }
 
     #[test]
