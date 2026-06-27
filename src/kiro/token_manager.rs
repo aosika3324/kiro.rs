@@ -499,9 +499,18 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
+    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，依据凭据区域选择主端点，
+    // 失败时回退到另一个端点。
+    //
+    // 区域种子以 **profileArn 区域** 为准（对齐 kiro-go `kiroRegionForProfile`）：profileArn
+    // 的区域段才是真实数据面/用量服务区域（如 eu-central-1），而 auth/SSO 区域可能不同。
+    // 此前用 `effective_auth_region`(常解析为 us-east-1)→ 首个候选发到 codewhisperer.us-east-1
+    // 却带 eu-central-1 的 profileArn → 区域/profile 不匹配 → 400 "Improperly formed request"。
+    // 无真实 profileArn(BuilderID 占位符 / API Key)时回落 auth 区域,保持原行为。
+    let sso_region = credentials
+        .effective_profile_arn()
+        .and_then(crate::kiro::model::credentials::region_from_profile_arn)
+        .unwrap_or_else(|| credentials.effective_auth_region(config));
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
@@ -580,11 +589,13 @@ pub(crate) async fn get_usage_limits(
 
         let body_text = response.text().await.unwrap_or_default();
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403（权限/区域）或 400（区域与 profileArn 不匹配时上游报 "Improperly formed
+        // request"）且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC/external_idp 跨区兼容）。
+        if (status.as_u16() == 403 || status.as_u16() == 400) && idx + 1 < candidates.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 {}，尝试备用端点 {}",
                 region,
+                status.as_u16(),
                 candidates[idx + 1]
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -4943,6 +4954,43 @@ mod tests {
             rest_api_region_candidates_with(sso_region, None),
             ["us-east-1", "eu-central-1"]
         );
+    }
+
+    #[test]
+    fn test_usage_limits_region_seed_prefers_profile_arn_region() {
+        // 回归 v0.6.28→v0.6.29:external_idp(Azure/Entra)凭据的 auth/SSO 区域常为
+        // us-east-1,但 profileArn 在 eu-central-1。getUsageLimits 必须以 profileArn 区域
+        // 为种子,否则首个候选发到 codewhisperer.us-east-1 却带 eu-central-1 profileArn →
+        // 上游 400 "Improperly formed request" → 余额刷新 502。
+        let config = Config::default(); // 默认 region = us-east-1
+
+        let mut eu_idp = KiroCredentials::default();
+        // auth 区域留空 → effective_auth_region 回落 config 的 us-east-1（模拟 Azure 租户）。
+        eu_idp.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:217422363316:profile/GNGVMQHECWM7".to_string());
+
+        // 修复后的种子逻辑(与 get_usage_limits 内一致):profileArn 区域优先。
+        let seed = eu_idp
+            .effective_profile_arn()
+            .and_then(crate::kiro::model::credentials::region_from_profile_arn)
+            .unwrap_or_else(|| eu_idp.effective_auth_region(&config));
+        assert_eq!(seed, "eu-central-1", "种子区域必须取自 profileArn");
+
+        // eu-central-1 排在首位 → 首个探测命中 q.eu-central-1.amazonaws.com（正确主机）。
+        assert_eq!(
+            rest_api_region_candidates_with(seed, None),
+            ["eu-central-1", "us-east-1"]
+        );
+
+        // 无真实 profileArn(BuilderID 占位符)时回落 auth 区域,保持旧行为。
+        let mut builder_id = KiroCredentials::default();
+        builder_id.profile_arn =
+            Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
+        let seed_fallback = builder_id
+            .effective_profile_arn()
+            .and_then(crate::kiro::model::credentials::region_from_profile_arn)
+            .unwrap_or_else(|| builder_id.effective_auth_region(&config));
+        assert_eq!(seed_fallback, "us-east-1", "占位符 ARN 应回落 auth 区域");
     }
 
     #[test]
