@@ -186,30 +186,20 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 中转层 prompt cache（CacheMeter）的条目容量上限（默认 131072）。
+    /// 中转层 prompt cache 计量的**全局命中率 R** ∈ [0,1]（默认 0.8）。
     ///
-    /// 这是缓存命中率的关键旋钮：表满后按 LRU 淘汰，容量须 ≥ 写入速率 × TTL，
-    /// 否则历史前缀会在跨轮复用前被挤掉，长会话表现为 cache_read 恒为 0、
-    /// 每轮重建整段。高并发生产可按 `峰值 req/min × 每轮段数 × (300s/60)` 估算下限。
-    /// 运行时会被 clamp 到 `>= 256`。每条约 80B，131072 满载约 10MiB。
-    #[serde(default = "default_cache_meter_capacity")]
-    pub cache_meter_capacity: usize,
-
-    /// 计量模型「会话级不过期」模式（默认 false）。
-    ///
-    /// false（默认）：CacheMeter 写入的前缀段按 TTL（默认 5min）过期——与 Anthropic
-    /// ephemeral 缓存语义一致；对话间隔 > TTL 时历史前缀过期、重算成 cache_creation。
-    ///
-    /// true：前缀段在同一会话内逐字节重复就永久命中（不因时间窗过期，仅受容量 LRU
-    /// 约束）。命中率仅由对话结构决定（重复前缀 vs 本轮新输入），与对话节奏/时间无关
-    /// → 稳定、可预测。响应 `usage.cache_read/creation` 据此拆分（下游按官方价计费）。
-    /// 运行时可经 Admin API `/config/runtime-governance` 切换。
-    #[serde(default)]
-    pub cache_meter_session_scoped: bool,
+    /// 上游不做真实缓存，cache_creation/cache_read 是中转层合成给下游看的数字（见
+    /// `crate::anthropic::cache_metering`）。本旋钮直接控制：非首轮请求里，可缓存前缀
+    /// （system + tools + 历史）有多大比例计作 cache_read，其余计作 cache_creation。
+    /// 首轮（无历史）恒全部计作 creation。设 0 = 从不命中（全 creation）；设 0.95 =
+    /// 呈现 95% 缓存折扣。运行时可经 Admin API `/config/runtime-governance` 调整，
+    /// 并可被 per-key `cacheReadRatio` 覆盖。clamp 到 [0,1]。
+    #[serde(default = "default_cache_read_ratio")]
+    pub cache_read_ratio: f64,
 
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
-    /// 注意：这与 `cache_meter_capacity`（只模拟 token 计量）是两回事，本项缓存真实响应体。
+    /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
     #[serde(default)]
     pub response_cache_enabled: bool,
 
@@ -218,7 +208,7 @@ pub struct Config {
     pub response_cache_ttl_secs: u64,
 
     /// 响应缓存条目容量上限（默认 1024）。表满按 last_hit LRU 淘汰；运行时 clamp 到 `>= 16`。
-    /// 每条值是一段完整响应体（数十 KB 量级），故默认远小于 cache_meter_capacity。
+    /// 每条值是一段完整响应体（数十 KB 量级）。
     #[serde(default = "default_response_cache_capacity")]
     pub response_cache_capacity: usize,
 
@@ -379,8 +369,8 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
-fn default_cache_meter_capacity() -> usize {
-    131072
+fn default_cache_read_ratio() -> f64 {
+    0.8
 }
 
 fn default_response_cache_ttl_secs() -> u64 {
@@ -433,8 +423,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
-            cache_meter_capacity: default_cache_meter_capacity(),
-            cache_meter_session_scoped: false,
+            cache_read_ratio: default_cache_read_ratio(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),

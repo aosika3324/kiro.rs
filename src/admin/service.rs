@@ -167,8 +167,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 响应体缓存（与 anthropic 路由共享；运行时读写全局缓存开关 / TTL）
     response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
-    /// 提示词计量器（与 anthropic 路由共享；运行时切换会话级不过期计量模式）
-    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    /// 缓存计量运行时治理（与 anthropic 路由共享；运行时调整全局命中率 R）
+    meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
     /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
     /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
     quota_disable_threshold: Mutex<f64>,
@@ -512,7 +512,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             response_cache: None,
-            cache_meter: None,
+            meter_governance: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
         };
 
@@ -559,12 +559,12 @@ impl AdminService {
         self
     }
 
-    /// 注入提示词计量器句柄（与 anthropic 路由共享），用于运行时切换会话级不过期计量模式。
-    pub fn with_cache_meter(
+    /// 注入缓存计量运行时治理（与 anthropic 路由共享），用于运行时调整全局命中率 R。
+    pub fn with_meter_governance(
         mut self,
-        cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+        meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
     ) -> Self {
-        self.cache_meter = cache_meter;
+        self.meter_governance = meter_governance;
         self
     }
 
@@ -2068,15 +2068,15 @@ impl AdminService {
             quota_disable_threshold: *self.quota_disable_threshold.lock(),
             response_cache_enabled: rc_enabled,
             response_cache_ttl_secs: rc_ttl,
-            cache_meter_session_scoped: self
-                .cache_meter
+            cache_read_ratio: self
+                .meter_governance
                 .as_ref()
-                .map(|c| c.is_session_scoped())
-                .unwrap_or(false),
+                .map(|g| g.read_ratio())
+                .unwrap_or(0.0),
         }
     }
 
-    /// 更新运行时治理配置：改运行时值（配额阈值 / 缓存开关 / 缓存 TTL）+ 持久化 config.json。
+    /// 更新运行时治理配置：改运行时值（配额阈值 / 缓存开关 / 缓存 TTL / 命中率 R）+ 持久化 config.json。
     /// 任一字段缺省表示不修改。
     pub fn set_runtime_governance_config(
         &self,
@@ -2085,10 +2085,10 @@ impl AdminService {
         if req.quota_disable_threshold.is_none()
             && req.response_cache_enabled.is_none()
             && req.response_cache_ttl_secs.is_none()
-            && req.cache_meter_session_scoped.is_none()
+            && req.cache_read_ratio.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheMeterSessionScoped 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio 一个字段"
                     .to_string(),
             ));
         }
@@ -2109,6 +2109,14 @@ impl AdminService {
                 )));
             }
         }
+        if let Some(r) = req.cache_read_ratio {
+            if !(0.0..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheReadRatio 必须在 0..=1 内: {}",
+                    r
+                )));
+            }
+        }
 
         // 先改运行时值
         if let Some(t) = req.quota_disable_threshold {
@@ -2124,9 +2132,9 @@ impl AdminService {
                 c.set_default_ttl_secs(ttl);
             }
         }
-        if let Some(scoped) = req.cache_meter_session_scoped {
-            if let Some(c) = &self.cache_meter {
-                c.set_session_scoped(scoped);
+        if let Some(r) = req.cache_read_ratio {
+            if let Some(g) = &self.meter_governance {
+                g.set_read_ratio(r);
             }
         }
 
@@ -2141,8 +2149,8 @@ impl AdminService {
             if let Some(ttl) = req.response_cache_ttl_secs {
                 c.response_cache_ttl_secs = ttl;
             }
-            if let Some(scoped) = req.cache_meter_session_scoped {
-                c.cache_meter_session_scoped = scoped;
+            if let Some(r) = req.cache_read_ratio {
+                c.cache_read_ratio = r;
             }
         });
 

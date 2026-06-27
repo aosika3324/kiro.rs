@@ -258,17 +258,11 @@ async fn main() {
         );
     }
 
-    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    // 容量上限可经 config.cacheMeterCapacity 配置：太小会在高并发下提前 LRU 淘汰
-    // 历史前缀，导致长会话跨轮 miss、每轮重建整段（cache_read 恒为 0）。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_capacity(
-        Some(cache_dir.join("cache_metering.json")),
-        config.cache_meter_capacity,
-    ));
-    // 计量模型：会话级不过期模式（默认 false=按 TTL 过期）。运行时可经 Admin API 切换。
-    cache_meter.set_session_scoped(config.cache_meter_session_scoped);
-    cache_meter.clone().spawn_background();
+    // 缓存计量运行时治理：持有全局命中率 R（无状态结构化拆分，per-key 可覆盖）。
+    // 取代旧的有状态 CacheMeter——不再需要容量 / TTL / 落盘 / 后台任务。
+    let meter_governance = std::sync::Arc::new(
+        anthropic::cache_metering::MeterGovernance::new(config.cache_read_ratio),
+    );
 
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
     // 这样可经 Admin API 运行时开启而无需重启；全局开关 + TTL 作为运行时原子值存于缓存内，
@@ -286,7 +280,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(cache_meter.clone()),
+        Some(meter_governance.clone()),
         trace_store.clone(),
         config.usage_gated_streaming_enabled,
         Some(response_cache.clone()),
@@ -312,7 +306,7 @@ async fn main() {
                         Some(usage_recorder.clone()),
                     )
                     .with_response_cache(Some(response_cache.clone()))
-                    .with_cache_meter(Some(cache_meter.clone()));
+                    .with_meter_governance(Some(meter_governance.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

@@ -459,26 +459,27 @@ fn resolve_usage_input_tokens(
         .unwrap_or(fallback_total_input_tokens)
 }
 
+/// 计算本次请求的结构化缓存覆盖（无状态、确定性）。
+///
+/// `cache_enabled=false` 的 Key 直接返回默认（不模拟缓存，全量计入 input）。否则取该请求
+/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`（默认
+/// 0.8）——交给 `compute_structural_cache_usage` 做纯函数拆分。
 pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
     key_ctx: &KeyContext,
 ) -> super::cache_metering::CacheUsage {
-    if key_ctx.cache_enabled {
-        state
-            .cache_meter
-            .as_ref()
-            .map(|cache| super::cache_metering::compute_cache_usage(cache, payload, key_ctx.key_id))
-            .unwrap_or_else(|| {
-                super::cache_metering::compute_standard_cache_usage(None, payload, key_ctx.key_id)
-            })
-    } else {
-        super::cache_metering::compute_standard_cache_usage(
-            state.cache_meter.as_deref(),
-            payload,
-            key_ctx.key_id,
-        )
+    if !key_ctx.cache_enabled {
+        return super::cache_metering::CacheUsage::default();
     }
+    let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
+        state
+            .meter_governance
+            .as_ref()
+            .map(|g| g.read_ratio())
+            .unwrap_or(0.0)
+    });
+    super::cache_metering::compute_structural_cache_usage(payload, read_ratio)
 }
 
 /// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。

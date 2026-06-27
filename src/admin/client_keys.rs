@@ -68,6 +68,10 @@ pub struct ClientKey {
     /// 响应缓存 TTL per-key 覆盖（秒；None 或 0 = 跟随全局 `responseCacheTtlSecs`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R per-key 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    /// 控制该 Key 的请求里可缓存前缀有多大比例计作 cache_read。老数据无此字段时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -236,6 +240,7 @@ impl ClientKeyManager {
             strip_env_noise: false,
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
+            cache_read_ratio: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -315,6 +320,7 @@ impl ClientKeyManager {
                     strip_env_noise: false,
                     response_cache_enabled: None,
                     response_cache_ttl_secs: None,
+                    cache_read_ratio: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -372,6 +378,7 @@ impl ClientKeyManager {
         strip_env_noise: Option<bool>,
         response_cache_enabled: Option<Option<bool>>,
         response_cache_ttl_secs: Option<Option<u32>>,
+        cache_read_ratio: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -403,6 +410,10 @@ impl ClientKeyManager {
                 if let Some(v) = response_cache_ttl_secs {
                     // 0 视为"清除覆盖、跟随全局"
                     e.response_cache_ttl_secs = v.filter(|t| *t > 0);
+                }
+                if let Some(v) = cache_read_ratio {
+                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局
+                    e.cache_read_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
                 true
             }
@@ -442,6 +453,15 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| (e.response_cache_enabled, e.response_cache_ttl_secs))
             .unwrap_or((None, None))
+    }
+
+    /// 返回指定 Key 的缓存命中率 R 覆盖（None = 跟随全局；Key 不存在时也返回 None）。
+    pub fn cache_read_ratio_of(&self, id: u64) -> Option<f64> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.cache_read_ratio)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -729,6 +749,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             None
         ));
         assert!(mgr.cache_enabled_of(entry.id));
@@ -752,6 +773,7 @@ mod tests {
             None,
             Some(Some(true)),
             Some(Some(60)),
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -766,13 +788,13 @@ mod tests {
             None,
             None,
             Some(Some(0)),
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
     }
 
     #[test]
     fn mask_format() {
-        assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
     }
 

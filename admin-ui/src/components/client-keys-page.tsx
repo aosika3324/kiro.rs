@@ -74,6 +74,8 @@ export function ClientKeysPage() {
   const [editRespCache, setEditRespCache] = useState<'global' | 'on' | 'off'>('global')
   // 响应缓存 TTL 覆盖（秒）；空串=跟随全局
   const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
+  // 缓存命中率 R 覆盖：空串=跟随全局，否则 0~1
+  const [editCacheRatio, setEditCacheRatio] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -184,6 +186,7 @@ export function ClientKeysPage() {
       item.responseCacheEnabled == null ? 'global' : item.responseCacheEnabled ? 'on' : 'off',
     )
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
+    setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditOpen(true)
   }
 
@@ -199,6 +202,13 @@ export function ClientKeysPage() {
       toast.error('缓存 TTL 需在 1..=86400 秒，或留空跟随全局')
       return
     }
+    // 命中率覆盖：空串→null（复位跟随全局）；否则 0~1
+    const ratioRaw = editCacheRatio.trim()
+    const cacheReadRatio = ratioRaw === '' ? null : parseFloat(ratioRaw)
+    if (ratioRaw !== '' && (isNaN(cacheReadRatio as number) || (cacheReadRatio as number) < 0 || (cacheReadRatio as number) > 1)) {
+      toast.error('缓存命中率需在 0..=1，或留空跟随全局')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -212,6 +222,7 @@ export function ClientKeysPage() {
           stripEnvNoise: editStripEnvNoise,
           responseCacheEnabled: respCacheEnabled,
           responseCacheTtlSecs: respCacheTtl,
+          cacheReadRatio,
         },
       })
       toast.success('已更新')
@@ -638,6 +649,25 @@ export function ClientKeysPage() {
                     placeholder="跟随全局"
                     value={editRespCacheTtl}
                     onChange={(e) => setEditRespCacheTtl(e.target.value)}
+                    disabled={updateKey.isPending}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">缓存命中率 R 覆盖</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局；0~1。可缓存前缀里计作 cache_read 的比例（其余 creation）。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    placeholder="跟随全局"
+                    value={editCacheRatio}
+                    onChange={(e) => setEditCacheRatio(e.target.value)}
                     disabled={updateKey.isPending}
                     className="h-8 w-28 text-xs"
                   />

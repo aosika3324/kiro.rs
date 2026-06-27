@@ -505,9 +505,10 @@ pub struct RuntimeGovernanceConfigResponse {
     pub response_cache_enabled: bool,
     /// 全局响应缓存默认 TTL（秒）。
     pub response_cache_ttl_secs: u64,
-    /// 提示词计量「会话级不过期」模式：true=同会话重复前缀永久命中（命中率由对话结构
-    /// 决定、不随时间漂移）；false=按 TTL 过期（Anthropic ephemeral 语义）。
-    pub cache_meter_session_scoped: bool,
+    /// 缓存计量全局命中率 R ∈ [0,1]：可缓存前缀（system+tools+历史）有多大比例计作
+    /// cache_read，其余计作 cache_creation。首轮（无历史）恒全部计作 creation。
+    /// 0 = 从不命中；可被 per-key `cacheReadRatio` 覆盖。
+    pub cache_read_ratio: f64,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -523,9 +524,9 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u64>,
-    /// 提示词计量「会话级不过期」模式开关；缺省不修改。
+    /// 缓存计量全局命中率 R，范围 0..=1；缺省不修改。
     #[serde(default)]
-    pub cache_meter_session_scoped: Option<bool>,
+    pub cache_read_ratio: Option<f64>,
 }
 
 // ============ 代理池 ============
@@ -813,6 +814,9 @@ pub struct ClientKeyItem {
     /// 响应缓存 TTL 覆盖（秒；None = 跟随全局）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -877,6 +881,12 @@ pub struct UpdateClientKeyRequest {
     /// 响应缓存 TTL 覆盖更新（秒；字段缺省=不变更；0=清除覆盖、跟随全局）。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖更新 ∈ [0,1]。三态语义（double-option）：
+    /// - 字段缺省 → `None`：不变更
+    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随全局默认
+    /// - 数值 → `Some(Some(v))`：强制该 Key 的命中率（clamp 到 [0,1]）
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_read_ratio: Option<Option<f64>>,
 }
 
 /// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。

@@ -267,9 +267,9 @@ function RuntimeGovernanceButton() {
   const { mutate, isPending } = useSetRuntimeGovernanceConfig()
   const [threshold, setThreshold] = useState('')
   const [ttl, setTtl] = useState('')
+  const [ratio, setRatio] = useState('')
 
   const cacheEnabled = cfg?.responseCacheEnabled ?? false
-  const sessionScoped = cfg?.cacheMeterSessionScoped ?? false
 
   const save = (patch: Record<string, unknown>, ok: string) => {
     mutate(patch, {
@@ -298,6 +298,17 @@ function RuntimeGovernanceButton() {
     }
     save({ responseCacheTtlSecs: n }, '缓存 TTL 已更新')
     setTtl('')
+  }
+
+  const submitRatio = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseFloat(ratio)
+    if (isNaN(n) || n < 0 || n > 1) {
+      toast.error('命中率需在 0..=1')
+      return
+    }
+    save({ cacheReadRatio: n }, '缓存命中率已更新')
+    setRatio('')
   }
 
   return (
@@ -371,34 +382,29 @@ function RuntimeGovernanceButton() {
             保存
           </Button>
         </form>
-        <DropdownMenuLabel className="pt-1">提示词计量模式</DropdownMenuLabel>
-        <div className="px-2 pb-2">
-          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-            <div className="text-xs">
-              <div className="font-medium text-foreground">
-                {sessionScoped ? '会话级·不过期' : '按时间过期 (TTL)'}
-              </div>
-              <div className="leading-snug text-muted-foreground">
-                {sessionScoped
-                  ? '同会话重复前缀永久命中，命中率不随对话节奏漂移'
-                  : '前缀按 5min 过期，间隔久则重算为缓存写'}
-              </div>
-            </div>
-            <Switch
-              checked={sessionScoped}
-              disabled={isLoading || isPending}
-              onCheckedChange={(v) =>
-                save(
-                  { cacheMeterSessionScoped: v },
-                  v ? '已切到会话级不过期计量' : '已切回按时间过期计量',
-                )
-              }
-            />
-          </div>
-          <div className="px-0.5 pt-1 text-[10px] leading-snug text-muted-foreground">
-            影响响应 usage 的 cache_read / cache_creation 拆分（下游按此计费）。
-          </div>
+        <DropdownMenuLabel className="pt-1">
+          缓存命中率 R（当前 {cfg?.cacheReadRatio ?? '—'}）
+        </DropdownMenuLabel>
+        <div className="px-2 pb-1 text-[11px] leading-snug text-muted-foreground">
+          可缓存前缀（system+tools+历史）里计作 cache_read 的比例，其余计 cache_creation；
+          首轮恒全部为 creation。0=从不命中，0.95=呈现 95% 缓存折扣。可被各 Key 单独覆盖。
         </div>
+        <form onSubmit={submitRatio} className="flex items-center gap-1.5 px-2 pb-2">
+          <Input
+            type="number"
+            min={0}
+            max={1}
+            step={0.05}
+            placeholder="0 ~ 1"
+            value={ratio}
+            onChange={(e) => setRatio(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !ratio.trim()}>
+            保存
+          </Button>
+        </form>
       </DropdownMenuContent>
     </DropdownMenu>
   )
