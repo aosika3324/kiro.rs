@@ -436,40 +436,55 @@ async fn refresh_external_idp_token(
 }
 
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
-/// setUserPreference）的区域候选列表。
+/// setUserPreference / ListAvailableProfiles）的区域候选列表。
 ///
-/// 按凭据类型区分主机族，候选区域也随之不同：
-/// - **external_idp**（host `codewhisperer.{region}.amazonaws.com`）：该主机族
-///   **实测仅在 `us-east-1` 存在 DNS 记录**，`eu-central-1` 为 NXDOMAIN。追加
-///   eu-central-1 只会产生误导性的传输层错误并盖住真实结果，故 external_idp
-///   **只用 us-east-1**（凭据自身区域若非 us-east-1 也强制回落，因为别的区域无主机）。
-/// - **非 external_idp**（host `q.{region}.amazonaws.com`）：保留自适应策略——
-///   凭据自身区域优先，再追加兜底 `us-east-1` / `eu-central-1`，去重保序。
+/// 主机族由 [`external_idp_host`](crate::kiro::model::credentials::external_idp_host)
+/// 统一决定：`us-east-1` → `codewhisperer.us-east-1.amazonaws.com`，其余区域 →
+/// `q.{region}.amazonaws.com`（**不存在 `codewhisperer.{region}`**）。因此两类凭据
+/// 都能跨区探测，候选区域策略一致：
+/// - **external_idp**（企业 SSO / Azure 租户）：默认探测 `us-east-1` + `eu-central-1`
+///   （EU 租户的 profile 在 eu-central-1）。可用环境变量 `KIRO_PROFILE_REGIONS`
+///   （逗号分隔）覆盖兜底集合，无需改代码即可接入新区域。凭据自身区域若非空则优先。
+/// - **非 external_idp**（`q.*`）：凭据自身区域优先，再追加兜底 `us-east-1` /
+///   `eu-central-1`，去重保序。
 ///
-/// 配合调用处「传输层错误也回退下一个候选」的逻辑，自适应分支即使某区域端点
+/// 配合调用处「传输层错误 / 空结果 / 403 也回退下一个候选」的逻辑，即使某区域端点
 /// 暂不可用也能自动切换。
-fn rest_api_region_candidates(sso_region: &str, is_external_idp: bool) -> Vec<String> {
-    // external_idp：codewhisperer.* 仅 us-east-1 有 DNS，单候选即可，杜绝 NXDOMAIN 噪声。
-    if is_external_idp {
-        return vec!["us-east-1".to_string()];
-    }
+fn rest_api_region_candidates(sso_region: &str) -> Vec<String> {
+    // 兜底区域：优先读环境变量 KIRO_PROFILE_REGIONS（逗号分隔）覆盖，否则用内置两区。
+    //    对齐 Kiro-Go defaultKiroProfileRegions = ["us-east-1", "eu-central-1"]。
+    let fallback = std::env::var("KIRO_PROFILE_REGIONS")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    rest_api_region_candidates_with(sso_region, fallback.as_deref())
+}
 
-    // 非 external_idp（q.*）：自适应两区兜底。顺序即回退优先级。
-    const FALLBACK_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
-
-    let mut candidates: Vec<String> = Vec::with_capacity(FALLBACK_REGIONS.len() + 1);
-    let mut push_unique = |region: &str| {
+/// `rest_api_region_candidates` 的纯函数核心：兜底区域显式传入，便于测试且不依赖进程环境。
+/// `fallback_csv` 为 `Some` 时按逗号分隔覆盖内置兜底集合，否则用 `us-east-1` / `eu-central-1`。
+fn rest_api_region_candidates_with(sso_region: &str, fallback_csv: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    let push_unique = |region: &str, list: &mut Vec<String>| {
         let region = region.trim();
-        if !region.is_empty() && !candidates.iter().any(|r| r == region) {
-            candidates.push(region.to_string());
+        if !region.is_empty() && !list.iter().any(|r| r == region) {
+            list.push(region.to_string());
         }
     };
 
-    // 1) 凭据自身区域优先
-    push_unique(sso_region);
-    // 2) 追加已知兜底区域
-    for region in FALLBACK_REGIONS {
-        push_unique(region);
+    // 1) 凭据自身区域优先（profileArn 区域 / SSO 区域）
+    push_unique(sso_region, &mut candidates);
+
+    // 2) 兜底区域
+    match fallback_csv {
+        Some(csv) => {
+            for region in csv.split(',') {
+                push_unique(region, &mut candidates);
+            }
+        }
+        None => {
+            for region in ["us-east-1", "eu-central-1"] {
+                push_unique(region, &mut candidates);
+            }
+        }
     }
 
     candidates
@@ -487,7 +502,7 @@ pub(crate) async fn get_usage_limits(
     // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
     // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
@@ -514,7 +529,7 @@ pub(crate) async fn get_usage_limits(
     let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
         let host = if is_external_idp {
-            format!("codewhisperer.{}.amazonaws.com", region)
+            crate::kiro::model::credentials::external_idp_host(region)
         } else {
             format!("q.{}.amazonaws.com", region)
         };
@@ -541,7 +556,7 @@ pub(crate) async fn get_usage_limits(
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 传输层错误(如某区域端点暂不可达)：
                 // 与 403 一样回退到下一个候选端点，而不是直接中断
                 if idx + 1 < candidates.len() {
                     tracing::debug!(
@@ -609,7 +624,7 @@ pub(crate) async fn get_available_models(
     // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -634,7 +649,7 @@ pub(crate) async fn get_available_models(
     let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
         let host = if is_external_idp {
-            format!("codewhisperer.{}.amazonaws.com", region)
+            crate::kiro::model::credentials::external_idp_host(region)
         } else {
             format!("q.{}.amazonaws.com", region)
         };
@@ -661,7 +676,7 @@ pub(crate) async fn get_available_models(
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 传输层错误(如某区域端点暂不可达)：
                 // 与 403 一样回退到下一个候选端点，而不是直接中断
                 if idx + 1 < candidates.len() {
                     tracing::debug!(
@@ -734,7 +749,7 @@ pub(crate) async fn list_available_profiles(
     tracing::debug!("正在获取可用 profile 列表...");
 
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -753,7 +768,7 @@ pub(crate) async fn list_available_profiles(
     let mut empty_seen = false;
     for region in candidates.iter() {
         let request = if is_external_idp {
-            let host = format!("codewhisperer.{}.amazonaws.com", region);
+            let host = crate::kiro::model::credentials::external_idp_host(region);
             let url = format!("https://{}/ListAvailableProfiles", host);
             client
                 .post(&url)
@@ -792,7 +807,7 @@ pub(crate) async fn list_available_profiles(
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 传输层错误(如某区域端点暂不可达)：
                 // 记录并尝试下一个候选端点
                 tracing::debug!("ListAvailableProfiles 连接 {} 失败: {}", region, e);
                 last_error = Some(format!("连接 {} 失败: {}", region, e));
@@ -844,7 +859,7 @@ pub(crate) async fn set_user_preference(
     // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
+    let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -874,7 +889,7 @@ pub(crate) async fn set_user_preference(
     let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
         let host = if is_external_idp {
-            format!("codewhisperer.{}.amazonaws.com", region)
+            crate::kiro::model::credentials::external_idp_host(region)
         } else {
             format!("q.{}.amazonaws.com", region)
         };
@@ -900,7 +915,7 @@ pub(crate) async fn set_user_preference(
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                // 传输层错误(如 EU 区域 codewhisperer.* 无 DNS 记录)：
+                // 传输层错误(如某区域端点暂不可达)：
                 // 与 403 一样回退到下一个候选端点，而不是直接中断
                 if idx + 1 < candidates.len() {
                     tracing::debug!(
@@ -4825,16 +4840,16 @@ mod tests {
     fn test_rest_api_region_candidates_us_default() {
         // 自身区域优先，再追加兜底区域；自身已是 us-east-1 时去重
         assert_eq!(
-            rest_api_region_candidates("us-east-1", false),
+            rest_api_region_candidates_with("us-east-1", None),
             ["us-east-1", "eu-central-1"]
         );
         // 自身区域非兜底区 → 排首位，兜底区依次追加
         assert_eq!(
-            rest_api_region_candidates("us-east-2", false),
+            rest_api_region_candidates_with("us-east-2", None),
             ["us-east-2", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("ap-southeast-1", false),
+            rest_api_region_candidates_with("ap-southeast-1", None),
             ["ap-southeast-1", "us-east-1", "eu-central-1"]
         );
     }
@@ -4843,39 +4858,66 @@ mod tests {
     fn test_rest_api_region_candidates_eu() {
         // eu-central-1 自身即兜底区 → 去重后排首位
         assert_eq!(
-            rest_api_region_candidates("eu-central-1", false),
+            rest_api_region_candidates_with("eu-central-1", None),
             ["eu-central-1", "us-east-1"]
         );
         // 其他 EU 区域 → 自身优先，再回退 us-east-1 / eu-central-1
         assert_eq!(
-            rest_api_region_candidates("eu-west-1", false),
+            rest_api_region_candidates_with("eu-west-1", None),
             ["eu-west-1", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("eu-north-1", false),
+            rest_api_region_candidates_with("eu-north-1", None),
             ["eu-north-1", "us-east-1", "eu-central-1"]
         );
     }
 
     #[test]
-    fn test_rest_api_region_candidates_external_idp_us_only() {
-        // external_idp 的 codewhisperer.* 主机仅 us-east-1 有 DNS：
-        // 无论自身 SSO 区域是什么，都只返回 us-east-1，杜绝 eu-central-1 NXDOMAIN 噪声。
-        assert_eq!(rest_api_region_candidates("us-east-1", true), ["us-east-1"]);
-        assert_eq!(rest_api_region_candidates("eu-central-1", true), ["us-east-1"]);
-        assert_eq!(rest_api_region_candidates("eu-west-1", true), ["us-east-1"]);
-        assert_eq!(rest_api_region_candidates("", true), ["us-east-1"]);
+    fn test_rest_api_region_candidates_external_idp_probes_both() {
+        // external_idp 不再锁死 us-east-1：us-east-1 → codewhisperer 主机，
+        // eu-central-1 → q.eu-central-1 主机（external_idp_host 统一决定），
+        // 两区都探测，EU 租户 profile 才能被解析。候选与非 external_idp 一致。
+        assert_eq!(
+            rest_api_region_candidates_with("us-east-1", None),
+            ["us-east-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates_with("eu-central-1", None),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates_with("", None),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_env_override() {
+        // KIRO_PROFILE_REGIONS 覆盖兜底集合（凭据自身区域仍优先、去重保序、忽略空白）。
+        assert_eq!(
+            rest_api_region_candidates_with("", Some("ap-southeast-1, eu-central-1")),
+            ["ap-southeast-1", "eu-central-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates_with("us-east-1", Some("ap-southeast-1")),
+            ["us-east-1", "ap-southeast-1"]
+        );
+        // 自身区域已在覆盖集合中 → 去重，不重复
+        assert_eq!(
+            rest_api_region_candidates_with("ap-southeast-1", Some("ap-southeast-1,us-east-1")),
+            ["ap-southeast-1", "us-east-1"]
+        );
     }
 
     #[test]
     fn test_rest_api_region_candidates_empty_falls_back() {
         // 空/空白自身区域被忽略，直接用兜底区域
         assert_eq!(
-            rest_api_region_candidates("", false),
+            rest_api_region_candidates_with("", None),
             ["us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("  ", false),
+            rest_api_region_candidates_with("  ", None),
             ["us-east-1", "eu-central-1"]
         );
     }
@@ -4890,7 +4932,7 @@ mod tests {
         eu_cred.region = Some("eu-west-1".to_string());
         let sso_region = eu_cred.effective_auth_region(&config);
         assert_eq!(
-            rest_api_region_candidates(sso_region, false),
+            rest_api_region_candidates_with(sso_region, None),
             ["eu-west-1", "us-east-1", "eu-central-1"]
         );
 
@@ -4898,7 +4940,7 @@ mod tests {
         let plain_cred = KiroCredentials::default();
         let sso_region = plain_cred.effective_auth_region(&config);
         assert_eq!(
-            rest_api_region_candidates(sso_region, false),
+            rest_api_region_candidates_with(sso_region, None),
             ["us-east-1", "eu-central-1"]
         );
     }

@@ -453,11 +453,65 @@ impl KiroCredentials {
                 .unwrap_or_else(|| self.default_profile_arn().to_string()),
         )
     }
+
+    /// external_idp 数据面区域：以已解析的 `profile_arn` 为准（profileArn 的区域段
+    /// 才是数据面区域，可能是 `eu-central-1` 等），无法解析时回落 `us-east-1`。
+    ///
+    /// 仅用于 external_idp 流式端点的主机/区域选择；其余凭据类型沿用 config 区域。
+    pub fn data_plane_region(&self) -> &str {
+        self.profile_arn
+            .as_deref()
+            .and_then(region_from_profile_arn)
+            .unwrap_or("us-east-1")
+    }
 }
 
 /// 判断给定 profileArn 是否为 BuilderID 占位符（非真实可用的 profile）。
 pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == BUILDER_ID_PROFILE_ARN
+}
+
+/// 从 profileArn 解析数据面区域。
+///
+/// ARN 形如 `arn:aws:codewhisperer:<REGION>:<ACCOUNT>:profile/<ID>`，
+/// 第 4 段（下标 3）即数据面区域（如 `us-east-1` / `eu-central-1`）。
+/// `account.region` 是 auth/OIDC 区域，可能与 profile 区域不同，故数据面路由
+/// 必须以 profileArn 为准（对齐 Kiro-Go `regionFromProfileArn`）。
+pub fn region_from_profile_arn(arn: &str) -> Option<&str> {
+    let mut parts = arn.trim().splitn(6, ':');
+    match (
+        parts.next(), // "arn"
+        parts.next(), // "aws"
+        parts.next(), // "codewhisperer"
+        parts.next(), // <REGION>
+    ) {
+        (Some("arn"), Some("aws"), Some("codewhisperer"), Some(region)) => {
+            let region = region.trim();
+            if region.is_empty() {
+                None
+            } else {
+                Some(region)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 计算 external_idp 数据面主机名。
+///
+/// 上游事实（见 Kiro-Go `regionalizeURLForRegion`）：CodeWhisperer REST 主机族
+/// **仅在 `us-east-1` 存在**；其余区域一律由区域化的 Amazon Q 主机
+/// `q.{region}.amazonaws.com` 提供服务，**不存在 `codewhisperer.{region}`**。
+/// 因此：
+/// - `us-east-1`（或空）→ `codewhisperer.us-east-1.amazonaws.com`
+/// - 其它区域 → `q.{region}.amazonaws.com`
+pub fn external_idp_host(region: &str) -> String {
+    let region = region.trim();
+    if region.is_empty() || region == "us-east-1" {
+        "codewhisperer.us-east-1.amazonaws.com".to_string()
+    } else {
+        format!("q.{}.amazonaws.com", region)
+    }
 }
 
 #[cfg(test)]
@@ -562,6 +616,77 @@ mod tests {
         assert!(!is_placeholder_profile_arn(
             "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123"
         ));
+    }
+
+    #[test]
+    fn test_region_from_profile_arn() {
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC"),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:us-east-1:638616132270:profile/XYZ"),
+            Some("us-east-1")
+        );
+        // 含前后空白
+        assert_eq!(
+            region_from_profile_arn("  arn:aws:codewhisperer:eu-west-1:1:profile/P  "),
+            Some("eu-west-1")
+        );
+        // BuilderID 占位符也是合法 ARN，区域为 us-east-1
+        assert_eq!(
+            region_from_profile_arn(BUILDER_ID_PROFILE_ARN),
+            Some("us-east-1")
+        );
+        // 非法 / 缺段
+        assert_eq!(region_from_profile_arn(""), None);
+        assert_eq!(region_from_profile_arn("not-an-arn"), None);
+        assert_eq!(region_from_profile_arn("arn:aws:s3:::bucket"), None);
+        assert_eq!(region_from_profile_arn("arn:aws:codewhisperer::1:profile/P"), None);
+    }
+
+    #[test]
+    fn test_external_idp_host() {
+        // us-east-1（或空）→ codewhisperer 主机
+        assert_eq!(
+            external_idp_host("us-east-1"),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            external_idp_host(""),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            external_idp_host("  "),
+            "codewhisperer.us-east-1.amazonaws.com"
+        );
+        // 其它区域 → 区域化 q 主机（不存在 codewhisperer.{region}）
+        assert_eq!(
+            external_idp_host("eu-central-1"),
+            "q.eu-central-1.amazonaws.com"
+        );
+        assert_eq!(
+            external_idp_host("ap-southeast-1"),
+            "q.ap-southeast-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_data_plane_region() {
+        // 以已解析的 profileArn 区域为准
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123:profile/REAL".to_string());
+        assert_eq!(cred.data_plane_region(), "eu-central-1");
+
+        // 无 profileArn → 回落 us-east-1
+        let plain = KiroCredentials::default();
+        assert_eq!(plain.data_plane_region(), "us-east-1");
+
+        // 占位符 profileArn（us-east-1）
+        let mut placeholder = KiroCredentials::default();
+        placeholder.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(placeholder.data_plane_region(), "us-east-1");
     }
 
     #[test]
