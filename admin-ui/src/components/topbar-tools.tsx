@@ -269,6 +269,7 @@ function RuntimeGovernanceButton() {
   const [ttl, setTtl] = useState('')
 
   const cacheEnabled = cfg?.responseCacheEnabled ?? false
+  const sessionScoped = cfg?.cacheMeterSessionScoped ?? false
 
   const save = (patch: Record<string, unknown>, ok: string) => {
     mutate(patch, {
@@ -370,6 +371,34 @@ function RuntimeGovernanceButton() {
             保存
           </Button>
         </form>
+        <DropdownMenuLabel className="pt-1">提示词计量模式</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">
+                {sessionScoped ? '会话级·不过期' : '按时间过期 (TTL)'}
+              </div>
+              <div className="leading-snug text-muted-foreground">
+                {sessionScoped
+                  ? '同会话重复前缀永久命中，命中率不随对话节奏漂移'
+                  : '前缀按 5min 过期，间隔久则重算为缓存写'}
+              </div>
+            </div>
+            <Switch
+              checked={sessionScoped}
+              disabled={isLoading || isPending}
+              onCheckedChange={(v) =>
+                save(
+                  { cacheMeterSessionScoped: v },
+                  v ? '已切到会话级不过期计量' : '已切回按时间过期计量',
+                )
+              }
+            />
+          </div>
+          <div className="px-0.5 pt-1 text-[10px] leading-snug text-muted-foreground">
+            影响响应 usage 的 cache_read / cache_creation 拆分（下游按此计费）。
+          </div>
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
   )

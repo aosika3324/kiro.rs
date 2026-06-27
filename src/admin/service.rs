@@ -167,6 +167,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 响应体缓存（与 anthropic 路由共享；运行时读写全局缓存开关 / TTL）
     response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
+    /// 提示词计量器（与 anthropic 路由共享；运行时切换会话级不过期计量模式）
+    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
     /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
     /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
     quota_disable_threshold: Mutex<f64>,
@@ -510,6 +512,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             response_cache: None,
+            cache_meter: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
         };
 
@@ -553,6 +556,15 @@ impl AdminService {
         response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
     ) -> Self {
         self.response_cache = response_cache;
+        self
+    }
+
+    /// 注入提示词计量器句柄（与 anthropic 路由共享），用于运行时切换会话级不过期计量模式。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    ) -> Self {
+        self.cache_meter = cache_meter;
         self
     }
 
@@ -2055,6 +2067,11 @@ impl AdminService {
             quota_disable_threshold: *self.quota_disable_threshold.lock(),
             response_cache_enabled: rc_enabled,
             response_cache_ttl_secs: rc_ttl,
+            cache_meter_session_scoped: self
+                .cache_meter
+                .as_ref()
+                .map(|c| c.is_session_scoped())
+                .unwrap_or(false),
         }
     }
 
@@ -2067,9 +2084,10 @@ impl AdminService {
         if req.quota_disable_threshold.is_none()
             && req.response_cache_enabled.is_none()
             && req.response_cache_ttl_secs.is_none()
+            && req.cache_meter_session_scoped.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheMeterSessionScoped 一个字段"
                     .to_string(),
             ));
         }
@@ -2105,6 +2123,11 @@ impl AdminService {
                 c.set_default_ttl_secs(ttl);
             }
         }
+        if let Some(scoped) = req.cache_meter_session_scoped {
+            if let Some(c) = &self.cache_meter {
+                c.set_session_scoped(scoped);
+            }
+        }
 
         // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
         self.update_config_file(|c| {
@@ -2116,6 +2139,9 @@ impl AdminService {
             }
             if let Some(ttl) = req.response_cache_ttl_secs {
                 c.response_cache_ttl_secs = ttl;
+            }
+            if let Some(scoped) = req.cache_meter_session_scoped {
+                c.cache_meter_session_scoped = scoped;
             }
         });
 

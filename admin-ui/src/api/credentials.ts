@@ -474,11 +474,12 @@ export async function setLogGovernanceConfig(
   return data
 }
 
-// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）
+// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）+ 计量模式
 export interface RuntimeGovernanceConfig {
   quotaDisableThreshold: number
   responseCacheEnabled: boolean
   responseCacheTtlSecs: number
+  cacheMeterSessionScoped: boolean
 }
 
 // 获取运行时治理配置

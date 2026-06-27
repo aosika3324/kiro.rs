@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 默认条目上限（防止内存无限增长）。
 ///
@@ -41,6 +42,9 @@ const DEFAULT_CAPACITY: usize = 131072;
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
+/// 会话级模式下条目的 `expires_at` 哨兵值：永不因时间过期（仅受容量 LRU 约束）。
+/// 取 `i64::MAX`，使所有 `expires_at > now` 的过期判定天然成立，无需特判。
+const NEVER_EXPIRES: i64 = i64::MAX;
 
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +126,10 @@ pub struct CacheMeter {
     persist_path: Option<PathBuf>,
     /// 条目容量上限（超出按 last_hit LRU 淘汰）。见 [`DEFAULT_CAPACITY`]。
     capacity: usize,
+    /// 会话级不过期模式：开启后 `record` 写入哨兵 `expires_at`，前缀只要在同一
+    /// 会话内逐字节重复就永久命中（不因时间窗过期），命中率仅由对话结构决定。
+    /// 仍受容量 LRU 约束。运行时可经 Admin API 切换。
+    session_scoped: AtomicBool,
 }
 
 #[derive(Default)]
@@ -170,11 +178,21 @@ impl CacheMeter {
             inner: Mutex::new(inner),
             persist_path,
             capacity,
+            session_scoped: AtomicBool::new(false),
         }
     }
 
+    /// 开关会话级不过期模式（运行时可切，立即对后续 `record` 生效）。
+    pub fn set_session_scoped(&self, on: bool) {
+        self.session_scoped.store(on, Ordering::Relaxed);
+    }
+
+    /// 当前是否处于会话级不过期模式。
+    pub fn is_session_scoped(&self) -> bool {
+        self.session_scoped.load(Ordering::Relaxed)
+    }
+
     /// 查询一组前缀段哈希，返回每段命中情况；命中段会刷新 last_hit_at。
-    ///
     /// `segment_hashes` 顺序必须与请求中 cache_control 断点顺序一致；
     /// `segment_tokens` 是每段累计 tokens（即 segment_hashes[i] 对应的整段累加值）。
     pub fn lookup(&self, segment_hashes: &[u64], segment_tokens: &[u32]) -> Vec<SegmentResult> {
@@ -200,7 +218,13 @@ impl CacheMeter {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
         let now = now_secs();
-        let expires_at = now + ttl;
+        // 会话级模式：写入哨兵 expires_at，前缀永不因时间过期（仅受容量 LRU 约束）。
+        // 普通模式：按 ttl 过期（与 Anthropic ephemeral 缓存语义一致）。
+        let expires_at = if self.is_session_scoped() {
+            NEVER_EXPIRES
+        } else {
+            now + ttl
+        };
         let mut inner = self.inner.lock();
         for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
             inner.entries.insert(
@@ -923,6 +947,47 @@ mod tests {
         assert_eq!(parse_ttl(Some("5m")), 300);
         assert_eq!(parse_ttl(None), 300);
         assert_eq!(parse_ttl(Some("garbage")), 300);
+    }
+
+    #[test]
+    fn session_scoped_entries_never_expire_by_time() {
+        // 会话级模式：record 写入的段即便 ttl 很短，也不应因时间过期被 lookup 判 miss。
+        let cache = CacheMeter::new(None);
+        cache.set_session_scoped(true);
+        assert!(cache.is_session_scoped());
+        cache.record(&[42], &[100], 60); // ttl=60 在会话级模式下被忽略
+        let r = cache.lookup(&[42], &[100]);
+        assert!(r[0].hit, "会话级写入的条目不应因时间过期而 miss");
+        // 该条目的 expires_at 应为哨兵值。
+        {
+            let inner = cache.inner.lock();
+            assert_eq!(inner.entries.get(&42).unwrap().expires_at, NEVER_EXPIRES);
+        }
+    }
+
+    #[test]
+    fn session_scoped_still_evicts_by_capacity() {
+        // 会话级模式不靠时间过期，但仍受容量 LRU 约束（防止死会话无限占内存）。
+        let cache = CacheMeter::with_capacity(None, 256);
+        cache.set_session_scoped(true);
+        for h in 0u64..512 {
+            cache.record(&[h], &[1], 60);
+        }
+        assert_eq!(cache.len(), 256, "会话级模式下容量上限仍生效，多出的按 LRU 淘汰");
+    }
+
+    #[test]
+    fn session_scoped_off_restores_ttl_expiry() {
+        // 关闭会话级模式后，回到按 ttl 过期的原有行为。
+        let cache = CacheMeter::new(None);
+        cache.set_session_scoped(false);
+        cache.record(&[7], &[100], 60);
+        {
+            let mut inner = cache.inner.lock();
+            assert_ne!(inner.entries.get(&7).unwrap().expires_at, NEVER_EXPIRES);
+            inner.entries.get_mut(&7).unwrap().expires_at = now_secs() - 1;
+        }
+        assert!(!cache.lookup(&[7], &[100])[0].hit, "普通模式过期后应 miss");
     }
 
     #[test]

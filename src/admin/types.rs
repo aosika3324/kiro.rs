@@ -505,6 +505,9 @@ pub struct RuntimeGovernanceConfigResponse {
     pub response_cache_enabled: bool,
     /// 全局响应缓存默认 TTL（秒）。
     pub response_cache_ttl_secs: u64,
+    /// 提示词计量「会话级不过期」模式：true=同会话重复前缀永久命中（命中率由对话结构
+    /// 决定、不随时间漂移）；false=按 TTL 过期（Anthropic ephemeral 语义）。
+    pub cache_meter_session_scoped: bool,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -520,6 +523,9 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u64>,
+    /// 提示词计量「会话级不过期」模式开关；缺省不修改。
+    #[serde(default)]
+    pub cache_meter_session_scoped: Option<bool>,
 }
 
 // ============ 代理池 ============

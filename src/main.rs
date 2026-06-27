@@ -265,6 +265,8 @@ async fn main() {
         Some(cache_dir.join("cache_metering.json")),
         config.cache_meter_capacity,
     ));
+    // 计量模型：会话级不过期模式（默认 false=按 TTL 过期）。运行时可经 Admin API 切换。
+    cache_meter.set_session_scoped(config.cache_meter_session_scoped);
     cache_meter.clone().spawn_background();
 
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
@@ -308,7 +310,8 @@ async fn main() {
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_response_cache(Some(response_cache.clone()));
+                    .with_response_cache(Some(response_cache.clone()))
+                    .with_cache_meter(Some(cache_meter.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

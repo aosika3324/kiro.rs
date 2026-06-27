@@ -195,6 +195,18 @@ pub struct Config {
     #[serde(default = "default_cache_meter_capacity")]
     pub cache_meter_capacity: usize,
 
+    /// 计量模型「会话级不过期」模式（默认 false）。
+    ///
+    /// false（默认）：CacheMeter 写入的前缀段按 TTL（默认 5min）过期——与 Anthropic
+    /// ephemeral 缓存语义一致；对话间隔 > TTL 时历史前缀过期、重算成 cache_creation。
+    ///
+    /// true：前缀段在同一会话内逐字节重复就永久命中（不因时间窗过期，仅受容量 LRU
+    /// 约束）。命中率仅由对话结构决定（重复前缀 vs 本轮新输入），与对话节奏/时间无关
+    /// → 稳定、可预测。响应 `usage.cache_read/creation` 据此拆分（下游按官方价计费）。
+    /// 运行时可经 Admin API `/config/runtime-governance` 切换。
+    #[serde(default)]
+    pub cache_meter_session_scoped: bool,
+
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
     /// 注意：这与 `cache_meter_capacity`（只模拟 token 计量）是两回事，本项缓存真实响应体。
@@ -422,6 +434,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_meter_capacity: default_cache_meter_capacity(),
+            cache_meter_session_scoped: false,
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
