@@ -842,15 +842,28 @@ impl AdminService {
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
+        let current_id = snapshot.current_id;
+        let threshold = self.token_manager.config().quota_disable_threshold;
+        // 阈值 >= 100 视为关闭自动配额禁用：行为与旧版一致（只刷新启用账号、不自动增减禁用状态）。
+        let auto_quota = threshold < 100.0;
+
         let mut success = 0_usize;
         let mut failure = 0_usize;
+        let mut auto_disabled = 0_usize;
+        let mut auto_reenabled = 0_usize;
+        let mut switched_current = false;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            // 默认跳过禁用账号；但开启自动配额时，仍轮询"因配额被自动禁用"的账号以探测用量回落恢复。
+            let is_quota_disabled =
+                entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded");
+            if entry.disabled && !(auto_quota && is_quota_disabled) {
                 continue;
             }
+
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    let pct = balance.usage_percentage;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -862,6 +875,46 @@ impl AdminService {
                         );
                     }
                     success += 1;
+
+                    if auto_quota {
+                        if !entry.disabled && pct >= threshold {
+                            // 用量达阈值：自动以 QuotaExceeded 原因禁用
+                            match self.token_manager.disable_quota_exceeded(entry.id) {
+                                Ok(()) => {
+                                    auto_disabled += 1;
+                                    if entry.id == current_id {
+                                        switched_current = true;
+                                    }
+                                    tracing::info!(
+                                        "配额自动禁用：凭据 #{} 用量 {:.1}% ≥ 阈值 {:.1}%",
+                                        entry.id,
+                                        pct,
+                                        threshold
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("配额自动禁用凭据 #{} 失败: {}", entry.id, e)
+                                }
+                            }
+                        } else if is_quota_disabled && pct < threshold {
+                            // 用量回落到阈值以下：自动重新启用（仅限因配额禁用的）
+                            match self.token_manager.reenable_if_quota_recovered(entry.id) {
+                                Ok(true) => {
+                                    auto_reenabled += 1;
+                                    tracing::info!(
+                                        "配额自动恢复：凭据 #{} 用量 {:.1}% < 阈值 {:.1}%，已重新启用",
+                                        entry.id,
+                                        pct,
+                                        threshold
+                                    );
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!("配额自动恢复凭据 #{} 失败: {}", entry.id, e)
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
@@ -872,8 +925,21 @@ impl AdminService {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
 
+        // 当前凭据被自动禁用时，切到下一个可用凭据
+        if switched_current {
+            let _ = self.token_manager.switch_to_next();
+        }
+
         if success > 0 {
             self.save_balance_cache();
+        }
+        if auto_disabled > 0 || auto_reenabled > 0 {
+            tracing::info!(
+                "配额阈值巡检（阈值 {:.1}%）：自动禁用 {}，自动恢复 {}",
+                threshold,
+                auto_disabled,
+                auto_reenabled
+            );
         }
         (success, failure)
     }

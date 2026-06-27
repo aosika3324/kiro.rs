@@ -3102,6 +3102,33 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 配额回落后自动重新启用：**仅当**该凭据当前正因 `QuotaExceeded` 被禁用时才启用。
+    ///
+    /// 其它禁用原因（手动 / 失败 / 刷新失败 / 配置无效 / refresh 失效）一律不动，避免把
+    /// 用户手动停用或因故障停用的账号误启用。返回 `Ok(true)` 表示本次确实执行了重新启用。
+    /// 启用后按优先级重新选当前凭据（恢复的高优先级账号可能立即被选回）。
+    pub fn reenable_if_quota_recovered(&self, id: u64) -> anyhow::Result<bool> {
+        let changed = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled && entry.disabled_reason == Some(DisabledReason::QuotaExceeded) {
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.select_highest_priority();
+            self.persist_credentials()?;
+        }
+        Ok(changed)
+    }
+
     /// 设置凭据优先级（Admin API）
     ///
     /// 修改优先级后会立即按新优先级重新选择当前凭据。
@@ -4722,7 +4749,36 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
     }
 
-    // ============ 凭据级 Region 优先级测试 ============
+    #[tokio::test]
+    async fn test_reenable_if_quota_recovered_only_targets_quota_disabled() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // #1 因配额禁用 → 可被自动恢复
+        manager.report_quota_exhausted(1);
+        // #2 手动禁用 → 不应被自动恢复
+        manager.set_disabled(2, true).unwrap();
+        assert_eq!(manager.available_count(), 0);
+
+        // 配额禁用的 #1：返回 true 并恢复
+        assert!(manager.reenable_if_quota_recovered(1).unwrap());
+        assert_eq!(manager.available_count(), 1);
+
+        // 手动禁用的 #2：返回 false，保持禁用
+        assert!(!manager.reenable_if_quota_recovered(2).unwrap());
+        assert_eq!(manager.available_count(), 1);
+
+        // 已启用的 #1 再调用：无配额禁用状态，返回 false
+        assert!(!manager.reenable_if_quota_recovered(1).unwrap());
+
+        // 不存在的 ID：返回错误
+        assert!(manager.reenable_if_quota_recovered(999).is_err());
+    }
+
 
     #[test]
     fn test_credential_region_priority_uses_credential_auth_region() {
