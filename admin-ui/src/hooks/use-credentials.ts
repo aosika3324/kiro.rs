@@ -21,6 +21,8 @@ import {
   setLogGovernanceConfig,
   getRuntimeGovernanceConfig,
   setRuntimeGovernanceConfig,
+  getModelMappings,
+  setModelMappings,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -265,6 +267,25 @@ export function useSetRuntimeGovernanceConfig() {
     mutationFn: setRuntimeGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['runtimeGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取模型映射规则列表
+export function useModelMappings() {
+  return useQuery({
+    queryKey: ['modelMappings'],
+    queryFn: getModelMappings,
+  })
+}
+
+// 整表替换模型映射规则
+export function useSetModelMappings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelMappings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelMappings'] })
     },
   })
 }

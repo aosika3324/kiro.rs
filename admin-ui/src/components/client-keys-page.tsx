@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Shuffle,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -24,6 +24,7 @@ import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { ModelMappingDialog } from '@/components/model-mapping-dialog'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -54,6 +55,7 @@ export function ClientKeysPage() {
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
+  const [mappingOpen, setMappingOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
@@ -250,9 +252,14 @@ export function ClientKeysPage() {
             分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
           </p>
         </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button onClick={() => setMappingOpen(true)} size="sm" variant="outline">
+            <Shuffle className="h-3.5 w-3.5" />模型映射
+          </Button>
+          <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Plus className="h-3.5 w-3.5" />新建 Key
+          </Button>
+        </div>
       </div>
 
       {isLoading ? (
@@ -452,9 +459,9 @@ export function ClientKeysPage() {
             </div>
             <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
               <div>
-                <div className="text-sm font-medium">Prompt cache</div>
+                <div className="text-sm font-medium">Prompt cache 计量</div>
                 <p className="text-[11px] text-muted-foreground">
-                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
+                  合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
                 </p>
               </div>
               <Switch
@@ -533,7 +540,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组及缓存行为（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -557,18 +564,42 @@ export function ClientKeysPage() {
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
             </div>
-            <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
-              <div>
-                <div className="text-sm font-medium">Prompt cache</div>
-                <p className="text-[11px] text-muted-foreground">
-                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
-                </p>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 text-sm font-medium">Prompt cache 计量</div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">启用计量合成</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editCacheEnabled}
+                    onCheckedChange={setEditCacheEnabled}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">read 留存 R 覆盖</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅在启用计量合成时生效。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    placeholder="跟随全局"
+                    value={editCacheRatio}
+                    onChange={(e) => setEditCacheRatio(e.target.value)}
+                    disabled={updateKey.isPending || !editCacheEnabled}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
               </div>
-              <Switch
-                checked={editCacheEnabled}
-                onCheckedChange={setEditCacheEnabled}
-                disabled={updateKey.isPending}
-              />
             </div>
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium text-pink-600">提示词过滤</div>
@@ -653,25 +684,6 @@ export function ClientKeysPage() {
                     className="h-8 w-28 text-xs"
                   />
                 </div>
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm">缓存 read 留存 R 覆盖</div>
-                    <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。
-                    </p>
-                  </div>
-                  <Input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    placeholder="跟随全局"
-                    value={editCacheRatio}
-                    onChange={(e) => setEditCacheRatio(e.target.value)}
-                    disabled={updateKey.isPending}
-                    className="h-8 w-28 text-xs"
-                  />
-                </div>
               </div>
             </div>
             <DialogFooter>
@@ -683,6 +695,8 @@ export function ClientKeysPage() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <ModelMappingDialog open={mappingOpen} onOpenChange={setMappingOpen} />
     </div>
   )
 }

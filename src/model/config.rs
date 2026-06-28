@@ -213,6 +213,11 @@ pub struct Config {
     #[serde(default = "default_response_cache_capacity")]
     pub response_cache_capacity: usize,
 
+    /// OpenAI 端点的可配置模型映射规则（全局，运行时经 Admin API 热编辑）。
+    /// 客户端模型名按规则映射到目标 Claude 模型名，再交给下游解析。空表示不映射。
+    #[serde(default)]
+    pub model_mappings: Vec<crate::openai::model_mapping::ModelMappingRule>,
+
     /// 上游凭据配额自动禁用阈值（百分比，默认 90）。仿 kiro-account-manager：
     /// 每次刷新余额后，若该凭据用量百分比 ≥ 此阈值则自动禁用（reason "配额已满"）；
     /// 用量回落到阈值以下且此前正是因配额被自动禁用时，自动重新启用。
@@ -428,6 +433,7 @@ impl Default for Config {
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
+            model_mappings: Vec::new(),
             quota_disable_threshold: default_quota_disable_threshold(),
             account_acquire_blocking: false,
             usage_gated_streaming_enabled: default_usage_gated_streaming_enabled(),

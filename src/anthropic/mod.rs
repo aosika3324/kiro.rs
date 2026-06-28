@@ -24,6 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
+pub use converter::map_model;
 pub(crate) mod handlers;
 pub mod middleware;
 mod payload_truncate;

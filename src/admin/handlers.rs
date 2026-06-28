@@ -596,6 +596,24 @@ pub async fn set_runtime_governance_config(
     }
 }
 
+/// GET /api/admin/config/model-mappings
+/// 获取 OpenAI 端点模型映射规则列表
+pub async fn get_model_mappings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_mappings())
+}
+
+/// PUT /api/admin/config/model-mappings
+/// 整表替换模型映射规则（运行时生效 + 持久化 config.json）
+pub async fn set_model_mappings(
+    State(state): State<AdminState>,
+    Json(payload): Json<Vec<crate::openai::model_mapping::ModelMappingRule>>,
+) -> impl IntoResponse {
+    match state.service.set_model_mappings(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/auth/idc/start
 /// 发起 IdC 设备授权登录
 pub async fn start_idc_login(

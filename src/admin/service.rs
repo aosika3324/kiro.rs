@@ -220,6 +220,8 @@ pub struct AdminService {
     response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
     /// 缓存计量运行时治理（与 anthropic 路由共享；运行时调整全局命中率 R）
     meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
+    /// OpenAI 端点模型映射表（与 anthropic 路由共享；运行时热编辑规则）
+    model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
     /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
     /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
     quota_disable_threshold: Mutex<f64>,
@@ -564,6 +566,7 @@ impl AdminService {
             usage_recorder: None,
             response_cache: None,
             meter_governance: None,
+            model_mappings: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
         };
 
@@ -616,6 +619,15 @@ impl AdminService {
         meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
     ) -> Self {
         self.meter_governance = meter_governance;
+        self
+    }
+
+    /// 注入模型映射表（与 anthropic 路由共享），用于运行时热编辑映射规则。
+    pub fn with_model_mappings(
+        mut self,
+        model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    ) -> Self {
+        self.model_mappings = model_mappings;
         self
     }
 
@@ -2227,6 +2239,60 @@ impl AdminService {
         });
 
         Ok(self.get_runtime_governance_config())
+    }
+
+    /// 获取当前模型映射规则列表（OpenAI 端点）。未注入映射表时返回空列表。
+    pub fn get_model_mappings(&self) -> Vec<crate::openai::model_mapping::ModelMappingRule> {
+        self.model_mappings
+            .as_ref()
+            .map(|m| m.get_all())
+            .unwrap_or_default()
+    }
+
+    /// 整表替换模型映射规则：校验 → 改运行时值 → 持久化 config.json。
+    pub fn set_model_mappings(
+        &self,
+        rules: Vec<crate::openai::model_mapping::ModelMappingRule>,
+    ) -> Result<Vec<crate::openai::model_mapping::ModelMappingRule>, AdminServiceError> {
+        use std::collections::HashSet;
+        // 校验：规则类型合法、源/目标非空、目标可被下游 map_model 解析、源模型不重复。
+        let mut seen_sources: HashSet<&str> = HashSet::new();
+        for r in &rules {
+            if !r.is_valid_rule_type() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "规则类型仅支持 replace/alias: {}",
+                    r.rule_type
+                )));
+            }
+            if r.source_model.trim().is_empty() || r.target_model.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "源模型名与目标模型名不能为空".to_string(),
+                ));
+            }
+            if crate::anthropic::map_model(&r.target_model).is_none() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "目标模型无法解析（需为 Claude sonnet/opus/haiku 且带版本）: {}",
+                    r.target_model
+                )));
+            }
+            if !seen_sources.insert(r.source_model.as_str()) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "源模型名重复: {}",
+                    r.source_model
+                )));
+            }
+        }
+
+        // 改运行时值（立即对后续请求生效）
+        if let Some(m) = &self.model_mappings {
+            m.set_all(rules.clone());
+        }
+        // 持久化到 config.json
+        self.update_config_file(|c| {
+            c.model_mappings = rules.clone();
+        });
+
+        Ok(self.get_model_mappings())
     }
 
     fn persist_log_governance_config(

@@ -27,6 +27,7 @@
 
 pub mod convert;
 pub mod handlers;
+pub mod model_mapping;
 pub mod response;
 pub mod types;
 

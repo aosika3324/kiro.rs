@@ -274,6 +274,12 @@ async fn main() {
     ));
     response_cache.clone().spawn_background();
 
+    // 模型映射表：OpenAI 端点客户端模型名 → 目标 Claude 模型名（全局，运行时热编辑）。
+    // 始终构造（即使空表），便于经 Admin API 运行时增删而无需重启。
+    let model_mappings = std::sync::Arc::new(
+        openai::model_mapping::ModelMappings::new(config.model_mappings.clone()),
+    );
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -284,6 +290,7 @@ async fn main() {
         trace_store.clone(),
         config.usage_gated_streaming_enabled,
         Some(response_cache.clone()),
+        Some(model_mappings.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -306,7 +313,8 @@ async fn main() {
                         Some(usage_recorder.clone()),
                     )
                     .with_response_cache(Some(response_cache.clone()))
-                    .with_meter_governance(Some(meter_governance.clone()));
+                    .with_meter_governance(Some(meter_governance.clone()))
+                    .with_model_mappings(Some(model_mappings.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

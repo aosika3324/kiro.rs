@@ -59,6 +59,8 @@ pub struct AppState {
     pub meter_governance: Option<SharedMeterGovernance>,
     /// 响应体缓存（真实响应回放；全局开关 + TTL 作为运行时原子值存于缓存内部）
     pub response_cache: Option<super::response_cache::SharedResponseCache>,
+    /// OpenAI 端点可配置模型映射表（全局，运行时热编辑）
+    pub model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
     /// `/cc/v1` usage-gated streaming 开关（来自 config.usage_gated_streaming_enabled）。
@@ -78,6 +80,7 @@ impl AppState {
             usage_aggregator: None,
             meter_governance: None,
             response_cache: None,
+            model_mappings: None,
             trace_store: None,
             usage_gated_streaming: true,
         }
@@ -126,6 +129,15 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入 OpenAI 端点模型映射表（全局，运行时热编辑）。
+    pub fn with_model_mappings(
+        mut self,
+        mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    ) -> Self {
+        self.model_mappings = mappings;
         self
     }
 }

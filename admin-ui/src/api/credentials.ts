@@ -497,6 +497,33 @@ export async function setRuntimeGovernanceConfig(
   return data
 }
 
+// OpenAI 端点模型映射规则：客户端模型名 → 目标 Claude 模型名（全局、运行时热编辑）
+export interface ModelMappingRule {
+  id: string
+  name: string
+  enabled: boolean
+  /** 规则类型：'replace' | 'alias'（等价，取单一 targetModel） */
+  ruleType: string
+  /** 源模型名（客户端传入，精确匹配） */
+  sourceModel: string
+  /** 目标模型名（Claude 系，dashed，如 claude-opus-4-8） */
+  targetModel: string
+}
+
+// 获取模型映射规则列表
+export async function getModelMappings(): Promise<ModelMappingRule[]> {
+  const { data } = await api.get<ModelMappingRule[]>('/config/model-mappings')
+  return data
+}
+
+// 整表替换模型映射规则（运行时生效 + 持久化）
+export async function setModelMappings(
+  rules: ModelMappingRule[],
+): Promise<ModelMappingRule[]> {
+  const { data } = await api.put<ModelMappingRule[]>('/config/model-mappings', rules)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

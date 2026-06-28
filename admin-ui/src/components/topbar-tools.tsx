@@ -382,11 +382,12 @@ function RuntimeGovernanceButton() {
             保存
           </Button>
         </form>
+        <DropdownMenuLabel className="pt-1 text-pink-600">Prompt cache 计量（全局默认）</DropdownMenuLabel>
         <DropdownMenuLabel className="pt-1">
-          缓存 read 留存 R（当前 {cfg?.cacheReadRatio ?? '—'}）
+          read 留存 R（当前 {cfg?.cacheReadRatio ?? '—'}）
         </DropdownMenuLabel>
         <div className="px-2 pb-1 text-[11px] leading-snug text-muted-foreground">
-          delta 计量：creation 每轮只算新增一段（有界），历史增量进 read。R 是 read 留存阻尼，
+          合成给下游的 token 计量旋钮（不缓存真实响应）。delta 计量：creation 每轮只算新增一段（有界），历史增量进 read。R 是 read 留存阻尼，
           保留 read×R、其余按未命中推回 input，不触碰贵的 creation。1=给足折扣，0=不给。可被各 Key 覆盖。
         </div>
         <form onSubmit={submitRatio} className="flex items-center gap-1.5 px-2 pb-2">

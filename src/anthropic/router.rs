@@ -40,6 +40,7 @@ pub fn create_router_with_provider(
         None,
         true,
         None,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ pub fn create_router(
     trace_store: Option<SharedTraceStore>,
     usage_gated_streaming: bool,
     response_cache: Option<SharedResponseCache>,
+    model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -65,6 +67,7 @@ pub fn create_router(
     state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);
+    state = state.with_model_mappings(model_mappings);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

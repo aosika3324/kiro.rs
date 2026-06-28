@@ -99,6 +99,17 @@ pub async fn post_chat_completions(
         "Received POST /v1/chat/completions request"
     );
 
+    // 可配置模型映射（全局、运行时热编辑）：客户端模型名 → 目标 Claude 模型名。
+    // 命中规则即替换；未命中保持原名。在归一化前执行，目标 Claude 名随后由
+    // normalize_model / map_model 正常解析。
+    let mut req = req;
+    if let Some(mappings) = &state.model_mappings {
+        if let Some(target) = mappings.resolve(&req.model) {
+            tracing::debug!(from = %req.model, to = %target, "模型映射命中");
+            req.model = target;
+        }
+    }
+
     // 归一化成 Anthropic MessagesRequest（唯一新增转换层）
     let mut payload = to_messages_request(&req);
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
