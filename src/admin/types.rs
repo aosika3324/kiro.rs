@@ -529,6 +529,27 @@ pub struct SetRuntimeGovernanceConfigRequest {
     pub cache_read_ratio: Option<f64>,
 }
 
+/// 新建 Key 提示词过滤默认值（响应）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFilterDefaultsResponse {
+    pub simplify_cc_prompt: bool,
+    pub strip_boundary_markers: bool,
+    pub strip_env_noise: bool,
+}
+
+/// 更新新建 Key 提示词过滤默认值（字段缺省表示不修改）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPromptFilterDefaultsRequest {
+    #[serde(default)]
+    pub simplify_cc_prompt: Option<bool>,
+    #[serde(default)]
+    pub strip_boundary_markers: Option<bool>,
+    #[serde(default)]
+    pub strip_env_noise: Option<bool>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

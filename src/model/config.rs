@@ -218,6 +218,17 @@ pub struct Config {
     #[serde(default)]
     pub model_mappings: Vec<crate::openai::model_mapping::ModelMappingRule>,
 
+    /// 新建客户端 Key 时提示词过滤三开关的默认值（运行时经 Admin API 可改 + 持久化）。
+    /// 仅作为「新建默认」：建 Key 时继承这些值；现有 Key 不受影响，per-key 仍可各自覆盖。
+    #[serde(default)]
+    pub default_simplify_cc_prompt: bool,
+    /// 新建 Key 默认是否去除边界标记。见 [`Self::default_simplify_cc_prompt`]。
+    #[serde(default)]
+    pub default_strip_boundary_markers: bool,
+    /// 新建 Key 默认是否去除环境噪声。见 [`Self::default_simplify_cc_prompt`]。
+    #[serde(default)]
+    pub default_strip_env_noise: bool,
+
     /// 上游凭据配额自动禁用阈值（百分比，默认 90）。仿 kiro-account-manager：
     /// 每次刷新余额后，若该凭据用量百分比 ≥ 此阈值则自动禁用（reason "配额已满"）；
     /// 用量回落到阈值以下且此前正是因配额被自动禁用时，自动重新启用。
@@ -434,6 +445,9 @@ impl Default for Config {
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
             model_mappings: Vec::new(),
+            default_simplify_cc_prompt: false,
+            default_strip_boundary_markers: false,
+            default_strip_env_noise: false,
             quota_disable_threshold: default_quota_disable_threshold(),
             account_acquire_blocking: false,
             usage_gated_streaming_enabled: default_usage_gated_streaming_enabled(),

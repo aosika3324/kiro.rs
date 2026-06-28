@@ -614,6 +614,37 @@ pub async fn set_model_mappings(
     }
 }
 
+/// GET /api/admin/config/prompt-filter-defaults
+/// 获取新建 Key 的提示词过滤默认值
+pub async fn get_prompt_filter_defaults(State(state): State<AdminState>) -> impl IntoResponse {
+    let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
+        state.service.prompt_filter_defaults();
+    Json(super::types::PromptFilterDefaultsResponse {
+        simplify_cc_prompt,
+        strip_boundary_markers,
+        strip_env_noise,
+    })
+}
+
+/// PUT /api/admin/config/prompt-filter-defaults
+/// 部分更新新建 Key 的提示词过滤默认值（运行时生效 + 持久化 config.json）
+pub async fn set_prompt_filter_defaults(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetPromptFilterDefaultsRequest>,
+) -> impl IntoResponse {
+    let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
+        state.service.set_prompt_filter_defaults(
+            payload.simplify_cc_prompt,
+            payload.strip_boundary_markers,
+            payload.strip_env_noise,
+        );
+    Json(super::types::PromptFilterDefaultsResponse {
+        simplify_cc_prompt,
+        strip_boundary_markers,
+        strip_env_noise,
+    })
+}
+
 /// POST /api/admin/auth/idc/start
 /// 发起 IdC 设备授权登录
 pub async fn start_idc_login(
@@ -1030,6 +1061,7 @@ pub async fn create_client_key(
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
         payload.cache_enabled,
+        state.service.prompt_filter_defaults(),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,

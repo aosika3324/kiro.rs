@@ -23,6 +23,10 @@ import {
   setRuntimeGovernanceConfig,
   getModelMappings,
   setModelMappings,
+  getPromptFilterDefaults,
+  setPromptFilterDefaults,
+  getGlobalProxy,
+  setGlobalProxy,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -286,6 +290,44 @@ export function useSetModelMappings() {
     mutationFn: setModelMappings,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['modelMappings'] })
+    },
+  })
+}
+
+// 获取提示词过滤默认值
+export function usePromptFilterDefaults() {
+  return useQuery({
+    queryKey: ['promptFilterDefaults'],
+    queryFn: getPromptFilterDefaults,
+  })
+}
+
+// 更新提示词过滤默认值
+export function useSetPromptFilterDefaults() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setPromptFilterDefaults,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['promptFilterDefaults'] })
+    },
+  })
+}
+
+// 获取全局代理
+export function useGlobalProxy() {
+  return useQuery({
+    queryKey: ['globalProxy'],
+    queryFn: getGlobalProxy,
+  })
+}
+
+// 设置全局代理
+export function useSetGlobalProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setGlobalProxy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['globalProxy'] })
     },
   })
 }

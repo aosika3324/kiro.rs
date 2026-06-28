@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Shuffle,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -24,7 +24,6 @@ import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
-import { ModelMappingDialog } from '@/components/model-mapping-dialog'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -55,7 +54,6 @@ export function ClientKeysPage() {
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
-  const [mappingOpen, setMappingOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
@@ -252,14 +250,9 @@ export function ClientKeysPage() {
             分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button onClick={() => setMappingOpen(true)} size="sm" variant="outline">
-            <Shuffle className="h-3.5 w-3.5" />模型映射
-          </Button>
-          <Button onClick={() => setCreateOpen(true)} size="sm">
-            <Plus className="h-3.5 w-3.5" />新建 Key
-          </Button>
-        </div>
+        <Button onClick={() => setCreateOpen(true)} size="sm">
+          <Plus className="h-3.5 w-3.5" />新建 Key
+        </Button>
       </div>
 
       {isLoading ? (
@@ -695,8 +688,6 @@ export function ClientKeysPage() {
           </form>
         </DialogContent>
       </Dialog>
-
-      <ModelMappingDialog open={mappingOpen} onOpenChange={setMappingOpen} />
     </div>
   )
 }

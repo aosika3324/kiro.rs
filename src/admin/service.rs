@@ -225,6 +225,9 @@ pub struct AdminService {
     /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
     /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
     quota_disable_threshold: Mutex<f64>,
+    /// 新建客户端 Key 时提示词过滤三开关默认值 (simplify_cc, strip_boundary, strip_env)。
+    /// 运行时可改 + 持久化；仅影响新建 Key，现有 Key 不受影响。
+    prompt_filter_defaults: Mutex<(bool, bool, bool)>,
 }
 
 /// Social 登录会话状态
@@ -551,6 +554,14 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
         let quota_threshold = token_manager.config().quota_disable_threshold;
+        let prompt_filter_defaults = {
+            let c = token_manager.config();
+            (
+                c.default_simplify_cc_prompt,
+                c.default_strip_boundary_markers,
+                c.default_strip_env_noise,
+            )
+        };
 
         let svc = Self {
             token_manager,
@@ -568,6 +579,7 @@ impl AdminService {
             meter_governance: None,
             model_mappings: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
+            prompt_filter_defaults: Mutex::new(prompt_filter_defaults),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -2293,6 +2305,40 @@ impl AdminService {
         });
 
         Ok(self.get_model_mappings())
+    }
+
+    /// 获取新建 Key 的提示词过滤默认值 (simplify_cc, strip_boundary, strip_env)。
+    pub fn prompt_filter_defaults(&self) -> (bool, bool, bool) {
+        *self.prompt_filter_defaults.lock()
+    }
+
+    /// 部分更新新建 Key 的提示词过滤默认值：改运行时值 + 持久化 config.json。
+    /// 各字段 None 表示不修改。返回更新后的三元组。
+    pub fn set_prompt_filter_defaults(
+        &self,
+        simplify_cc: Option<bool>,
+        strip_boundary: Option<bool>,
+        strip_env: Option<bool>,
+    ) -> (bool, bool, bool) {
+        {
+            let mut g = self.prompt_filter_defaults.lock();
+            if let Some(v) = simplify_cc {
+                g.0 = v;
+            }
+            if let Some(v) = strip_boundary {
+                g.1 = v;
+            }
+            if let Some(v) = strip_env {
+                g.2 = v;
+            }
+        }
+        let cur = *self.prompt_filter_defaults.lock();
+        self.update_config_file(|c| {
+            c.default_simplify_cc_prompt = cur.0;
+            c.default_strip_boundary_markers = cur.1;
+            c.default_strip_env_noise = cur.2;
+        });
+        cur
     }
 
     fn persist_log_governance_config(

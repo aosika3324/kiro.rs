@@ -524,6 +524,27 @@ export async function setModelMappings(
   return data
 }
 
+// 新建客户端 Key 时提示词过滤三开关的默认值（全局、运行时可改）
+export interface PromptFilterDefaults {
+  simplifyCcPrompt: boolean
+  stripBoundaryMarkers: boolean
+  stripEnvNoise: boolean
+}
+
+// 获取提示词过滤默认值
+export async function getPromptFilterDefaults(): Promise<PromptFilterDefaults> {
+  const { data } = await api.get<PromptFilterDefaults>('/config/prompt-filter-defaults')
+  return data
+}
+
+// 更新提示词过滤默认值（部分字段，运行时生效 + 持久化）
+export async function setPromptFilterDefaults(
+  patch: Partial<PromptFilterDefaults>,
+): Promise<PromptFilterDefaults> {
+  const { data } = await api.put<PromptFilterDefaults>('/config/prompt-filter-defaults', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

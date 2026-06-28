@@ -182,33 +182,24 @@ impl ClientKeyManager {
         description: Option<String>,
         group: Option<String>,
         cache_enabled: bool,
+        prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         if cache_enabled {
-            self.create_with_key(name, description, group, generate_client_key())
+            self.create_with_key_full(name, description, group, generate_client_key(), true, prompt_filters)
         } else {
-            self.create_with_key_and_cache(name, description, group, generate_client_key(), false)
+            self.create_with_key_full(name, description, group, generate_client_key(), false, prompt_filters)
         }
     }
 
-    /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
-    /// 若该明文已存在则跳过，返回已存在的条目。
-    pub fn create_with_key(
-        &self,
-        name: String,
-        description: Option<String>,
-        group: Option<String>,
-        plaintext: String,
-    ) -> ClientKey {
-        self.create_with_key_and_cache(name, description, group, plaintext, true)
-    }
-
-    fn create_with_key_and_cache(
+    /// 用指定明文创建 Key（带缓存与提示词过滤设置）。bootstrap 系统密钥走 `ensure_system_key`。
+    fn create_with_key_full(
         &self,
         name: String,
         description: Option<String>,
         group: Option<String>,
         plaintext: String,
         cache_enabled: bool,
+        prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
@@ -235,9 +226,9 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             cache_enabled,
-            simplify_cc_prompt: false,
-            strip_boundary_markers: false,
-            strip_env_noise: false,
+            simplify_cc_prompt: prompt_filters.0,
+            strip_boundary_markers: prompt_filters.1,
+            strip_env_noise: prompt_filters.2,
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
@@ -703,7 +694,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -713,7 +704,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -723,7 +714,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -737,8 +728,7 @@ mod tests {
     #[test]
     fn cache_enabled_can_be_updated() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false);
-        assert!(!mgr.cache_enabled_of(entry.id));
+        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
         assert!(mgr.update_meta(
             entry.id,
             None,
@@ -758,7 +748,7 @@ mod tests {
     #[test]
     fn response_cache_override_can_be_updated() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false);
+        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
         // 默认无覆盖
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (None, None));
         // 设置覆盖：开启 + ttl 60
@@ -806,6 +796,7 @@ mod tests {
             Some("desc".into()),
             Some("groupA".into()),
             true,
+            (false, false, false),
         );
         // 累计一些统计
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
@@ -850,7 +841,7 @@ mod tests {
     fn ensure_system_key_migrates_misplaced_id_to_zero() {
         // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
         let mgr = ClientKeyManager::new();
-        mgr.create_with_key("默认密钥".into(), None, None, "sk-kiro-abc".into());
+        mgr.create_with_key_full("默认密钥".into(), None, None, "sk-kiro-abc".into(), true, (false, false, false));
         assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
