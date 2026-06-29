@@ -183,28 +183,84 @@ pub fn compute_structural_cache_usage(req: &MessagesRequest, read_ratio: f64) ->
     }
 }
 
-/// 估算一条 message 的 token：遍历 content blocks，文本 / thinking 走文本估算，
-/// 图片走 Anthropic 口径尺寸估算。string content 直接估算原文。
+/// 估算一条 message 的 token：遍历 content blocks，按块 `type` **完整分派**
+/// （text/thinking 文本、tool_use 参数、tool_result 内容、image 尺寸）。
+/// string content 直接估算原文。
+///
+/// 必须覆盖 agent 负载里的 `tool_use`(参数在 `.input`) / `tool_result`(文本嵌在
+/// `.content[]`) —— 它们在 Claude Code 多轮里常是 message 的主体。只数 text/thinking
+/// 会把这些 message 计成 ≈0，导致 `creation`(=倒数第二条 message，常为 assistant 的
+/// tool_use) 塌成 0、计量严重偏向 read。对齐 [`crate::token`] 的 `count_block_tokens` 分派口径。
 fn message_tokens(msg: &super::types::Message) -> i32 {
     match &msg.content {
         serde_json::Value::String(s) => estimate_tokens(s).max(0),
         serde_json::Value::Array(arr) => {
             let mut sum: i32 = 0;
             for v in arr {
-                if v.get("type").and_then(|t| t.as_str()) == Some("image") {
-                    let (media_type, data) = image_source_parts(v);
-                    sum = sum
-                        .saturating_add(crate::image_resize::estimate_image_tokens(media_type, data) as i32);
-                } else {
-                    let text = block_token_text(v);
-                    if !text.is_empty() {
-                        sum = sum.saturating_add(estimate_tokens(&text).max(0));
-                    }
-                }
+                sum = sum.saturating_add(block_tokens(v));
             }
             sum
         }
         _ => 0,
+    }
+}
+
+/// 估算单个 content block 的 token，按 `type` 完整分派。用本模块的 `estimate_tokens` /
+/// `estimate_image_tokens` 保持模块内口径一致（拆分是比例运算，分子分母同尺即可）。
+/// 宽松取值：字段缺失/异形只少计该块，不整块丢弃。
+fn block_tokens(v: &serde_json::Value) -> i32 {
+    let mut sum: i32 = 0;
+    // text / thinking：任何块都可能带（与 token.rs 一致，先无条件累加）。
+    if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
+        sum = sum.saturating_add(estimate_tokens(text).max(0));
+    }
+    if let Some(thinking) = v.get("thinking").and_then(|x| x.as_str()) {
+        sum = sum.saturating_add(estimate_tokens(thinking).max(0));
+    }
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("tool_use") => {
+            if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
+                sum = sum.saturating_add(estimate_tokens(name).max(0));
+            }
+            if let Some(input) = v.get("input") {
+                let s = serde_json::to_string(input).unwrap_or_default();
+                sum = sum.saturating_add(estimate_tokens(&s).max(0));
+            }
+        }
+        Some("tool_result") => {
+            sum = sum.saturating_add(tool_result_content_tokens(v.get("content")));
+        }
+        Some("image") => {
+            let (media_type, data) = image_source_parts(v);
+            sum = sum
+                .saturating_add(crate::image_resize::estimate_image_tokens(media_type, data) as i32);
+        }
+        _ => {}
+    }
+    sum
+}
+
+/// 估算 `tool_result.content` 的 token：string，或 `[{text}|{image}]` 数组
+/// （与转换器 `extract_tool_result_content` 的解析形态一致）；其它异形序列化兜底。
+fn tool_result_content_tokens(content: Option<&serde_json::Value>) -> i32 {
+    match content {
+        Some(serde_json::Value::String(s)) => estimate_tokens(s).max(0),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut sum: i32 = 0;
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|x| x.as_str()) {
+                    sum = sum.saturating_add(estimate_tokens(text).max(0));
+                } else if item.get("type").and_then(|x| x.as_str()) == Some("image") {
+                    let (media_type, data) = image_source_parts(item);
+                    sum = sum.saturating_add(
+                        crate::image_resize::estimate_image_tokens(media_type, data) as i32,
+                    );
+                }
+            }
+            sum
+        }
+        Some(other) => estimate_tokens(&other.to_string()).max(0),
+        None => 0,
     }
 }
 
@@ -217,20 +273,6 @@ fn tool_tokens(t: &Tool) -> i32 {
 /// system block 的 token 估算。
 fn system_tokens(s: &SystemMessage) -> i32 {
     estimate_tokens(&s.text).max(0)
-}
-
-/// content block 的 token 估算原文：仅 text + thinking 的纯文本。
-fn block_token_text(v: &serde_json::Value) -> String {
-    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    let text = s("text");
-    let thinking = s("thinking");
-    if thinking.is_empty() {
-        text.to_string()
-    } else if text.is_empty() {
-        thinking.to_string()
-    } else {
-        format!("{text} {thinking}")
-    }
 }
 
 /// 从 image content block 取 `(media_type, base64_data)`，缺字段时返回空串（估算走保底）。
@@ -548,6 +590,54 @@ mod tests {
         assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
         let (_, _, read) = u.split_against_total(u.prompt_total_est);
         assert!(read > img_tokens / 2, "含图历史进 read 桶");
+    }
+
+    #[test]
+    fn compute_tool_use_message_counted_as_creation() {
+        // 回归：agentic 轮里倒数第二条常是 assistant 的 tool_use（无顶层 text，参数在 .input）。
+        // 修复前只数 text/thinking → 该 message≈0 → creation 塌成 0。修复后必须计入 input 参数。
+        let big_args = "x".repeat(2000);
+        let tool_use = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "run_bash",
+                "input": { "command": big_args }
+            }]),
+        };
+        let toolu_est = message_tokens(&tool_use);
+        assert!(toolu_est > 100, "tool_use 参数必须计入 token，实得 {toolu_est}");
+
+        // 历史 (u1, assistant tool_use) + 本轮 user：creation = 倒数第二条 = tool_use。
+        let req = req_with(
+            vec![msg("user", "do something"), tool_use, msg("user", "next")],
+            None,
+        );
+        let u = compute_structural_cache_usage(&req, 1.0);
+        assert_eq!(u.creation_est, toolu_est, "creation 应等于 tool_use message 的 token");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert!(creation > 0, "修复后 cache_creation 不再塌成 0");
+        assert_eq!(input + creation + read, u.prompt_total_est);
+    }
+
+    #[test]
+    fn compute_tool_result_message_counted() {
+        // 回归：user 侧 tool_result 文本嵌在 .content[]（顶层无 text）。修复前整段被漏。
+        let big = "result line ".repeat(300);
+        let tool_result = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "tool_result", "tool_use_id": "toolu_1", "content": big
+            }]),
+        };
+        let tr_est = message_tokens(&tool_result);
+        assert!(tr_est > 100, "tool_result 内容必须计入，实得 {tr_est}");
+        // tool_result 作为历史前缀 → 进 read 桶，prompt_total 应含其 token。
+        let req = req_with(
+            vec![tool_result, msg("assistant", "ok"), msg("user", "q")],
+            None,
+        );
+        let u = compute_structural_cache_usage(&req, 1.0);
+        assert!(u.prompt_total_est > tr_est, "prompt_total 应含 tool_result token");
     }
 
     #[test]
