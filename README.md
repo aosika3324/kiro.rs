@@ -288,7 +288,7 @@ Admin API 鉴权同样支持：
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
-| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点（`ide` / `cli` / `codewhisperer`） |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
@@ -412,7 +412,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
-| `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
+| `endpoint` | `ide` / `cli` / `codewhisperer`，未填使用 `config.defaultEndpoint` |
 
 <a id="models"></a>
 ## 模型
