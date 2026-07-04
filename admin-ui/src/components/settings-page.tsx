@@ -161,14 +161,24 @@ function EndpointRoutingSection() {
   )
 }
 
+// 指纹计量命中率百分比（hits /(hits+misses)），无样本时显示 —。
+function hitRatePct(s: { hits: number; misses: number }): string {
+  const total = s.hits + s.misses
+  if (total <= 0) return '—'
+  return `${((s.hits / total) * 100).toFixed(1)}%`
+}
+
 // 缓存 / 配额治理
 function CacheQuotaSection() {
   const { data: cfg, isLoading } = useRuntimeGovernanceConfig()
   const { mutate, isPending } = useSetRuntimeGovernanceConfig()
   const [threshold, setThreshold] = useState('')
   const [ttl, setTtl] = useState('')
-  const [ratio, setRatio] = useState('')
   const [meterTtl, setMeterTtl] = useState('')
+  const [maxRatio, setMaxRatio] = useState('')
+  const [minTokens, setMinTokens] = useState('')
+  const [minTokensOpus, setMinTokensOpus] = useState('')
+  const [maxEntries, setMaxEntries] = useState('')
 
   const save = (patch: Record<string, unknown>, ok: string) =>
     mutate(patch, {
@@ -224,25 +234,78 @@ function CacheQuotaSection() {
         </form>
       </div>
 
-      <div>
-        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · read 留存 R（当前 {cfg?.cacheReadRatio ?? '—'}）</div>
-        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
-          合成给下游的 token 计量旋钮（不缓存真实响应）。保留 read×R、其余按未命中推回 input，不触碰 creation。1=给足折扣，0=不给。可被各 Key 覆盖。
+      <div className="rounded-md border border-pink-200/60 bg-pink-50/30 p-2.5 dark:border-pink-900/40 dark:bg-pink-950/10">
+        <div className="mb-2 text-sm font-medium text-pink-600">
+          Prompt cache 指纹计量（合成给下游的 token 计量，不缓存真实响应）
         </div>
-        <form onSubmit={num(ratio, 0, 1, parseFloat, 'cacheReadRatio', '缓存命中率已更新', () => setRatio(''))} className="flex items-center gap-1.5">
-          <Input type="number" min={0} max={1} step={0.05} placeholder="0 ~ 1" value={ratio} onChange={(e) => setRatio(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
-          <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !ratio.trim()}>保存</Button>
-        </form>
-      </div>
-      <div>
-        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · 缓存热度 TTL 秒（当前 {cfg?.cacheMeterTtlSecs ?? '—'}）</div>
-        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
-          会话首次出现、或距上次请求超此秒数（缓存已凉）→ 本轮判 cold：整段可缓存前缀按 creation（贵桶）重写计费、read=0，如同首轮。TTL 越短越多请求判 cold（creation 多、下游折扣少）；越长越易判 warm（更多 0.1× read 折扣）。默认 300（5min，对齐 Anthropic ephemeral）。
+        <div className="mb-2.5 text-[11px] leading-snug text-muted-foreground">
+          命中按<strong>内容指纹物理匹配</strong>（对齐 Kiro-Go）：相同前缀无论哪个会话/账号都命中。
+          下面 5 个参数控制命中率——TTL 越长、阈值越低、容量越大、上限越高 → 命中率越高。
+          {cfg?.cacheStats && (
+            <span className="mt-1 block text-pink-600/80">
+              实时统计：命中 {cfg.cacheStats.hits} / 未命中 {cfg.cacheStats.misses}
+              （命中率 {hitRatePct(cfg.cacheStats)}）· 表内 {cfg.cacheStats.entries}/{cfg.cacheStats.capacity}
+              · 淘汰 {cfg.cacheStats.evictions} · 过期 {cfg.cacheStats.expirations}
+            </span>
+          )}
         </div>
-        <form onSubmit={num(meterTtl, 1, 86400, (s) => parseInt(s, 10), 'cacheMeterTtlSecs', '缓存热度 TTL 已更新', () => setMeterTtl(''))} className="flex items-center gap-1.5">
-          <Input type="number" min={1} max={86400} placeholder="秒" value={meterTtl} onChange={(e) => setMeterTtl(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
-          <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
-        </form>
+
+        <div className="space-y-2.5">
+          <div>
+            <div className="mb-1 text-xs font-medium">断点默认 TTL 秒（当前 {cfg?.cacheMeterTtlSecs ?? '—'}）</div>
+            <div className="mb-1 text-[11px] leading-snug text-muted-foreground">
+              断点无显式 cache_control.ttl 时用此值。越长 → 缓存前缀留存越久 → 跨请求命中率↑。默认 300。
+            </div>
+            <form onSubmit={num(meterTtl, 1, 86400, (s) => parseInt(s, 10), 'cacheMeterTtlSecs', '断点 TTL 已更新', () => setMeterTtl(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={1} max={86400} placeholder="秒" value={meterTtl} onChange={(e) => setMeterTtl(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
+            </form>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs font-medium">单请求可命中上限（当前 {cfg?.cacheMaxRatio ?? '—'}）</div>
+            <div className="mb-1 text-[11px] leading-snug text-muted-foreground">
+              单请求可命中占总 input 的上限 ∈ [0.5,1.0]，保证最新内容本轮不全命中。调大 → 命中率更激进。默认 0.85。
+            </div>
+            <form onSubmit={num(maxRatio, 0.5, 1, parseFloat, 'cacheMaxRatio', '命中上限已更新', () => setMaxRatio(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={0.5} max={1} step={0.01} placeholder="0.5 ~ 1.0" value={maxRatio} onChange={(e) => setMaxRatio(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !maxRatio.trim()}>保存</Button>
+            </form>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs font-medium">最小可缓存 token（非 opus，当前 {cfg?.cacheMinTokens ?? '—'}）</div>
+            <div className="mb-1 text-[11px] leading-snug text-muted-foreground">
+              低于此 token 的前缀不进缓存。调小 → 更多小块可缓存 → 命中率↑。默认 1024。
+            </div>
+            <form onSubmit={num(minTokens, 0, 1000000, (s) => parseInt(s, 10), 'cacheMinTokens', '最小 token 已更新', () => setMinTokens(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={0} placeholder="token" value={minTokens} onChange={(e) => setMinTokens(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !minTokens.trim()}>保存</Button>
+            </form>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs font-medium">最小可缓存 token（opus，当前 {cfg?.cacheMinTokensOpus ?? '—'}）</div>
+            <div className="mb-1 text-[11px] leading-snug text-muted-foreground">
+              opus 家族缓存门槛更高。默认 4096。
+            </div>
+            <form onSubmit={num(minTokensOpus, 0, 1000000, (s) => parseInt(s, 10), 'cacheMinTokensOpus', 'opus 最小 token 已更新', () => setMinTokensOpus(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={0} placeholder="token" value={minTokensOpus} onChange={(e) => setMinTokensOpus(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !minTokensOpus.trim()}>保存</Button>
+            </form>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs font-medium">全局 LRU 容量上限（当前 {cfg?.cacheMaxEntries ?? '—'}）</div>
+            <div className="mb-1 text-[11px] leading-snug text-muted-foreground">
+              指纹表最多存多少前缀，超出淘汰最久未用。调大 → 容纳更多前缀 → 高并发命中率↑（占内存更多）。默认 20000，下限 100。
+            </div>
+            <form onSubmit={num(maxEntries, 100, 100000000, (s) => parseInt(s, 10), 'cacheMaxEntries', 'LRU 容量已更新', () => setMaxEntries(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={100} placeholder="条数" value={maxEntries} onChange={(e) => setMaxEntries(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !maxEntries.trim()}>保存</Button>
+            </form>
+          </div>
+        </div>
       </div>
     </SettingSection>
   )

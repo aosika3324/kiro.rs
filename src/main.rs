@@ -277,12 +277,30 @@ async fn main() {
         );
     }
 
-    // 缓存计量运行时治理：持有全局命中率 R + 缓存热度 TTL（按会话判 warm/cold）。
-    // 比旧的有状态 CacheMeter 轻：只存 session→last_seen，不存全前缀哈希链、不落盘。
-    let meter_governance = std::sync::Arc::new(anthropic::cache_metering::MeterGovernance::new(
-        config.cache_read_ratio,
-        config.cache_meter_ttl_secs,
-    ));
+    // 缓存计量：内容指纹 + 全局 LRU（带 TTL）物理匹配（对齐 Kiro-Go）。指纹表落盘
+    // data/prompt_cache.json 跨重启保命中率。5 个可调参数支持 Admin 运行时热更新。
+    let prompt_cache_tracker = std::sync::Arc::new(
+        anthropic::cache_metering::PromptCacheTracker::new(
+            config.cache_max_ratio,
+            config.cache_min_tokens,
+            config.cache_min_tokens_opus,
+            config.cache_meter_ttl_secs,
+            config.cache_max_entries,
+            Some(cache_dir.join("prompt_cache.json")),
+        ),
+    );
+    // 后台定期 flush（脏才写），并在退出时 flush 一次。
+    {
+        let tracker = prompt_cache_tracker.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.tick().await; // 跳过立即触发
+            loop {
+                tick.tick().await;
+                tracker.flush();
+            }
+        });
+    }
 
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
     // 这样可经 Admin API 运行时开启而无需重启；全局开关 + TTL 作为运行时原子值存于缓存内，
@@ -306,7 +324,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(meter_governance.clone()),
+        Some(prompt_cache_tracker.clone()),
         trace_store.clone(),
         config.usage_gated_streaming_enabled,
         Some(response_cache.clone()),
@@ -333,7 +351,7 @@ async fn main() {
                         Some(usage_recorder.clone()),
                     )
                     .with_response_cache(Some(response_cache.clone()))
-                    .with_meter_governance(Some(meter_governance.clone()))
+                    .with_prompt_cache_tracker(Some(prompt_cache_tracker.clone()))
                     .with_model_mappings(Some(model_mappings.clone()))
                     .with_endpoint_routing(Some(endpoint_routing.clone()));
             let admin_state = admin::AdminState::new(

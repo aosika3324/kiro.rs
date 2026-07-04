@@ -1036,7 +1036,6 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         strip_env_noise: k.strip_env_noise,
         response_cache_enabled: k.response_cache_enabled,
         response_cache_ttl_secs: k.response_cache_ttl_secs,
-        cache_read_ratio: k.cache_read_ratio,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1148,7 +1147,6 @@ pub async fn update_client_key(
         payload.strip_env_noise,
         payload.response_cache_enabled,
         payload.response_cache_ttl_secs.map(Some),
-        payload.cache_read_ratio,
     ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

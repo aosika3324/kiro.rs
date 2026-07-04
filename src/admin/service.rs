@@ -224,8 +224,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 响应体缓存（与 anthropic 路由共享；运行时读写全局缓存开关 / TTL）
     response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
-    /// 缓存计量运行时治理（与 anthropic 路由共享；运行时调整全局命中率 R）
-    meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
+    /// 指纹缓存计量器（与 anthropic 路由共享；运行时调 5 个命中率参数 + 读统计）
+    prompt_cache_tracker: Option<crate::anthropic::cache_metering::SharedPromptCacheTracker>,
     /// OpenAI 端点模型映射表（与 anthropic 路由共享；运行时热编辑规则）
     model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
     /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
@@ -584,7 +584,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             response_cache: None,
-            meter_governance: None,
+            prompt_cache_tracker: None,
             model_mappings: None,
             quota_disable_threshold: Mutex::new(quota_threshold),
             prompt_filter_defaults: Mutex::new(prompt_filter_defaults),
@@ -634,12 +634,12 @@ impl AdminService {
         self
     }
 
-    /// 注入缓存计量运行时治理（与 anthropic 路由共享），用于运行时调整全局命中率 R。
-    pub fn with_meter_governance(
+    /// 注入指纹缓存计量器（与 anthropic 路由共享），用于运行时调 5 个命中率参数 + 读统计。
+    pub fn with_prompt_cache_tracker(
         mut self,
-        meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
+        tracker: Option<crate::anthropic::cache_metering::SharedPromptCacheTracker>,
     ) -> Self {
-        self.meter_governance = meter_governance;
+        self.prompt_cache_tracker = tracker;
         self
     }
 
@@ -2221,24 +2221,31 @@ impl AdminService {
             .as_ref()
             .map(|c| (c.default_enabled(), c.default_ttl_secs()))
             .unwrap_or((false, crate::anthropic::response_cache::DEFAULT_TTL_SECS));
+        let t = self.prompt_cache_tracker.as_ref();
         RuntimeGovernanceConfigResponse {
             quota_disable_threshold: *self.quota_disable_threshold.lock(),
             response_cache_enabled: rc_enabled,
             response_cache_ttl_secs: rc_ttl,
-            cache_read_ratio: self
-                .meter_governance
-                .as_ref()
-                .map(|g| g.read_ratio())
-                .unwrap_or(0.0),
-            cache_meter_ttl_secs: self
-                .meter_governance
-                .as_ref()
-                .map(|g| g.ttl_secs())
-                .unwrap_or(300),
+            cache_meter_ttl_secs: t.map(|g| g.default_ttl_secs()).unwrap_or(
+                crate::anthropic::cache_metering::DEFAULT_CACHE_TTL_SECS,
+            ),
+            cache_max_ratio: t.map(|g| g.max_ratio()).unwrap_or(
+                crate::anthropic::cache_metering::DEFAULT_CACHE_MAX_RATIO,
+            ),
+            cache_min_tokens: t.map(|g| g.min_tokens()).unwrap_or(
+                crate::anthropic::cache_metering::DEFAULT_CACHE_MIN_TOKENS,
+            ),
+            cache_min_tokens_opus: t.map(|g| g.min_tokens_opus()).unwrap_or(
+                crate::anthropic::cache_metering::DEFAULT_CACHE_MIN_TOKENS_OPUS,
+            ),
+            cache_max_entries: t.map(|g| g.max_entries()).unwrap_or(
+                crate::anthropic::cache_metering::DEFAULT_CACHE_MAX_ENTRIES,
+            ),
+            cache_stats: t.map(|g| g.stats()),
         }
     }
 
-    /// 更新运行时治理配置：改运行时值（配额阈值 / 缓存开关 / 缓存 TTL / 命中率 R）+ 持久化 config.json。
+    /// 更新运行时治理配置：改运行时值（配额阈值 / 响应缓存 / 指纹计量 5 参数）+ 持久化 config.json。
     /// 任一字段缺省表示不修改。
     pub fn set_runtime_governance_config(
         &self,
@@ -2247,11 +2254,14 @@ impl AdminService {
         if req.quota_disable_threshold.is_none()
             && req.response_cache_enabled.is_none()
             && req.response_cache_ttl_secs.is_none()
-            && req.cache_read_ratio.is_none()
             && req.cache_meter_ttl_secs.is_none()
+            && req.cache_max_ratio.is_none()
+            && req.cache_min_tokens.is_none()
+            && req.cache_min_tokens_opus.is_none()
+            && req.cache_max_entries.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheMeterTtlSecs / cacheMaxRatio / cacheMinTokens / cacheMinTokensOpus / cacheMaxEntries 一个字段"
                     .to_string(),
             ));
         }
@@ -2272,19 +2282,27 @@ impl AdminService {
                 )));
             }
         }
-        if let Some(r) = req.cache_read_ratio {
-            if !(0.0..=1.0).contains(&r) {
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "cacheReadRatio 必须在 0..=1 内: {}",
-                    r
-                )));
-            }
-        }
         if let Some(ttl) = req.cache_meter_ttl_secs {
             if !(1..=86400).contains(&ttl) {
                 return Err(AdminServiceError::InvalidCredential(format!(
                     "cacheMeterTtlSecs 必须在 1..=86400 内: {}",
                     ttl
+                )));
+            }
+        }
+        if let Some(r) = req.cache_max_ratio {
+            if !(0.5..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheMaxRatio 必须在 0.5..=1.0 内: {}",
+                    r
+                )));
+            }
+        }
+        if let Some(n) = req.cache_max_entries {
+            if n < 100 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheMaxEntries 必须 >= 100: {}",
+                    n
                 )));
             }
         }
@@ -2303,14 +2321,21 @@ impl AdminService {
                 c.set_default_ttl_secs(ttl);
             }
         }
-        if let Some(r) = req.cache_read_ratio {
-            if let Some(g) = &self.meter_governance {
-                g.set_read_ratio(r);
+        if let Some(g) = &self.prompt_cache_tracker {
+            if let Some(ttl) = req.cache_meter_ttl_secs {
+                g.set_default_ttl_secs(ttl);
             }
-        }
-        if let Some(ttl) = req.cache_meter_ttl_secs {
-            if let Some(g) = &self.meter_governance {
-                g.set_ttl_secs(ttl);
+            if let Some(r) = req.cache_max_ratio {
+                g.set_max_ratio(r);
+            }
+            if let Some(n) = req.cache_min_tokens {
+                g.set_min_tokens(n);
+            }
+            if let Some(n) = req.cache_min_tokens_opus {
+                g.set_min_tokens_opus(n);
+            }
+            if let Some(n) = req.cache_max_entries {
+                g.set_max_entries(n);
             }
         }
 
@@ -2325,11 +2350,20 @@ impl AdminService {
             if let Some(ttl) = req.response_cache_ttl_secs {
                 c.response_cache_ttl_secs = ttl;
             }
-            if let Some(r) = req.cache_read_ratio {
-                c.cache_read_ratio = r;
-            }
             if let Some(ttl) = req.cache_meter_ttl_secs {
                 c.cache_meter_ttl_secs = ttl;
+            }
+            if let Some(r) = req.cache_max_ratio {
+                c.cache_max_ratio = r;
+            }
+            if let Some(n) = req.cache_min_tokens {
+                c.cache_min_tokens = n;
+            }
+            if let Some(n) = req.cache_min_tokens_opus {
+                c.cache_min_tokens_opus = n;
+            }
+            if let Some(n) = req.cache_max_entries {
+                c.cache_max_entries = n;
             }
         });
 

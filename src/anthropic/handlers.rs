@@ -459,13 +459,14 @@ fn resolve_usage_input_tokens(
         .unwrap_or(fallback_total_input_tokens)
 }
 
-/// 计算本次请求的结构化缓存覆盖。
+/// 计算本次请求的缓存覆盖（指纹模型）。
 ///
-/// `cache_enabled=false` 的 Key 直接返回默认（不模拟缓存，全量计入 input）。否则取该请求
-/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`——并按会话
-/// 热度取上轮消息条数（`observe_session`：首次出现或距上次超 TTL → cold=None，整段前缀按
-/// creation 重写计费；warm 返回上次条数以界定本轮新增的 creation 区间），交给
-/// `compute_structural_cache_usage` 拆分。
+/// `cache_enabled=false` 的 Key 或无 tracker → 返回默认（不模拟缓存，全量计入 input）。
+/// 否则 `build_profile`（内容指纹 + 断点）→ `compute`（倒序找最长命中前缀，read=物理命中量）
+/// → `update`（写回全局指纹表）。命中按内容真实匹配，不再靠会话时间轴推断（对齐 Kiro-Go）。
+///
+/// 注：本函数只在响应缓存 miss（真打上游）时被调用（见 `prepare_kiro_request` 调用点在
+/// response_cache 命中 early-return 之后），故 `update` 不会污染缓存命中的请求。
 pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
@@ -474,27 +475,16 @@ pub(crate) fn compute_cache_usage_for_key(
     if !key_ctx.cache_enabled {
         return super::cache_metering::CacheUsage::default();
     }
-    let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
-        state
-            .meter_governance
-            .as_ref()
-            .map(|g| g.read_ratio())
-            .unwrap_or(0.0)
-    });
-    // 会话热度：首次出现 / 超 TTL（缓存凉了）→ cold(None)，否则返回上次消息条数。无 governance
-    // 时退化为「无上轮记录」语义——传 Some(n-1) 等价旧的恒 warm + 倒数第二条 creation。
-    let prev_msg_count = match state.meter_governance.as_ref() {
-        Some(g) => {
-            let session = super::cache_metering::isolation_seed(payload, key_ctx.key_id);
-            g.observe_session(
-                &session,
-                super::cache_metering::now_unix_secs(),
-                payload.messages.len(),
-            )
-        }
-        None => Some(payload.messages.len().saturating_sub(1)),
+    let Some(tracker) = state.prompt_cache_tracker.as_ref() else {
+        return super::cache_metering::CacheUsage::default();
     };
-    super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count)
+    let Some(profile) = super::cache_metering::build_profile(payload, tracker.default_ttl_secs())
+    else {
+        return super::cache_metering::CacheUsage::default();
+    };
+    let usage = tracker.compute(&profile);
+    tracker.update(&profile);
+    usage
 }
 
 /// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。
