@@ -155,16 +155,24 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+/// 追加到 Write 工具 description 末尾的内容。
+/// 详尽版（移植自 Kiro-RS-Tool）：点明上游 Kiro API 会在大参数完成前截断响应，给出明确阈值
+/// （150 行 / 8000 字符 / ~4000 token）与失败后不重发同样大 payload 的策略。
+const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: The upstream Kiro API can truncate one assistant response before a large tool argument is complete. If the content to write exceeds 150 lines, 8,000 characters, or roughly 4,000 tokens, you MUST NOT write it all at once. Write only a small skeleton or first chunk using this tool (no more than 50 lines and no more than 4,000 characters), leave a unique placeholder if needed, then use `Edit` to append or replace the remaining content in chunks of no more than 50 lines and no more than 4,000 characters each. If a Write/Edit attempt fails, do not retry the same large payload; split it smaller.";
 
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+/// 追加到 Edit 工具 description 末尾的内容（详尽版，移植自 Kiro-RS-Tool）。
+const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: The upstream Kiro API can truncate one assistant response before a large tool argument is complete. If `old_string` or `new_string` exceeds 50 lines, 8,000 characters, or roughly 4,000 tokens, you MUST split the modification into multiple Edit calls, each replacing no more than 50 lines and no more than 4,000 characters at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder. If an Edit attempt fails, do not retry the same large payload; split it smaller.";
 
-/// 追加到系统提示词的分块写入策略
+/// 追加到 Bash 工具 description 末尾的内容（移植自 Kiro-RS-Tool）。
+/// 引导超长命令/内联脚本/heredoc 先用分块 Write/Edit 落文件再执行，规避上游对大参数的截断。
+const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs through Bash. If a command would exceed 100 lines, 8,000 characters, or roughly 4,000 tokens, create or modify a script/file with chunked Write/Edit calls first, then run a short Bash command that executes it. If a Bash attempt fails due to argument size or truncation, do not retry the same large command; split it smaller.";
+
+/// 追加到系统提示词的分块写入策略（详尽版，移植自 Kiro-RS-Tool）。
 const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
+Single tool arguments can be truncated by the upstream Kiro API when a response is too large. \
+Always chunk large Write/Edit/Bash payloads before they approach 8,000 characters, 150 Write lines, 50 Edit lines, or roughly 4,000 tokens. \
+Never retry the same oversized tool payload after a failure. \
+Never bypass these limits with a large Bash heredoc or inline script. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
@@ -1050,10 +1058,11 @@ fn convert_tools(
 
         let mut description = t.description.clone();
 
-        // 对 Write/Edit 工具追加自定义描述后缀
+        // 对 Write/Edit/Bash 工具追加自定义描述后缀
         let suffix = match t.name.as_str() {
             "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
             "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+            "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
             _ => "",
         };
         if !suffix.is_empty() {
@@ -1387,6 +1396,39 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bash_write_edit_description_suffixes_applied() {
+        use super::super::types::Tool as AnthropicTool;
+        let mk = |name: &str| AnthropicTool {
+            name: name.to_string(),
+            description: "base".to_string(),
+            input_schema: std::collections::BTreeMap::new(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        };
+        let tools = Some(vec![mk("Bash"), mk("Write"), mk("Edit"), mk("Other")]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+        let by = |n: &str| {
+            converted
+                .iter()
+                .find(|t| t.tool_specification.name == n)
+                .map(|t| t.tool_specification.description.clone())
+                .unwrap()
+        };
+        // Bash guard newly wired (was absent before absorption).
+        assert!(
+            by("Bash").contains("Do not send very large commands"),
+            "Bash suffix must be appended"
+        );
+        // Write/Edit upgraded to the detailed version mentioning the 8,000-char threshold.
+        assert!(by("Write").contains("8,000 characters"), "Write detailed suffix");
+        assert!(by("Edit").contains("8,000 characters"), "Edit detailed suffix");
+        // Unlisted tools untouched (only base description).
+        assert_eq!(by("Other"), "base", "non Write/Edit/Bash tools unchanged");
+    }
 
     #[test]
     fn test_map_model_sonnet() {
