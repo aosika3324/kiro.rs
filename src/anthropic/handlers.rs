@@ -478,7 +478,9 @@ pub(crate) fn compute_cache_usage_for_key(
     let Some(tracker) = state.prompt_cache_tracker.as_ref() else {
         return super::cache_metering::CacheUsage::default();
     };
-    let Some(profile) = super::cache_metering::build_profile(payload, tracker.default_ttl_secs())
+    // partition = 下游 client key id：缓存按 Key 隔离（同 Key 重复命中，跨 Key 不互相白命中）。
+    let Some(profile) =
+        super::cache_metering::build_profile(payload, key_ctx.key_id, tracker.default_ttl_secs())
     else {
         return super::cache_metering::CacheUsage::default();
     };

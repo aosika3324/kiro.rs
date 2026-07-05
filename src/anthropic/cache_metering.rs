@@ -522,11 +522,6 @@ use super::types::{Message, MessagesRequest, SystemMessage, Tool};
 /// `prev_msg_count` 只用作 **warm/cold 布尔标志**（`Some`=缓存还热 / `None`=首次或超 TTL 已凉），
 /// **其具体数值不再参与计算**——跨请求 msg_count 在共享/交错 seed 下不可靠（见 warm 分支注释）。
 /// - **`Some(_)`**（缓存还热）→ creation = 最近一个 user 回合之后、到 input 之前的那几条（纯结构
-///   判据，见 [`last_turn_creation_start`]），其余前缀走 read 便宜桶。标准对话 = 一条 assistant
-///   回复；agent 工具循环 = 本轮全部 tool_use/tool_result。
-/// - **`None`**（首次出现 / 超 TTL 缓存已凉）→ 整段可缓存前缀（system+tools+除最后一条外的全部
-///   历史）按 **creation** 重写计费、read 基数=0，如同首轮重建缓存。这让"凉了的会话"不再白
-///   拿 0.1× 折扣。
 /// 判断模型是否 opus 家族（阈值更高）。
 fn is_opus_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("opus")
@@ -534,12 +529,22 @@ fn is_opus_model(model: &str) -> bool {
 
 /// 构建本次请求的缓存画像（对齐 Kiro-Go `BuildClaudeProfile` + `flattenClaudeCacheBlocks`）。
 ///
-/// 展平顺序：request_prelude(model+tool_choice) → tools[] → system[] → messages[]。逐块喂
-/// 滚动 SHA256、累加 token；断点判定：块自带 `cache_control` → 断点（取其 TTL）；首个显式
-/// 断点出现后，每个 message 边界成为隐式断点（继承 active TTL）。无断点 → 返回 None。
+/// 展平顺序：partition(账号隔离种子) → request_prelude(model+tool_choice) → tools[] →
+/// system[] → messages[]。逐块喂滚动 SHA256、累加 token；断点判定：块自带 `cache_control`
+/// → 断点（取其 TTL）；首个显式断点出现后，每个 message 边界成为隐式断点（继承 active TTL）。
+/// 无断点 → 返回 None。
+///
+/// **`partition` = 缓存归属隔离键（下游 client key id）**：作为哈希前缀种子喂入，使**相同内容
+/// 在不同 Key 下产生不同指纹** → 全局合并表里天然按 Key 隔离命中。同一 Key 重复请求指纹相同
+/// → 命中。这实现"每个下游账号各算各的缓存"：账号 A 建立的前缀不会被账号 B 首次请求白命中
+/// （B 首次仍算 creation）；上游账号池化 / 调度与此无关。
 ///
 /// `default_ttl_secs` 为断点无显式 TTL 时的兜底（来自 tracker 参数）。
-pub fn build_profile(req: &MessagesRequest, default_ttl_secs: u64) -> Option<CachePrefixProfile> {
+pub fn build_profile(
+    req: &MessagesRequest,
+    partition: u64,
+    default_ttl_secs: u64,
+) -> Option<CachePrefixProfile> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -552,6 +557,11 @@ pub fn build_profile(req: &MessagesRequest, default_ttl_secs: u64) -> Option<Cac
         hasher.update((chunk.len() as u64).to_le_bytes());
         hasher.update(chunk.as_bytes());
     };
+
+    // ---- partition 种子（账号隔离，不计 token，仅进哈希）----
+    // 相同内容 + 不同 partition → 不同指纹 → 全局表内按下游 Key 隔离命中。
+    hasher.update(b"partition|");
+    hasher.update(partition.to_le_bytes());
 
     // ---- request_prelude（不作断点，仅参与前缀哈希与 token）----
     let prelude = format!(
@@ -894,14 +904,14 @@ mod tests {
     #[test]
     fn build_profile_none_when_empty() {
         let req = req_with(vec![], None);
-        assert!(build_profile(&req, 300).is_none());
+        assert!(build_profile(&req, 1, 300).is_none());
     }
 
     #[test]
     fn build_profile_single_implicit_breakpoint() {
         // 无显式 cache_control → 整前缀作单一隐式断点。
         let req = req_with(vec![msg("user", "hello world this is a test")], None);
-        let p = build_profile(&req, 300).expect("profile");
+        let p = build_profile(&req, 1, 300).expect("profile");
         assert_eq!(p.breakpoints.len(), 1);
         assert!(p.total_input_est > 0);
         assert_eq!(
@@ -916,8 +926,8 @@ mod tests {
         // 同内容两次 → 指纹相同（canonicalize 幂等）。
         let req1 = req_with(vec![msg("user", "abc"), msg("assistant", "def")], None);
         let req2 = req_with(vec![msg("user", "abc"), msg("assistant", "def")], None);
-        let p1 = build_profile(&req1, 300).unwrap();
-        let p2 = build_profile(&req2, 300).unwrap();
+        let p1 = build_profile(&req1, 1, 300).unwrap();
+        let p2 = build_profile(&req2, 1, 300).unwrap();
         assert_eq!(
             p1.breakpoints.last().unwrap().fingerprint,
             p2.breakpoints.last().unwrap().fingerprint
@@ -928,8 +938,8 @@ mod tests {
     fn build_profile_different_content_differs() {
         let req1 = req_with(vec![msg("user", "abc")], None);
         let req2 = req_with(vec![msg("user", "xyz")], None);
-        let p1 = build_profile(&req1, 300).unwrap();
-        let p2 = build_profile(&req2, 300).unwrap();
+        let p1 = build_profile(&req1, 1, 300).unwrap();
+        let p2 = build_profile(&req2, 1, 300).unwrap();
         assert_ne!(
             p1.breakpoints.last().unwrap().fingerprint,
             p2.breakpoints.last().unwrap().fingerprint
@@ -937,12 +947,48 @@ mod tests {
     }
 
     #[test]
+    fn build_profile_partition_isolates_same_content() {
+        // 相同内容 + 不同 partition(下游 Key)→ 不同指纹（账号隔离核心）。
+        let req = req_with(vec![msg("user", "identical content across keys")], None);
+        let pa = build_profile(&req, 1, 300).unwrap();
+        let pb = build_profile(&req, 2, 300).unwrap();
+        assert_ne!(
+            pa.breakpoints.last().unwrap().fingerprint,
+            pb.breakpoints.last().unwrap().fingerprint,
+            "不同 Key 相同内容必须不同指纹"
+        );
+        // 同一 partition 幂等。
+        let pa2 = build_profile(&req, 1, 300).unwrap();
+        assert_eq!(
+            pa.breakpoints.last().unwrap().fingerprint,
+            pa2.breakpoints.last().unwrap().fingerprint
+        );
+    }
+
+    #[test]
+    fn cross_key_no_false_hit() {
+        // Key1 建立前缀后,Key2 首次发相同内容 → 不命中(各算各的 creation)。
+        let t = tracker();
+        let req = req_with(vec![msg("user", "shared prompt body for two keys")], None);
+        let p1 = build_profile(&req, 1, 300).unwrap();
+        let _ = t.compute(&p1);
+        t.update(&p1);
+        // Key2 首次:
+        let p2 = build_profile(&req, 2, 300).unwrap();
+        let u2 = t.compute(&p2);
+        assert_eq!(u2.read_est, 0, "跨 Key 不得白命中");
+        // 同 Key1 重放 → 命中。
+        let u1 = t.compute(&p1);
+        assert!(u1.read_est > 0, "同 Key 重放应命中");
+    }
+
+    #[test]
     fn build_profile_opus_flag() {
         let mut req = req_with(vec![msg("user", "hi")], None);
         req.model = "claude-opus-4-8".to_string();
-        assert!(build_profile(&req, 300).unwrap().is_opus);
+        assert!(build_profile(&req, 1, 300).unwrap().is_opus);
         req.model = "claude-sonnet-4-6".to_string();
-        assert!(!build_profile(&req, 300).unwrap().is_opus);
+        assert!(!build_profile(&req, 1, 300).unwrap().is_opus);
     }
 
     // ---- compute / update：命中语义 ----------------------------------------
@@ -952,7 +998,7 @@ mod tests {
         // 空表首次 → read=0，creation=整可缓存前缀。
         let t = tracker();
         let req = req_with(vec![msg("user", "hello world foo bar baz")], None);
-        let p = build_profile(&req, 300).unwrap();
+        let p = build_profile(&req, 1, 300).unwrap();
         let u = t.compute(&p);
         assert_eq!(u.read_est, 0);
         assert!(u.creation_est > 0);
@@ -966,7 +1012,7 @@ mod tests {
             vec![msg("user", "a long enough first message here")],
             None,
         );
-        let p = build_profile(&req, 300).unwrap();
+        let p = build_profile(&req, 1, 300).unwrap();
         let _ = t.compute(&p);
         t.update(&p);
         // 第二轮：在前缀基础上加一条新消息（前缀仍命中）。
@@ -978,7 +1024,7 @@ mod tests {
             ],
             None,
         );
-        let p2 = build_profile(&req2, 300).unwrap();
+        let p2 = build_profile(&req2, 1, 300).unwrap();
         // p2 的隐式断点是整前缀，与 p 不同（内容更长）→ 不直接命中 p 的指纹。
         // 但显式多断点场景才有中间命中；此处验证 update 后表非空、compute 走命中分支。
         t.update(&p2);
@@ -991,7 +1037,7 @@ mod tests {
         // 完全相同请求重放 → 第二次命中全前缀。
         let t = tracker();
         let req = req_with(vec![msg("user", "identical replay content here")], None);
-        let p = build_profile(&req, 300).unwrap();
+        let p = build_profile(&req, 1, 300).unwrap();
         let _ = t.compute(&p);
         t.update(&p);
         let u2 = t.compute(&p);
@@ -1006,7 +1052,7 @@ mod tests {
         let t = tracker();
         let mut req = req_with(vec![msg("user", "content that will expire soon")], None);
         req.model = "claude-sonnet-4-6".to_string();
-        let mut p = build_profile(&req, 300).unwrap();
+        let mut p = build_profile(&req, 1, 300).unwrap();
         // 强制 TTL 极短：手动构造过期断点。
         for bp in &mut p.breakpoints {
             bp.ttl_secs = 0;
@@ -1022,7 +1068,7 @@ mod tests {
         // min_tokens 很高 → 小请求不进缓存（creation=0，read=0）。
         let t = PromptCacheTracker::new(0.85, 100_000, 100_000, 300, 100, None);
         let req = req_with(vec![msg("user", "tiny")], None);
-        let p = build_profile(&req, 300).unwrap();
+        let p = build_profile(&req, 1, 300).unwrap();
         let u = t.compute(&p);
         assert_eq!(u.read_est, 0);
         assert_eq!(u.creation_est, 0, "低于阈值不计 creation");
@@ -1037,7 +1083,7 @@ mod tests {
                 vec![msg("user", &format!("distinct content number {}", i))],
                 None,
             );
-            let p = build_profile(&req, 300).unwrap();
+            let p = build_profile(&req, 1, 300).unwrap();
             t.update(&p);
         }
         assert!(t.stats().entries <= 100, "LRU 容量上限 100");
@@ -1048,7 +1094,7 @@ mod tests {
     fn stats_track_hits_misses() {
         let t = tracker();
         let req = req_with(vec![msg("user", "some content for stats test")], None);
-        let p = build_profile(&req, 300).unwrap();
+        let p = build_profile(&req, 1, 300).unwrap();
         let _ = t.compute(&p); // miss（空表）
         t.update(&p);
         let _ = t.compute(&p); // hit
