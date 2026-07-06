@@ -31,6 +31,3 @@
 .ace-tool/
 .codegraph/
 .claude/
-
-# 轮换/导出的凭据快照(含 accessToken 等秘密) —— 绝不入库
-credentials-*.json

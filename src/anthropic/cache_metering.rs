@@ -1,4 +1,4 @@
-//! 中转层 prompt cache 计量（内容指纹 + 全局 LRU，对齐 Kiro-Go）
+//! 中转层 prompt cache 计量（无状态、确定性、delta-based）
 //!
 //! Kiro 上游既不做 prompt cache、也不下发 cache_creation / cache_read 字段（实测
 //! meteringEvent 只给 credit 计费量），所以中转层上报的缓存计费**纯粹是合成给下游看
@@ -6,48 +6,51 @@
 //! （creation 贵、read 便宜），所以合成数字必须**经济上自洽**：creation 每轮只应反映
 //! 「本轮新增的那一段」，不能随对话变长而虚高。
 //!
-//! # 指纹模型（本模块）
+//! 既然底层没有真实缓存，就不该去"忠实模拟"真实缓存那套随时间/负载漂移的不确定行为。
+//! 本模块按**多轮对话缓存实际怎么累积**做纯函数式、确定性的结构化拆分（delta-based）：
 //!
-//! 不再靠"会话时间轴 + 消息条数"**推断**命中，而是按**内容 SHA256 指纹 + 全局 LRU（带
-//! TTL）物理匹配**（对齐 Kiro-Go `promptCacheTracker`）：
+//! ```text
+//! input    = 最后一条 message（本轮新问题）              —— 未缓存
+//! creation = 本会话上次请求后新增、且已进稳定前缀的消息   —— 有界，随本轮新增量走
+//!            （= messages[上次条数 .. 末条)，不含 input；overhead 上轮已缓存不计）
+//! read     = system + tools + 更早的全部历史              —— 上一轮已缓存
+//! 首轮 / 超 TTL（cold）→ creation = system+tools+除末条外全部历史（整段重写）、read = 0
+//! ```
 //!
-//! 1. `build_profile`：把请求展平成可缓存块序列（request_prelude → tools → system →
-//!    messages），逐块喂滚动 SHA256、累加 token；在断点（显式 `cache_control`，或首个显式
-//!    断点后的每个 message 边界）记录 `{前缀指纹, 累计token, TTL}`。
-//! 2. `compute`：倒序扫断点，在全局表里找**最长已命中且未过期**的前缀 → `read = 命中 token`、
-//!    `creation = 本轮超出命中的新 token`、`input = 总量 − 可缓存前缀`。命中即刷新其 TTL。
-//! 3. `update`：把本次所有断点指纹写回全局表（跨账号共享），LRU + 容量上限淘汰。
+//! creation 取「**上次见到本会话后新增的那几条**」而非死板的「倒数第二条」：标准对话每轮
+//! 只加一对（assistant + 新 user），两者等价；但 agent 工具循环一轮可能补进多对
+//! （a1,tool_result,a2,...），此时新增的中间消息也应计 creation，不该塞进便宜的 read 桶。
+//! 为此按会话记 last_seen 的 **(秒, 消息条数)**，本轮新增 = `当前条数 − 上次条数`。
 //!
-//! 命中是**按内容真实匹配**（同前缀无论哪个会话/账号都命中），不猜、不受会话交错影响。
-//! 结果对真实 total 由 [`CacheUsage::split_against_total`] 做互斥比例分摊。
+//! 关键性质：**creation 每轮有界（≈本轮新增的非-input 消息），read 随历史累积增长**。对话越长
+//! read 越大、read:creation 比值自然往上漂——既真实又不死板，且贵的 creation 桶不会被历史规模放大。
+//! 同一段对话无论何时重放、负载如何，结果**完全相同**（请求结构 + last_seen 的纯函数）。
 //!
-//! # 可调命中率参数（前端可调、运行时热更新）
+//! 命中率 `R` ∈ [0,1] 是 **read 留存阻尼**（默认 1.0）：`read_final = read × R`，被砍掉的
+//! `read × (1−R)` 推回 input（相当于"假装这段前缀没命中缓存"→ 不给折扣）。R **不触碰
+//! creation**，所以贵桶始终经济正确；R=1 给足缓存折扣（真实），调低则更保守。可全局设也可
+//! per-key 覆盖。
 //!
-//! - `cache_max_ratio`：单请求可命中占总 input 上限（默认 0.85，保证最新内容本轮不全命中）
-//! - `cache_min_tokens` / `cache_min_tokens_opus`：断点最小可缓存 token 阈值
-//! - `cache_ttl_secs`：断点无显式 `cache_control.ttl` 时的默认 TTL
-//! - `cache_max_entries`：全局 LRU 容量上限
-//!
-//! 指纹表落盘 `data/prompt_cache.json`，跨重启保命中率。
+//! 无后台任务、无落盘、无内存增长——计量只是请求级的纯计算。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// [`PromptCacheTracker::compute`] 的结果：按 estimate 口径算出的三桶基准，最终由
-/// [`CacheUsage::split_against_total`] 对真实 total 做互斥分摊。
+/// `compute_structural_cache_usage` 的结果：按 estimate 口径算出的三桶基准 + read 留存
+/// 阻尼，最终由 [`CacheUsage::split_against_total`] 对真实 total 做互斥分摊。
 ///
 /// 三个 estimate 是比例基准（不是最终值）——真正的 token 数要在拿到真实 total（contextUsage
 /// 真值或 count_tokens 估算）后才按比例算出，因为流式响应直到末尾才知道真实 total。
 #[derive(Debug, Clone, Copy)]
 pub struct CacheUsage {
-    /// 本轮新输入（超出可缓存前缀的部分）的 estimate token——这部分永不计入缓存。
+    /// 本轮新输入（最后一条 message）的 estimate token——这部分永不计入缓存。
     pub input_est: i32,
-    /// 本轮新写入缓存的 delta（命中前缀之外、到可缓存末尾）的 estimate token。
+    /// 本轮新写入缓存的 delta（倒数第二条 message；首轮为 system+tools）的 estimate token。
     pub creation_est: i32,
-    /// 命中的已缓存前缀 estimate token（read 基数）。
-    pub read_est: i32,
-    /// 整个 prompt 的 estimate token，比例分摊的分母。
+    /// 整个 prompt（system + tools + 全部 messages）的 estimate token，比例分摊的分母。
     pub prompt_total_est: i32,
+    /// read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input（不给缓存折扣）。
+    pub read_ratio: f64,
 }
 
 impl Default for CacheUsage {
@@ -56,8 +59,8 @@ impl Default for CacheUsage {
         Self {
             input_est: 0,
             creation_est: 0,
-            read_est: 0,
             prompt_total_est: 0,
+            read_ratio: 1.0,
         }
     }
 }
@@ -66,9 +69,9 @@ impl CacheUsage {
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`，
     /// 三者满足 `input + creation + read == total_real`。
     ///
-    /// input / creation / read 各按其 estimate 占比折算到真实 total（read 取剩余，保证和相等）。
+    /// `total_real` 是最终上报口径的全量 prompt token。input / creation 各按其 estimate 占比
+    /// 折算到真实 total，剩余即 read；再对 read 施加留存阻尼 R（砍掉的部分推回 input）。
     /// 无可缓存内容（`prompt_total_est <= 0`）时全部计入 input，不凭空造缓存计数。
-    /// 不再有 R 留存阻尼：read 即物理命中量（对齐 Kiro-Go）。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.prompt_total_est <= 0 || total == 0 {
@@ -78,82 +81,117 @@ impl CacheUsage {
         let input_share = (self.input_est as f64 / denom).clamp(0.0, 1.0);
         let creation_share = (self.creation_est as f64 / denom).clamp(0.0, 1.0);
 
-        // input / creation 按占比折算，clamp 保证 input + creation <= total；剩余即 read。
+        // input / creation 按占比折算，clamp 保证 input + creation <= total。
         let mut input = ((total as f64) * input_share).round() as i32;
         input = input.clamp(0, total);
         let mut creation = ((total as f64) * creation_share).round() as i32;
         creation = creation.clamp(0, total - input);
-        let read = total - input - creation;
+
+        // 剩余即已缓存前缀（read 基数）。
+        let read_base = total - input - creation;
+        if read_base <= 0 {
+            return (input, creation, 0);
+        }
+        // read 留存阻尼：保留 read_base × R，被砍部分推回 input（无缓存折扣），creation 不动。
+        let r = self.read_ratio.clamp(0.0, 1.0);
+        let read = ((read_base as f64) * r).round() as i32;
+        let read = read.clamp(0, read_base);
+        input += read_base - read;
         (input, creation, read)
     }
 }
 
-/// 默认可调参数（可被 config / Admin 覆盖）。
-pub const DEFAULT_CACHE_MAX_RATIO: f64 = 0.85;
-pub const DEFAULT_CACHE_MIN_TOKENS: u32 = 1024;
-pub const DEFAULT_CACHE_MIN_TOKENS_OPUS: u32 = 4096;
-pub const DEFAULT_CACHE_TTL_SECS: u64 = 300;
-pub const DEFAULT_CACHE_MAX_ENTRIES: usize = 20_000;
-
-/// 单个缓存断点：到此块为止的前缀指纹 + 累计 token + 该断点 TTL（秒）。
-#[derive(Debug, Clone)]
-pub struct CacheBreakpoint {
-    pub fingerprint: [u8; 32],
-    pub cumulative_tokens: i32,
-    pub ttl_secs: u64,
-}
-
-/// 一次请求的缓存画像（[`build_profile`] 产出）。断点按前缀顺序，累计 token 单调增。
-#[derive(Debug, Clone)]
-pub struct CachePrefixProfile {
-    pub breakpoints: Vec<CacheBreakpoint>,
-    pub total_input_est: i32,
-    pub is_opus: bool,
-}
-
-/// 全局 LRU 表条目：过期时刻（unix 秒）+ TTL（刷新用）。
-#[derive(Debug, Clone, Copy)]
-struct PrefixEntry {
-    expires_at: i64,
-    ttl_secs: u64,
-}
-
-/// 指纹计量器：全局共享（跨账号跨会话）的前缀指纹 → 过期时刻表，带 TTL + LRU 容量上限。
-/// 5 个可调参数原子存储，Admin 改动即时生效。指纹表落盘 `data/prompt_cache.json`。
+/// 计量运行时治理：持有全局 read 留存阻尼 R + 缓存热度 TTL + 按会话的 last_seen 表
+/// （运行时可经 Admin API 调整 R 与 TTL）。
 ///
-/// 替代旧的会话推断式 `MeterGovernance`：命中按内容物理匹配，不猜。
-pub struct PromptCacheTracker {
-    inner: parking_lot::Mutex<TrackerInner>,
-    /// 单请求可命中占总 input 上限的 bit 表示（f64→u64）。
-    max_ratio_bits: AtomicU64,
-    /// 断点最小可缓存 token 阈值（非 opus / opus）。
-    min_tokens: AtomicU64,
-    min_tokens_opus: AtomicU64,
-    /// 断点默认 TTL（秒）。
-    default_ttl_secs: AtomicU64,
-    /// 全局 LRU 容量上限。
-    max_entries: AtomicU64,
-    /// 落盘路径（None = 不落盘，测试用）。
-    persist_path: Option<std::path::PathBuf>,
-    /// 命中率统计。
-    hits: AtomicU64,
-    misses: AtomicU64,
-    evictions: AtomicU64,
-    expirations: AtomicU64,
+/// 比旧的有状态 `CacheMeter` 轻得多：不存全前缀哈希链、不落盘，只存 `session → (上次请求秒,
+/// 上次请求时的消息条数)` 一个表。秒用于判 cold/warm（见 [`Self::observe_session`]）；条数用于
+/// 算「本轮新增了几条」从而界定 creation 区间（见 [`compute_structural_cache_usage`]）。
+pub struct MeterGovernance {
+    /// 全局 R 的 bit 表示（f64 → u64，原子读写）。per-key 未覆盖时用此值。
+    read_ratio_bits: AtomicU64,
+    /// 缓存热度 TTL（秒，原子）。距某会话上次请求超过此值即判 cold（缓存已凉）。
+    ttl_secs: AtomicU64,
+    /// 会话热度表：`isolation_seed → (上次请求 unix 秒, 上次请求的 messages 条数)`。
+    last_seen: parking_lot::Mutex<std::collections::HashMap<String, (i64, usize)>>,
 }
 
-/// 表内部：指纹 → 条目 + LRU 顺序（front=最近使用）+ 脏标记。
-struct TrackerInner {
-    entries: std::collections::HashMap<[u8; 32], PrefixEntry>,
-    /// LRU 顺序：队首=最久未用，队尾=最近使用。
-    order: std::collections::VecDeque<[u8; 32]>,
-    dirty: bool,
+/// `last_seen` 表的清理阈值：超过此条目数时，借一次请求顺手清掉所有已过 2×TTL 的死会话，
+/// 避免长期运行内存无界增长（纯防护，不影响判定语义）。
+const LAST_SEEN_SWEEP_THRESHOLD: usize = 4096;
+
+impl MeterGovernance {
+    /// 用初始 R + TTL 构造（R clamp 到 [0,1]）。
+    pub fn new(read_ratio: f64, ttl_secs: u64) -> Self {
+        Self {
+            read_ratio_bits: AtomicU64::new(read_ratio.clamp(0.0, 1.0).to_bits()),
+            ttl_secs: AtomicU64::new(ttl_secs),
+            last_seen: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 当前全局 R。
+    pub fn read_ratio(&self) -> f64 {
+        f64::from_bits(self.read_ratio_bits.load(Ordering::Relaxed))
+    }
+
+    /// 设置全局 R（clamp 到 [0,1]），运行时立即对后续请求生效。
+    pub fn set_read_ratio(&self, ratio: f64) {
+        self.read_ratio_bits
+            .store(ratio.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// 当前缓存热度 TTL（秒）。
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs.load(Ordering::Relaxed)
+    }
+
+    /// 设置缓存热度 TTL（秒），运行时立即对后续请求生效。
+    pub fn set_ttl_secs(&self, ttl: u64) {
+        self.ttl_secs.store(ttl, Ordering::Relaxed);
+    }
+
+    /// 记录本会话本次请求（时间 + 消息条数**高水位**），返回**上轮缓存还热时的消息条数高水位**。
+    ///
+    /// 返回 `Some(prev_n)` = warm：该会话此前出现过 **且** 距上次请求 `<= TTL`（缓存未凉），
+    /// `prev_n` 是**已见过的消息条数高水位**，供调用方界定「本轮新增 = 当前条数 − prev_n」的
+    /// creation 区间。返回 `None` = cold（首次出现 / 间隔超 TTL）→ 调用方把整段前缀按 creation
+    /// 重写计费。`now` / `msg_count` 为本次请求的 unix 秒与 messages 条数（参数化便于测试）。
+    ///
+    /// **存高水位（`prev_n.max(msg_count)`）而非裸 msg_count**：`creation = msg_est[prev_n .. n-1]`
+    /// 的下界依赖 prev_n，但同一 session seed 上可能出现**更小 msg_count** 的请求——OpenAI 端点回退
+    /// key 级 seed 时多对话共享一条记录、Claude Code 的 title/探针/子任务复用同 session 但消息少、
+    /// 历史被重截断、并发乱序。裸存会把 prev_n 打小，使下一条真实长请求算出**横跨整段历史**的巨大
+    /// delta → `creation` 爆炸（吃掉本该进 read 便宜桶的历史）。取高水位后，短请求不再拉低下界，
+    /// 后续长请求的 creation 恢复到「真实新增」量级。副作用只在合法 compaction/截断使条数**永久**
+    /// 下降时出现：那一轮 creation 计 0（欠计新摘要）——**偏向便宜桶，经济上安全**，永不再虚高。
+    /// cold（缓存已凉）则重置基线为本次条数，不保留旧高水位（前缀确实要整段重建）。
+    pub fn observe_session(&self, session: &str, now: i64, msg_count: usize) -> Option<usize> {
+        let ttl = self.ttl_secs.load(Ordering::Relaxed) as i64;
+        let mut map = self.last_seen.lock();
+        // 偶发清理：表过大时清掉死会话（超 2×TTL 没来过的）。
+        if map.len() > LAST_SEEN_SWEEP_THRESHOLD {
+            let dead_before = now - ttl.saturating_mul(2).max(0);
+            map.retain(|_, &mut (last, _)| last >= dead_before);
+        }
+        let warm = match map.get(session) {
+            Some(&(last, prev_n)) if now.saturating_sub(last) <= ttl => Some(prev_n),
+            _ => None,
+        };
+        // warm：存高水位（短请求不拉低下界）；cold：重置基线为本次条数。
+        let stored_n = match warm {
+            Some(prev_n) => prev_n.max(msg_count),
+            None => msg_count,
+        };
+        map.insert(session.to_string(), (now, stored_n));
+        warm
+    }
 }
 
-/// `Arc<PromptCacheTracker>` 别名
-pub type SharedPromptCacheTracker = Arc<PromptCacheTracker>;
+/// `Arc<MeterGovernance>` 别名
+pub type SharedMeterGovernance = Arc<MeterGovernance>;
 
-/// 当前 unix 秒（i64）。指纹表 TTL / 过期判定的时间基准。
+/// 当前 unix 秒（i64）。用于会话热度判定的时间基准。
 pub fn now_unix_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -162,356 +200,12 @@ pub fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 命中率统计快照（供 Admin 展示）。
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct PromptCacheStats {
-    pub entries: usize,
-    pub capacity: usize,
-    pub hits: u64,
-    pub misses: u64,
-    pub evictions: u64,
-    pub expirations: u64,
-}
-
-impl PromptCacheTracker {
-    /// 用 5 个可调参数构造。`persist_path=None` 表示纯内存（测试用）。
-    pub fn new(
-        max_ratio: f64,
-        min_tokens: u32,
-        min_tokens_opus: u32,
-        default_ttl_secs: u64,
-        max_entries: usize,
-        persist_path: Option<std::path::PathBuf>,
-    ) -> Self {
-        let t = Self {
-            inner: parking_lot::Mutex::new(TrackerInner {
-                entries: std::collections::HashMap::new(),
-                order: std::collections::VecDeque::new(),
-                dirty: false,
-            }),
-            max_ratio_bits: AtomicU64::new(max_ratio.clamp(0.5, 1.0).to_bits()),
-            min_tokens: AtomicU64::new(min_tokens as u64),
-            min_tokens_opus: AtomicU64::new(min_tokens_opus as u64),
-            default_ttl_secs: AtomicU64::new(default_ttl_secs.max(1)),
-            max_entries: AtomicU64::new((max_entries.max(100)) as u64),
-            persist_path,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
-            expirations: AtomicU64::new(0),
-        };
-        t.load();
-        t
-    }
-
-    // ---- 可调参数 getter/setter（Admin 热更新）----
-    pub fn max_ratio(&self) -> f64 {
-        f64::from_bits(self.max_ratio_bits.load(Ordering::Relaxed))
-    }
-    pub fn set_max_ratio(&self, v: f64) {
-        self.max_ratio_bits
-            .store(v.clamp(0.5, 1.0).to_bits(), Ordering::Relaxed);
-    }
-    pub fn min_tokens(&self) -> u32 {
-        self.min_tokens.load(Ordering::Relaxed) as u32
-    }
-    pub fn set_min_tokens(&self, v: u32) {
-        self.min_tokens.store(v as u64, Ordering::Relaxed);
-    }
-    pub fn min_tokens_opus(&self) -> u32 {
-        self.min_tokens_opus.load(Ordering::Relaxed) as u32
-    }
-    pub fn set_min_tokens_opus(&self, v: u32) {
-        self.min_tokens_opus.store(v as u64, Ordering::Relaxed);
-    }
-    pub fn default_ttl_secs(&self) -> u64 {
-        self.default_ttl_secs.load(Ordering::Relaxed)
-    }
-    pub fn set_default_ttl_secs(&self, v: u64) {
-        self.default_ttl_secs.store(v.max(1), Ordering::Relaxed);
-    }
-    pub fn max_entries(&self) -> usize {
-        self.max_entries.load(Ordering::Relaxed) as usize
-    }
-    pub fn set_max_entries(&self, v: usize) {
-        self.max_entries.store(v.max(100) as u64, Ordering::Relaxed);
-    }
-
-    fn min_tokens_for(&self, is_opus: bool) -> i32 {
-        if is_opus {
-            self.min_tokens_opus() as i32
-        } else {
-            self.min_tokens() as i32
-        }
-    }
-
-    /// 统计快照。
-    pub fn stats(&self) -> PromptCacheStats {
-        let inner = self.inner.lock();
-        PromptCacheStats {
-            entries: inner.entries.len(),
-            capacity: self.max_entries(),
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
-            expirations: self.expirations.load(Ordering::Relaxed),
-        }
-    }
-
-    /// 计算本次请求的缓存覆盖（对齐 Kiro-Go `Compute`）。命中即刷新 TTL + LRU 提前。
-    pub fn compute(&self, profile: &CachePrefixProfile) -> CacheUsage {
-        if profile.breakpoints.is_empty() {
-            return CacheUsage::default();
-        }
-        let now = now_unix_secs();
-        let min_tokens = self.min_tokens_for(profile.is_opus);
-        let total = profile.total_input_est;
-        let last = profile.breakpoints.last().unwrap();
-        let mut last_tokens = last.cumulative_tokens.min(total);
-
-        let mut inner = self.inner.lock();
-        self.prune_expired(&mut inner, now);
-
-        if inner.entries.is_empty() {
-            // 首次：整段可缓存前缀按 creation 重写（若达阈值），read=0。
-            drop(inner);
-            let creation = if last_tokens >= min_tokens {
-                last_tokens
-            } else {
-                0
-            };
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return CacheUsage {
-                input_est: (total - last_tokens).max(0),
-                creation_est: creation,
-                read_est: 0,
-                prompt_total_est: total,
-            };
-        }
-
-        // 可命中上限 = total × max_ratio（保证最新内容本轮不全命中）。
-        let max_cacheable = ((total as f64) * self.max_ratio()).round() as i32;
-        if last_tokens > max_cacheable {
-            last_tokens = max_cacheable;
-        }
-
-        // 倒序找最长命中前缀。
-        let mut matched = 0i32;
-        for bp in profile.breakpoints.iter().rev() {
-            if bp.cumulative_tokens < min_tokens {
-                continue;
-            }
-            let hit = match inner.entries.get(&bp.fingerprint) {
-                Some(e) if e.expires_at > now => Some(*e),
-                _ => None,
-            };
-            if let Some(e) = hit {
-                let refreshed = PrefixEntry {
-                    expires_at: now + e.ttl_secs as i64,
-                    ttl_secs: e.ttl_secs,
-                };
-                inner.entries.insert(bp.fingerprint, refreshed);
-                Self::lru_touch(&mut inner, &bp.fingerprint);
-                inner.dirty = true;
-                matched = bp.cumulative_tokens.min(last_tokens);
-                break;
-            }
-        }
-        drop(inner);
-
-        if matched > 0 {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        let creation = (last_tokens - matched).max(0);
-        CacheUsage {
-            input_est: (total - last_tokens).max(0),
-            creation_est: creation,
-            read_est: matched,
-            prompt_total_est: total,
-        }
-    }
-
-    /// 把本次所有达阈值的断点指纹写回全局表（对齐 Kiro-Go `Update`）。
-    pub fn update(&self, profile: &CachePrefixProfile) {
-        if profile.breakpoints.is_empty() {
-            return;
-        }
-        let now = now_unix_secs();
-        let min_tokens = self.min_tokens_for(profile.is_opus);
-        let mut inner = self.inner.lock();
-        self.prune_expired(&mut inner, now);
-        for bp in &profile.breakpoints {
-            if bp.cumulative_tokens < min_tokens {
-                continue;
-            }
-            let entry = PrefixEntry {
-                expires_at: now + bp.ttl_secs as i64,
-                ttl_secs: bp.ttl_secs,
-            };
-            inner.entries.insert(bp.fingerprint, entry);
-            Self::lru_touch(&mut inner, &bp.fingerprint);
-        }
-        inner.dirty = true;
-        self.evict_overflow(&mut inner);
-    }
-
-    /// 把某指纹移到 LRU 队尾（最近使用）。
-    fn lru_touch(inner: &mut TrackerInner, fp: &[u8; 32]) {
-        if let Some(pos) = inner.order.iter().position(|x| x == fp) {
-            inner.order.remove(pos);
-        }
-        inner.order.push_back(*fp);
-    }
-
-    /// 清除已过期条目。
-    fn prune_expired(&self, inner: &mut TrackerInner, now: i64) {
-        let expired: Vec<[u8; 32]> = inner
-            .entries
-            .iter()
-            .filter(|(_, e)| e.expires_at <= now)
-            .map(|(fp, _)| *fp)
-            .collect();
-        if expired.is_empty() {
-            return;
-        }
-        for fp in &expired {
-            inner.entries.remove(fp);
-            if let Some(pos) = inner.order.iter().position(|x| x == fp) {
-                inner.order.remove(pos);
-            }
-        }
-        self.expirations
-            .fetch_add(expired.len() as u64, Ordering::Relaxed);
-        inner.dirty = true;
-    }
-
-    /// 超容量时从 LRU 队首淘汰。
-    fn evict_overflow(&self, inner: &mut TrackerInner) {
-        let cap = self.max_entries();
-        let mut evicted = 0u64;
-        while inner.entries.len() > cap {
-            match inner.order.pop_front() {
-                Some(fp) => {
-                    if inner.entries.remove(&fp).is_some() {
-                        evicted += 1;
-                    }
-                }
-                None => break,
-            }
-        }
-        if evicted > 0 {
-            self.evictions.fetch_add(evicted, Ordering::Relaxed);
-            inner.dirty = true;
-        }
-    }
-
-    /// 从落盘文件加载指纹表（丢弃已过期条目）。best-effort，损坏/缺失 → 空表启动。
-    fn load(&self) {
-        let Some(path) = self.persist_path.as_ref() else {
-            return;
-        };
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        let Ok(disk): Result<PromptCacheDisk, _> = serde_json::from_slice(&bytes) else {
-            return;
-        };
-        let now = now_unix_secs();
-        let mut inner = self.inner.lock();
-        for e in disk.entries {
-            if e.expires_at > now {
-                inner.entries.insert(
-                    e.fingerprint,
-                    PrefixEntry {
-                        expires_at: e.expires_at,
-                        ttl_secs: e.ttl_secs,
-                    },
-                );
-                inner.order.push_back(e.fingerprint);
-            }
-        }
-    }
-
-    /// 若脏则原子落盘（临时文件 + rename）。由后台 flush 循环 / 退出时调用。
-    pub fn flush(&self) {
-        let Some(path) = self.persist_path.as_ref() else {
-            return;
-        };
-        let snapshot: Vec<PromptCacheDiskEntry> = {
-            let mut inner = self.inner.lock();
-            if !inner.dirty {
-                return;
-            }
-            inner.dirty = false;
-            inner
-                .entries
-                .iter()
-                .map(|(fp, e)| PromptCacheDiskEntry {
-                    fingerprint: *fp,
-                    expires_at: e.expires_at,
-                    ttl_secs: e.ttl_secs,
-                })
-                .collect()
-        };
-        let disk = PromptCacheDisk {
-            version: 1,
-            entries: snapshot,
-        };
-        let Ok(bytes) = serde_json::to_vec(&disk) else {
-            return;
-        };
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
-    }
-}
-
-/// 落盘格式（对齐 Kiro-Go C3）。
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PromptCacheDisk {
-    version: u32,
-    entries: Vec<PromptCacheDiskEntry>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PromptCacheDiskEntry {
-    #[serde(with = "fingerprint_hex")]
-    fingerprint: [u8; 32],
-    expires_at: i64,
-    ttl_secs: u64,
-}
-
-/// 指纹以 hex 字符串落盘（JSON 友好）。
-mod fingerprint_hex {
-    pub fn serialize<S: serde::Serializer>(fp: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        let hex: String = fp.iter().map(|b| format!("{:02x}", b)).collect();
-        s.serialize_str(&hex)
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        use serde::Deserialize;
-        let hex = String::deserialize(d)?;
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-            .collect::<Vec<u8>>();
-        let mut out = [0u8; 32];
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("fingerprint not 32 bytes"));
-        }
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    }
-}
-
 // ============================================================================
 // 与请求体协议层的接线
 // ============================================================================
 
 use super::stream::estimate_tokens;
-use super::types::{Message, MessagesRequest, SystemMessage, Tool};
+use super::types::{MessagesRequest, SystemMessage, Tool};
 
 /// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构、R、上轮消息条数，
 /// 不依赖时间或负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
@@ -519,162 +213,67 @@ use super::types::{Message, MessagesRequest, SystemMessage, Tool};
 /// 桶划分（见模块文档）：input = 最后一条 message；read = 其余前缀。`read_ratio` 是该请求
 /// 生效的 R（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
 ///
-/// `prev_msg_count` 只用作 **warm/cold 布尔标志**（`Some`=缓存还热 / `None`=首次或超 TTL 已凉），
-/// **其具体数值不再参与计算**——跨请求 msg_count 在共享/交错 seed 下不可靠（见 warm 分支注释）。
-/// - **`Some(_)`**（缓存还热）→ creation = 最近一个 user 回合之后、到 input 之前的那几条（纯结构
-/// 判断模型是否 opus 家族（阈值更高）。
-fn is_opus_model(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("opus")
-}
-
-/// 构建本次请求的缓存画像（对齐 Kiro-Go `BuildClaudeProfile` + `flattenClaudeCacheBlocks`）。
-///
-/// 展平顺序：partition(账号隔离种子) → request_prelude(model+tool_choice) → tools[] →
-/// system[] → messages[]。逐块喂滚动 SHA256、累加 token；断点判定：块自带 `cache_control`
-/// → 断点（取其 TTL）；首个显式断点出现后，每个 message 边界成为隐式断点（继承 active TTL）。
-/// 无断点 → 返回 None。
-///
-/// **`partition` = 缓存归属隔离键（下游 client key id）**：作为哈希前缀种子喂入，使**相同内容
-/// 在不同 Key 下产生不同指纹** → 全局合并表里天然按 Key 隔离命中。同一 Key 重复请求指纹相同
-/// → 命中。这实现"每个下游账号各算各的缓存"：账号 A 建立的前缀不会被账号 B 首次请求白命中
-/// （B 首次仍算 creation）；上游账号池化 / 调度与此无关。
-///
-/// `default_ttl_secs` 为断点无显式 TTL 时的兜底（来自 tracker 参数）。
-pub fn build_profile(
+/// `prev_msg_count` 是本会话上轮缓存还热时的上次消息条数（见 [`MeterGovernance::observe_session`]）:
+/// - **`Some(prev_n)`**（缓存还热）→ creation = `messages[prev_n .. n-1]`，即上次见到后**新增、
+///   且已沉为稳定前缀**的那几条（标准对话 = 倒数第二条一条；agent 工具循环可能多条），其余前缀
+///   走 read 便宜桶。`prev_n` 钳到 `[0, n-1]`；若 `prev_n >= n-1`（无新增沉淀）则 creation=0。
+/// - **`None`**（首次出现 / 超 TTL 缓存已凉）→ 整段可缓存前缀（system+tools+除最后一条外的全部
+///   历史）按 **creation** 重写计费、read 基数=0，如同首轮重建缓存。这让"凉了的会话"不再白
+///   拿 0.1× 折扣。
+pub fn compute_structural_cache_usage(
     req: &MessagesRequest,
-    partition: u64,
-    default_ttl_secs: u64,
-) -> Option<CachePrefixProfile> {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    let mut breakpoints: Vec<CacheBreakpoint> = Vec::new();
-    let mut cumulative: i32 = 0;
-    let mut active_ttl: Option<u64> = None;
-
-    // helper: 把一段规范化文本喂入滚动哈希。
-    let feed = |hasher: &mut Sha256, chunk: &str| {
-        hasher.update((chunk.len() as u64).to_le_bytes());
-        hasher.update(chunk.as_bytes());
-    };
-
-    // ---- partition 种子（账号隔离，不计 token，仅进哈希）----
-    // 相同内容 + 不同 partition → 不同指纹 → 全局表内按下游 Key 隔离命中。
-    hasher.update(b"partition|");
-    hasher.update(partition.to_le_bytes());
-
-    // ---- request_prelude（不作断点，仅参与前缀哈希与 token）----
-    let prelude = format!(
-        "prelude|model={}|tool_choice={}",
-        req.model,
-        req.tool_choice
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default()
-    );
-    feed(&mut hasher, &prelude);
-    cumulative = cumulative.saturating_add(estimate_tokens(&prelude).max(0));
-
-    // ---- tools[] ----
+    read_ratio: f64,
+    prev_msg_count: Option<usize>,
+) -> CacheUsage {
+    // system + tools 开销（首轮即首次写入缓存的那段）。
+    let mut overhead: i32 = 0;
     if let Some(tools) = req.tools.as_ref() {
         for t in tools {
-            let canonical = format!(
-                "tool|{}|{}|{}",
-                t.name,
-                t.description,
-                serde_json::to_string(&t.input_schema).unwrap_or_default()
-            );
-            feed(&mut hasher, &canonical);
-            cumulative = cumulative.saturating_add(tool_tokens(t));
+            overhead = overhead.saturating_add(tool_tokens(t));
         }
     }
-
-    // ---- system[] ----
     if let Some(systems) = req.system.as_ref() {
-        for (i, sys) in systems.iter().enumerate() {
-            let canonical = format!("system|{}|{}", i, sys.text);
-            feed(&mut hasher, &canonical);
-            cumulative = cumulative.saturating_add(system_tokens(sys));
+        for sys in systems {
+            overhead = overhead.saturating_add(system_tokens(sys));
         }
     }
 
-    // ---- messages[]：每条 message 边界是潜在断点 ----
-    for (idx, msg) in req.messages.iter().enumerate() {
-        let content_str = msg.content.to_string();
-        let canonical = format!("msg|{}|{}|{}", idx, msg.role, content_str);
-        feed(&mut hasher, &canonical);
-        cumulative = cumulative.saturating_add(message_tokens(msg));
-
-        // message 级 cache_control 检测（Anthropic 允许在 block 上打 cache_control）。
-        let explicit_ttl = message_cache_control_ttl(msg);
-        if let Some(ttl) = explicit_ttl {
-            active_ttl = Some(ttl);
-        }
-        // 断点：显式 cache_control，或已出现过显式断点后的每个 message 边界。
-        let bp_ttl = if explicit_ttl.is_some() {
-            explicit_ttl
-        } else {
-            active_ttl
+    let n = req.messages.len();
+    if n == 0 {
+        // 无 message：无可缓存内容，全入 input（prompt_total_est=0 触发默认分摊）。
+        return CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: 0,
+            read_ratio: read_ratio.clamp(0.0, 1.0),
         };
-        if let Some(ttl) = bp_ttl {
-            let fp: [u8; 32] = hasher.clone().finalize().into();
-            breakpoints.push(CacheBreakpoint {
-                fingerprint: fp,
-                cumulative_tokens: cumulative,
-                ttl_secs: if ttl == 0 { default_ttl_secs } else { ttl },
-            });
-        }
     }
 
-    // 无显式 cache_control：整个前缀（到最后一条 message）作单一隐式断点，用默认 TTL。
-    // 这让"没打 cache_control 的普通多轮对话"也能命中（对齐 Anthropic 自动前缀缓存的常见用法）。
-    if breakpoints.is_empty() {
-        if req.messages.is_empty() {
-            return None;
+    let msg_est: Vec<i32> = req.messages.iter().map(message_tokens).collect();
+    let msgs_total: i32 = msg_est.iter().fold(0, |a, b| a.saturating_add(*b));
+    let prompt_total_est = overhead.saturating_add(msgs_total);
+
+    // input = 最后一条 message（本轮新问题），永不计入缓存。
+    let input_est = msg_est[n - 1];
+    // creation = 本轮"写入缓存"的部分：
+    //   cold（None：首次/超TTL，缓存已凉）→ 整段可缓存前缀 = prompt_total − input，全部重写计
+    //     creation（read 基数随之为 0），如同首轮；
+    //   warm（Some(prev_n)）→ messages[prev_n .. n-1]：上次见到后新增、且已沉为稳定前缀的那几条。
+    //     prev_n 钳到 [0, n-1]；标准对话每轮 +2 条（prev_n = n-2）→ 恰为倒数第二条；agent 工具
+    //     循环一轮补进多对 → 覆盖全部新增中间消息。prev_n >= n-1（无新增沉淀，如纯重放）→ creation=0。
+    let creation_est = match prev_msg_count {
+        None => prompt_total_est.saturating_sub(input_est),
+        Some(prev_n) => {
+            let start = prev_n.min(n - 1);
+            msg_est[start..n - 1].iter().fold(0i32, |a, b| a.saturating_add(*b))
         }
-        let fp: [u8; 32] = hasher.finalize().into();
-        breakpoints.push(CacheBreakpoint {
-            fingerprint: fp,
-            cumulative_tokens: cumulative,
-            ttl_secs: default_ttl_secs,
-        });
-    }
+    };
 
-    Some(CachePrefixProfile {
-        breakpoints,
-        total_input_est: cumulative,
-        is_opus: is_opus_model(&req.model),
-    })
-}
-
-/// 从 message 的 content blocks 里提取 `cache_control.ttl`（秒）；无则 None。
-/// `ephemeral` 且带 `ttl: "1h"` → 3600；`ttl: "5m"` 或无 ttl → 0（调用方用默认 TTL）。
-fn message_cache_control_ttl(msg: &Message) -> Option<u64> {
-    let arr = msg.content.as_array()?;
-    let mut found = None;
-    for block in arr {
-        if let Some(cc) = block.get("cache_control") {
-            // 命中 cache_control：解析 ttl 字段。
-            let ttl = cc
-                .get("ttl")
-                .and_then(|t| t.as_str())
-                .map(parse_ttl_str)
-                .unwrap_or(0);
-            found = Some(ttl);
-        }
-    }
-    found
-}
-
-/// 解析 Anthropic ttl 字符串："5m"→300, "1h"→3600；无法解析→0（用默认）。
-fn parse_ttl_str(s: &str) -> u64 {
-    let s = s.trim();
-    if let Some(m) = s.strip_suffix('m') {
-        m.trim().parse::<u64>().map(|v| v * 60).unwrap_or(0)
-    } else if let Some(h) = s.strip_suffix('h') {
-        h.trim().parse::<u64>().map(|v| v * 3600).unwrap_or(0)
-    } else {
-        s.parse::<u64>().unwrap_or(0)
+    CacheUsage {
+        input_est,
+        creation_est,
+        prompt_total_est,
+        read_ratio: read_ratio.clamp(0.0, 1.0),
     }
 }
 
@@ -727,10 +326,8 @@ fn block_tokens(v: &serde_json::Value) -> i32 {
         }
         Some("image") => {
             let (media_type, data) = image_source_parts(v);
-            sum =
-                sum.saturating_add(
-                    crate::image_resize::estimate_image_tokens(media_type, data) as i32
-                );
+            sum = sum
+                .saturating_add(crate::image_resize::estimate_image_tokens(media_type, data) as i32);
         }
         _ => {}
     }
@@ -749,9 +346,9 @@ fn tool_result_content_tokens(content: Option<&serde_json::Value>) -> i32 {
                     sum = sum.saturating_add(estimate_tokens(text).max(0));
                 } else if item.get("type").and_then(|x| x.as_str()) == Some("image") {
                     let (media_type, data) = image_source_parts(item);
-                    sum = sum.saturating_add(crate::image_resize::estimate_image_tokens(
-                        media_type, data,
-                    ) as i32);
+                    sum = sum.saturating_add(
+                        crate::image_resize::estimate_image_tokens(media_type, data) as i32,
+                    );
                 }
             }
             sum
@@ -827,8 +424,8 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{Message, MessagesRequest, SystemMessage};
     use super::*;
+    use super::super::types::{Message, MessagesRequest, Metadata, SystemMessage};
 
     fn msg(role: &str, text: &str) -> Message {
         Message {
@@ -852,34 +449,23 @@ mod tests {
         }
     }
 
-    /// 纯内存 tracker（不落盘），默认参数。
-    fn tracker() -> PromptCacheTracker {
-        PromptCacheTracker::new(
-            DEFAULT_CACHE_MAX_RATIO,
-            1,   // min_tokens=1，测试里小请求也可缓存
-            1,   // min_tokens_opus
-            300, // ttl
-            100, // max_entries
-            None,
-        )
-    }
-
-    // ---- split_against_total（去 R，read=剩余）-----------------------------
+    // ---- split_against_total ------------------------------------------------
 
     #[test]
     fn split_no_prefix_all_input() {
+        // prompt_total_est == 0（默认）→ 全量计入 input。
         let u = CacheUsage::default();
         assert_eq!(u.split_against_total(500), (500, 0, 0));
     }
 
     #[test]
     fn split_three_buckets_by_share() {
-        // input 10%、creation 5%，剩余 85% 为 read。
+        // input 占比 10%、creation 占比 5%，剩余 85% 为 read（R=1 全留存）。
         let u = CacheUsage {
             input_est: 10,
             creation_est: 5,
-            read_est: 85,
             prompt_total_est: 100,
+            read_ratio: 1.0,
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input, 100);
@@ -889,249 +475,522 @@ mod tests {
     }
 
     #[test]
+    fn split_creation_bounded_independent_of_history() {
+        // creation 只随 creation_est 占比走，不随 read 基数（历史规模）变化——贵桶有界。
+        // 短历史：total 小
+        let short = CacheUsage {
+            input_est: 10,
+            creation_est: 20,
+            prompt_total_est: 100,
+            read_ratio: 1.0,
+        };
+        // 长历史：同样的 input/creation 占比，但 prompt_total 大得多（read 基数暴涨）
+        let long = CacheUsage {
+            input_est: 10,
+            creation_est: 20,
+            prompt_total_est: 1000,
+            read_ratio: 1.0,
+        };
+        let (_, c_short, _) = short.split_against_total(300);
+        let (_, c_long, r_long) = long.split_against_total(3000);
+        // creation 占比相同（20/100 vs 20/1000 → 真实 total 也等比放大），关键是 read 吃掉增量
+        assert_eq!(c_short, 60); // 300 × 20/100
+        assert_eq!(c_long, 60); // 3000 × 20/1000 —— creation 不被历史放大
+        assert!(r_long > 2000, "历史增长全进 read（便宜桶），不进 creation");
+    }
+
+    #[test]
+    fn split_read_retention_pushes_to_input_not_creation() {
+        // R<1：read 被砍的部分推回 input，creation 纹丝不动（贵桶经济正确）。
+        let u = CacheUsage {
+            input_est: 10,
+            creation_est: 10,
+            prompt_total_est: 100,
+            read_ratio: 0.5,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        // base: input=100, creation=100, read_base=800
+        // R=0.5 → read=400，被砍 400 推回 input → input=500
+        assert_eq!(input, 500);
+        assert_eq!(creation, 100, "creation 不受 R 影响");
+        assert_eq!(read, 400);
+        assert_eq!(input + creation + read, 1000);
+    }
+
+    #[test]
+    fn split_ratio_zero_no_read() {
+        // R=0：完全不给缓存折扣，read 全部推回 input；creation 仍按其占比保留。
+        let u = CacheUsage {
+            input_est: 10,
+            creation_est: 10,
+            prompt_total_est: 100,
+            read_ratio: 0.0,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(creation, 100);
+        assert_eq!(read, 0);
+        assert_eq!(input, 900);
+    }
+
+    #[test]
+    fn split_pure_replay_hit_rate_equals_r() {
+        // 纯重放（creation_est≈0：无新增沉淀）时命中率精确 = R。锁住此语义:
+        //   R=1.0 → read≈total、input≈0 → 命中率 100%(贴近真实 Anthropic 稳态);
+        //   R=0.8 → read=total×0.8、input=total×0.2 → 命中率精确 80%(实证里所有高命中样本卡 80.0% 的成因)。
+        // 这是「配置能到多少」与「改码能到多少」归因的数学基准，不能悄悄漂移。
+        let replay = |r: f64| CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: 1000, // >0 触发分摊；input/creation 占比为 0 → read_base=total
+            read_ratio: r,
+        };
+        let hit = |(_i, _c, rd): (i32, i32, i32), tot: i32| rd as f64 / tot as f64;
+
+        let (i1, c1, r1) = replay(1.0).split_against_total(1000);
+        assert_eq!((i1, c1, r1), (0, 0, 1000), "R=1.0 纯重放 → 全 read");
+        assert!((hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9, "R=1.0 → 命中率 100%");
+
+        let (i8, c8, r8) = replay(0.8).split_against_total(1000);
+        assert_eq!((i8, c8, r8), (200, 0, 800), "R=0.8 → read=800、被砍 200 推回 input");
+        assert!((hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9, "R=0.8 → 命中率精确 80%");
+    }
+
+    #[test]
+    fn split_is_deterministic() {
+        let u = CacheUsage {
+            input_est: 33,
+            creation_est: 41,
+            prompt_total_est: 207,
+            read_ratio: 1.0,
+        };
+        let a = u.split_against_total(4096);
+        let b = u.split_against_total(4096);
+        assert_eq!(a, b);
+        assert_eq!(a.0 + a.1 + a.2, 4096, "互斥口径必须自洽");
+    }
+
+    #[test]
     fn split_zero_total_safe() {
         let u = CacheUsage {
             input_est: 10,
-            creation_est: 5,
-            read_est: 85,
+            creation_est: 10,
             prompt_total_est: 100,
+            read_ratio: 1.0,
         };
         assert_eq!(u.split_against_total(0), (0, 0, 0));
     }
 
-    // ---- build_profile ------------------------------------------------------
+    // ---- compute_structural_cache_usage ------------------------------------
 
     #[test]
-    fn build_profile_none_when_empty() {
-        let req = req_with(vec![], None);
-        assert!(build_profile(&req, 1, 300).is_none());
-    }
-
-    #[test]
-    fn build_profile_single_implicit_breakpoint() {
-        // 无显式 cache_control → 整前缀作单一隐式断点。
-        let req = req_with(vec![msg("user", "hello world this is a test")], None);
-        let p = build_profile(&req, 1, 300).expect("profile");
-        assert_eq!(p.breakpoints.len(), 1);
-        assert!(p.total_input_est > 0);
-        assert_eq!(
-            p.breakpoints[0].cumulative_tokens,
-            p.total_input_est,
-            "隐式断点累计=总量"
-        );
-    }
-
-    #[test]
-    fn build_profile_deterministic_same_content() {
-        // 同内容两次 → 指纹相同（canonicalize 幂等）。
-        let req1 = req_with(vec![msg("user", "abc"), msg("assistant", "def")], None);
-        let req2 = req_with(vec![msg("user", "abc"), msg("assistant", "def")], None);
-        let p1 = build_profile(&req1, 1, 300).unwrap();
-        let p2 = build_profile(&req2, 1, 300).unwrap();
-        assert_eq!(
-            p1.breakpoints.last().unwrap().fingerprint,
-            p2.breakpoints.last().unwrap().fingerprint
-        );
-    }
-
-    #[test]
-    fn build_profile_different_content_differs() {
-        let req1 = req_with(vec![msg("user", "abc")], None);
-        let req2 = req_with(vec![msg("user", "xyz")], None);
-        let p1 = build_profile(&req1, 1, 300).unwrap();
-        let p2 = build_profile(&req2, 1, 300).unwrap();
-        assert_ne!(
-            p1.breakpoints.last().unwrap().fingerprint,
-            p2.breakpoints.last().unwrap().fingerprint
-        );
-    }
-
-    #[test]
-    fn build_profile_partition_isolates_same_content() {
-        // 相同内容 + 不同 partition(下游 Key)→ 不同指纹（账号隔离核心）。
-        let req = req_with(vec![msg("user", "identical content across keys")], None);
-        let pa = build_profile(&req, 1, 300).unwrap();
-        let pb = build_profile(&req, 2, 300).unwrap();
-        assert_ne!(
-            pa.breakpoints.last().unwrap().fingerprint,
-            pb.breakpoints.last().unwrap().fingerprint,
-            "不同 Key 相同内容必须不同指纹"
-        );
-        // 同一 partition 幂等。
-        let pa2 = build_profile(&req, 1, 300).unwrap();
-        assert_eq!(
-            pa.breakpoints.last().unwrap().fingerprint,
-            pa2.breakpoints.last().unwrap().fingerprint
-        );
-    }
-
-    #[test]
-    fn cross_key_no_false_hit() {
-        // Key1 建立前缀后,Key2 首次发相同内容 → 不命中(各算各的 creation)。
-        let t = tracker();
-        let req = req_with(vec![msg("user", "shared prompt body for two keys")], None);
-        let p1 = build_profile(&req, 1, 300).unwrap();
-        let _ = t.compute(&p1);
-        t.update(&p1);
-        // Key2 首次:
-        let p2 = build_profile(&req, 2, 300).unwrap();
-        let u2 = t.compute(&p2);
-        assert_eq!(u2.read_est, 0, "跨 Key 不得白命中");
-        // 同 Key1 重放 → 命中。
-        let u1 = t.compute(&p1);
-        assert!(u1.read_est > 0, "同 Key 重放应命中");
-    }
-
-    #[test]
-    fn build_profile_opus_flag() {
-        let mut req = req_with(vec![msg("user", "hi")], None);
-        req.model = "claude-opus-4-8".to_string();
-        assert!(build_profile(&req, 1, 300).unwrap().is_opus);
-        req.model = "claude-sonnet-4-6".to_string();
-        assert!(!build_profile(&req, 1, 300).unwrap().is_opus);
-    }
-
-    // ---- compute / update：命中语义 ----------------------------------------
-
-    #[test]
-    fn compute_first_request_all_creation() {
-        // 空表首次 → read=0，creation=整可缓存前缀。
-        let t = tracker();
-        let req = req_with(vec![msg("user", "hello world foo bar baz")], None);
-        let p = build_profile(&req, 1, 300).unwrap();
-        let u = t.compute(&p);
-        assert_eq!(u.read_est, 0);
-        assert!(u.creation_est > 0);
-    }
-
-    #[test]
-    fn compute_hit_after_update() {
-        // update 写回后，同前缀再 compute → read 命中。
-        let t = tracker();
+    fn compute_cold_charges_whole_prefix_as_creation() {
+        // cold(首次/超TTL,缓存凉了)：整段可缓存前缀(system+历史,除最后一条)按 creation 重写、
+        // read=0,如同首轮。对比同请求 warm 时只把倒数第二条计 creation、其余进 read。
+        let big = "the quick brown fox ".repeat(40);
         let req = req_with(
-            vec![msg("user", "a long enough first message here")],
+            vec![
+                msg("user", &big),
+                msg("assistant", &big),
+                msg("user", "short new question"),
+            ],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(50),
+                cache_control: None,
+            }]),
+        );
+        let warm = compute_structural_cache_usage(&req, 1.0, Some(req.messages.len() - 2));
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+
+        // 两者 input 相同(都是最后一条),prompt_total 相同。
+        assert_eq!(cold.input_est, warm.input_est);
+        assert_eq!(cold.prompt_total_est, warm.prompt_total_est);
+        // cold 的 creation = 整段前缀 = total − input;warm 的 creation 只一条,远小于 cold。
+        assert_eq!(cold.creation_est, cold.prompt_total_est - cold.input_est);
+        assert!(cold.creation_est > warm.creation_est * 2, "cold 把整段前缀都计 creation");
+
+        let (ci, cc, cr) = cold.split_against_total(cold.prompt_total_est);
+        assert_eq!(cr, 0, "cold 无 read(整段重写)");
+        assert_eq!(ci + cc, cold.prompt_total_est);
+        let (_, wc, wr) = warm.split_against_total(warm.prompt_total_est);
+        assert!(wr > 0, "warm 有 read");
+        assert!(cc > wc, "cold 的 creation(贵桶)远多于 warm");
+    }
+
+    #[test]
+    fn compute_single_message_first_write() {
+        // 单条 message + system：input=该 message，creation=system(首次写缓存)，read=0。
+        let req = req_with(
+            vec![msg("user", "hello there friend")],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(20),
+                cache_control: None,
+            }]),
+        );
+        let u = compute_structural_cache_usage(&req, 1.0, None);
+        assert!(u.input_est > 0);
+        assert!(u.creation_est > 0, "首轮 system+tools 计作 creation");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert_eq!(read, 0, "首轮无 read");
+        assert!(input > 0 && creation > 0);
+        assert_eq!(input + creation + read, u.prompt_total_est);
+    }
+
+    #[test]
+    fn compute_single_message_no_overhead_all_input() {
+        // 单条 message、无 system/tools：creation_est=0 → 全入 input。
+        let req = req_with(vec![msg("user", "hi")], None);
+        let u = compute_structural_cache_usage(&req, 1.0, None);
+        assert_eq!(u.creation_est, 0);
+        assert_eq!(u.input_est, u.prompt_total_est);
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est.max(1));
+        assert_eq!(creation, 0);
+        assert_eq!(read, 0);
+        assert_eq!(input, u.prompt_total_est.max(1));
+    }
+
+    #[test]
+    fn compute_multi_turn_delta_creation_is_prev_message() {
+        // 历史(u1,a1) + 本轮 u2：input=u2，creation=a1(倒数第二条)，read=system+tools+u1。
+        let big = "the quick brown fox ".repeat(40);
+        let req = req_with(
+            vec![
+                msg("user", &big),
+                msg("assistant", &big),
+                msg("user", "short new question"),
+            ],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(50),
+                cache_control: None,
+            }]),
+        );
+        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        let a1_est = message_tokens(&msg("assistant", &big));
+        let u2_est = message_tokens(&msg("user", "short new question"));
+        assert_eq!(u.creation_est, a1_est, "creation = 倒数第二条 message");
+        assert_eq!(u.input_est, u2_est, "input = 最后一条 message");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert!(read > 0, "非首轮应有 cache_read");
+        assert!(creation > 0);
+        assert!(read > creation, "read（system+u1）应远大于 creation（仅 a1）");
+        assert_eq!(input + creation + read, u.prompt_total_est);
+    }
+
+    #[test]
+    fn compute_creation_does_not_grow_with_history() {
+        // 核心经济性质：对话越长，creation 仍≈一条 message，不随历史线性增长。
+        let unit = "lorem ipsum dolor sit amet ".repeat(10);
+        let short = req_with(
+            vec![msg("user", &unit), msg("assistant", &unit), msg("user", "q")],
             None,
         );
-        let p = build_profile(&req, 1, 300).unwrap();
-        let _ = t.compute(&p);
-        t.update(&p);
-        // 第二轮：在前缀基础上加一条新消息（前缀仍命中）。
-        let req2 = req_with(
+        // 长对话：20 条历史 + 本轮
+        let mut long_msgs: Vec<Message> = Vec::new();
+        for i in 0..10 {
+            long_msgs.push(msg("user", &format!("{unit} {i}")));
+            long_msgs.push(msg("assistant", &unit));
+        }
+        long_msgs.push(msg("user", "q"));
+        let long = req_with(long_msgs, None);
+
+        let cu_short = compute_structural_cache_usage(&short, 1.0, Some(short.messages.len() - 2));
+        let cu_long = compute_structural_cache_usage(&long, 1.0, Some(long.messages.len() - 2));
+        // creation_est 都≈一条 assistant 消息，长对话不放大
+        let a_est = message_tokens(&msg("assistant", &unit));
+        assert_eq!(cu_short.creation_est, a_est);
+        assert_eq!(cu_long.creation_est, a_est, "长对话 creation 仍是一条 message");
+        // 而 prompt_total（→read 基数）长对话远大于短对话
+        assert!(cu_long.prompt_total_est > cu_short.prompt_total_est * 5);
+
+        let (_, c_short, _) = cu_short.split_against_total(cu_short.prompt_total_est);
+        let (_, c_long, r_long) = cu_long.split_against_total(cu_long.prompt_total_est);
+        assert!(r_long > c_long * 5, "长对话增量几乎全进便宜的 read 桶");
+        // creation 真实 token 不爆炸（两者同数量级，长对话甚至更小，因占比被摊薄）
+        assert!(c_long <= c_short + 5);
+    }
+
+    #[test]
+    fn compute_read_retention_controls_discount() {
+        // R 越大，read 越多、input 越少；creation 不变。
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        let req = req_with(
+            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            None,
+        );
+        let total = compute_structural_cache_usage(&req, 1.0, Some(1)).prompt_total_est;
+        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5, Some(1)).split_against_total(total);
+        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0, Some(1)).split_against_total(total);
+        assert!(r_hi > r_lo, "R 越大 read 越多");
+        assert!(i_hi < i_lo, "R 越大 input 越少（折扣更足）");
+        assert_eq!(c_lo, c_hi, "creation 不受 R 影响");
+    }
+
+    #[test]
+    fn compute_image_message_counts_tokens() {
+        let png = make_test_png(750, 750);
+        let img_tokens = crate::image_resize::estimate_image_tokens("image/png", &png) as i32;
+        assert!(img_tokens > 100);
+        let req = req_with(
             vec![
-                msg("user", "a long enough first message here"),
-                msg("assistant", "reply"),
-                msg("user", "second question appended now"),
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data": png}},
+                        {"type":"text","text":"describe"}
+                    ]),
+                },
+                msg("assistant", "a pixel"),
+                msg("user", "and now"),
             ],
             None,
         );
-        let p2 = build_profile(&req2, 1, 300).unwrap();
-        // p2 的隐式断点是整前缀，与 p 不同（内容更长）→ 不直接命中 p 的指纹。
-        // 但显式多断点场景才有中间命中；此处验证 update 后表非空、compute 走命中分支。
-        t.update(&p2);
-        let u = t.compute(&p2);
-        assert!(u.read_est > 0, "重放同前缀应命中 read");
+        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // 含图历史(u1)在 read 前缀里 → prompt_total 应远大于本轮纯文本新输入。
+        assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
+        let (_, _, read) = u.split_against_total(u.prompt_total_est);
+        assert!(read > img_tokens / 2, "含图历史进 read 桶");
     }
 
     #[test]
-    fn compute_replay_same_prefix_hits() {
-        // 完全相同请求重放 → 第二次命中全前缀。
-        let t = tracker();
-        let req = req_with(vec![msg("user", "identical replay content here")], None);
-        let p = build_profile(&req, 1, 300).unwrap();
-        let _ = t.compute(&p);
-        t.update(&p);
-        let u2 = t.compute(&p);
-        assert!(u2.read_est > 0);
-        // max_ratio=0.85 封顶：read 不超过 total×0.85。
-        assert!(u2.read_est <= ((p.total_input_est as f64) * 0.85).round() as i32 + 1);
+    fn compute_tool_use_message_counted_as_creation() {
+        // 回归：agentic 轮里倒数第二条常是 assistant 的 tool_use（无顶层 text，参数在 .input）。
+        // 修复前只数 text/thinking → 该 message≈0 → creation 塌成 0。修复后必须计入 input 参数。
+        let big_args = "x".repeat(2000);
+        let tool_use = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{
+                "type": "tool_use", "id": "toolu_1", "name": "run_bash",
+                "input": { "command": big_args }
+            }]),
+        };
+        let toolu_est = message_tokens(&tool_use);
+        assert!(toolu_est > 100, "tool_use 参数必须计入 token，实得 {toolu_est}");
+
+        // 历史 (u1, assistant tool_use) + 本轮 user：creation = 倒数第二条 = tool_use。
+        let req = req_with(
+            vec![msg("user", "do something"), tool_use, msg("user", "next")],
+            None,
+        );
+        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        assert_eq!(u.creation_est, toolu_est, "creation 应等于 tool_use message 的 token");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert!(creation > 0, "修复后 cache_creation 不再塌成 0");
+        assert_eq!(input + creation + read, u.prompt_total_est);
     }
 
     #[test]
-    fn compute_expired_is_miss() {
-        // TTL=0 的断点写入即过期 → 下轮 miss。
-        let t = tracker();
-        let mut req = req_with(vec![msg("user", "content that will expire soon")], None);
-        req.model = "claude-sonnet-4-6".to_string();
-        let mut p = build_profile(&req, 1, 300).unwrap();
-        // 强制 TTL 极短：手动构造过期断点。
-        for bp in &mut p.breakpoints {
-            bp.ttl_secs = 0;
+    fn compute_tool_result_message_counted() {
+        // 回归：user 侧 tool_result 文本嵌在 .content[]（顶层无 text）。修复前整段被漏。
+        let big = "result line ".repeat(300);
+        let tool_result = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "tool_result", "tool_use_id": "toolu_1", "content": big
+            }]),
+        };
+        let tr_est = message_tokens(&tool_result);
+        assert!(tr_est > 100, "tool_result 内容必须计入，实得 {tr_est}");
+        // tool_result 作为历史前缀 → 进 read 桶，prompt_total 应含其 token。
+        let req = req_with(
+            vec![tool_result, msg("assistant", "ok"), msg("user", "q")],
+            None,
+        );
+        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        assert!(u.prompt_total_est > tr_est, "prompt_total 应含 tool_result token");
+    }
+
+    #[test]
+    fn compute_empty_messages_safe() {
+        let req = req_with(vec![], None);
+        let u = compute_structural_cache_usage(&req, 1.0, None);
+        assert_eq!(u.input_est, 0);
+        assert_eq!(u.creation_est, 0);
+        assert_eq!(u.split_against_total(100), (100, 0, 0));
+    }
+
+    // ---- MeterGovernance ---------------------------------------------------
+
+    #[test]
+    fn governance_get_set_and_clamp() {
+        let g = MeterGovernance::new(0.8, 300);
+        assert!((g.read_ratio() - 0.8).abs() < 1e-9);
+        g.set_read_ratio(0.95);
+        assert!((g.read_ratio() - 0.95).abs() < 1e-9);
+        // clamp 到 [0,1]
+        g.set_read_ratio(1.5);
+        assert!((g.read_ratio() - 1.0).abs() < 1e-9);
+        g.set_read_ratio(-0.2);
+        assert!((g.read_ratio() - 0.0).abs() < 1e-9);
+        assert!((MeterGovernance::new(2.0, 300).read_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn governance_ttl_get_set() {
+        let g = MeterGovernance::new(1.0, 300);
+        assert_eq!(g.ttl_secs(), 300);
+        g.set_ttl_secs(60);
+        assert_eq!(g.ttl_secs(), 60);
+    }
+
+    #[test]
+    fn governance_warmth_cold_then_warm_then_expired() {
+        let g = MeterGovernance::new(1.0, 300);
+        // 首次出现 → cold(None)，本次记 5 条
+        assert_eq!(g.observe_session("sess:a", 1000, 5), None, "首次出现应判 cold");
+        // TTL 内再来 → warm，返回上次条数 5；本次记 7 条
+        assert_eq!(g.observe_session("sess:a", 1200, 7), Some(5), "TTL(300)内应 warm 且返回上次条数");
+        // 超 TTL → cold(缓存凉了)；本次记 9 条
+        assert_eq!(g.observe_session("sess:a", 1600, 9), None, "距上次>300s 应判 cold");
+        // 刚刷新过,紧接着再来 → warm，返回刚记的 9
+        assert_eq!(g.observe_session("sess:a", 1700, 11), Some(9), "刷新后 TTL 内应 warm");
+        // 不同会话互不影响 → cold
+        assert_eq!(g.observe_session("sess:b", 1700, 3), None, "另一会话首次应 cold");
+    }
+
+    #[test]
+    fn governance_hwm_short_request_does_not_lower_prev_n() {
+        // 核心修复：同一 seed 上出现更小 msg_count 的短请求（OpenAI key 级 seed 下的另一对话、
+        // title/探针/子任务、被重截断的历史），不得把 prev_n 下界打小 → 否则下一条长请求会算出
+        // 横跨整段历史的巨大 creation delta。存高水位后短请求不拉低下界。
+        let g = MeterGovernance::new(1.0, 300);
+        // 长对话到 200 条 → 首次 cold，记高水位 200。
+        assert_eq!(g.observe_session("key:42", 1000, 200), None);
+        // 同 seed 冒出一条短请求（另一对话/探针，只 3 条）→ warm，返回高水位 200（不是 3）。
+        assert_eq!(
+            g.observe_session("key:42", 1010, 3),
+            Some(200),
+            "短请求应读到高水位 200,而非被自己打小"
+        );
+        // 长对话回来到 202 条 → warm，返回的 prev_n 仍是高水位 200（旧 bug 会返回 3）。
+        assert_eq!(
+            g.observe_session("key:42", 1020, 202),
+            Some(200),
+            "长请求应读到高水位 200 → creation 只覆盖新增 2 条,不横跨历史"
+        );
+        // 高水位随真实增长上移。
+        assert_eq!(g.observe_session("key:42", 1030, 205), Some(202));
+    }
+
+    #[test]
+    fn governance_hwm_bounds_creation_delta() {
+        // 端到端证明高水位把 creation 从「横跨整段历史」压回「本轮新增」量级。
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        // 构造 6 条历史 + 末条：模拟长对话某轮 n=7。
+        let mut msgs: Vec<Message> = Vec::new();
+        for i in 0..6 {
+            msgs.push(msg(if i % 2 == 0 { "user" } else { "assistant" }, &body));
         }
-        t.update(&p); // expires_at = now + 0 = now
-        // compute 时 prune 掉 now 之前的（expires_at <= now）→ 空表 → miss。
-        let u = t.compute(&p);
-        assert_eq!(u.read_est, 0);
+        msgs.push(msg("user", "new q"));
+        let req = req_with(msgs, None);
+        let n = req.messages.len(); // 7
+
+        // 旧 bug：prev_n 被短请求打成 1 → creation 横跨 msg[1..6]（5 条）。
+        let exploded = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // 修复：高水位使 prev_n = n-2 = 5 → creation 只覆盖 msg[5..6]（1 条）。
+        let bounded = compute_structural_cache_usage(&req, 1.0, Some(n - 2));
+        assert!(
+            exploded.creation_est > bounded.creation_est * 3,
+            "打小的 prev_n 会让 creation 爆炸(exploded={} vs bounded={})",
+            exploded.creation_est,
+            bounded.creation_est
+        );
     }
 
     #[test]
-    fn min_tokens_threshold_skips_small() {
-        // min_tokens 很高 → 小请求不进缓存（creation=0，read=0）。
-        let t = PromptCacheTracker::new(0.85, 100_000, 100_000, 300, 100, None);
-        let req = req_with(vec![msg("user", "tiny")], None);
-        let p = build_profile(&req, 1, 300).unwrap();
-        let u = t.compute(&p);
-        assert_eq!(u.read_est, 0);
-        assert_eq!(u.creation_est, 0, "低于阈值不计 creation");
+    fn governance_cold_resets_baseline_not_hwm() {
+        // cold（超 TTL，缓存确已凉）：重置基线为本次条数，不保留旧高水位——前缀整段要重建。
+        let g = MeterGovernance::new(1.0, 100);
+        assert_eq!(g.observe_session("key:9", 1000, 50), None); // 首次 cold，记 50
+        assert_eq!(g.observe_session("key:9", 1050, 52), Some(50), "TTL 内 warm");
+        // 超 TTL → cold，基线重置为本次的 4（不因高水位 52 而保留）。
+        assert_eq!(g.observe_session("key:9", 1300, 4), None, "超 TTL 应 cold");
+        // 紧接着来 → warm，读到刚重置的 4（证明 cold 没保留旧高水位 52）。
+        assert_eq!(
+            g.observe_session("key:9", 1310, 6),
+            Some(4),
+            "cold 后基线应是重置值 4,不是旧高水位 52"
+        );
     }
 
     #[test]
-    fn lru_eviction_bounds_entries() {
-        // max_entries 下限 clamp 到 100（本番安全）；写入 130 个不同前缀 → 表最多 100 条。
-        let t = PromptCacheTracker::new(0.85, 1, 1, 300, 100, None);
-        for i in 0..130 {
-            let req = req_with(
-                vec![msg("user", &format!("distinct content number {}", i))],
-                None,
-            );
-            let p = build_profile(&req, 1, 300).unwrap();
-            t.update(&p);
-        }
-        assert!(t.stats().entries <= 100, "LRU 容量上限 100");
-        assert!(t.stats().evictions >= 1);
+    fn compute_warm_multi_message_burst_creation() {
+        // C 方案核心：一轮补进多对消息（agent 工具循环）时，creation 覆盖**全部新增中间消息**，
+        // 而非只倒数第二条。历史 [u0,a0]（上次 prev_n=2）+ 本轮新增 [a1,tr,a2] + 末条 input。
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        let req = req_with(
+            vec![
+                msg("user", &body),      // 0  上轮已缓存
+                msg("assistant", &body), // 1  上轮已缓存（prev_n=2 → [0,1] 是上次的前缀）
+                msg("assistant", &body), // 2  本轮新增 ← creation
+                msg("user", &body),      // 3  本轮新增（tool_result 占位）← creation
+                msg("assistant", &body), // 4  本轮新增 ← creation
+                msg("user", "new q"),    // 5  本轮 input
+            ],
+            None,
+        );
+        let est = |m: &Message| message_tokens(m);
+        let burst: i32 = est(&req.messages[2]) + est(&req.messages[3]) + est(&req.messages[4]);
+        let u = compute_structural_cache_usage(&req, 1.0, Some(2));
+        assert_eq!(u.creation_est, burst, "creation 应覆盖上次见到后新增的全部中间消息");
+        assert_eq!(u.input_est, est(&req.messages[5]), "input 仍是末条");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert!(creation > 0 && read > 0);
+        assert_eq!(input + creation + read, u.prompt_total_est);
+
+        // 对比旧「倒数第二条」语义（prev_n = n-2 = 4）：creation 只一条，明显偏小。
+        let old = compute_structural_cache_usage(&req, 1.0, Some(req.messages.len() - 2));
+        assert_eq!(old.creation_est, est(&req.messages[4]));
+        assert!(u.creation_est > old.creation_est * 2, "多消息 burst 下 C 比旧语义计入更多 creation");
     }
 
     #[test]
-    fn stats_track_hits_misses() {
-        let t = tracker();
-        let req = req_with(vec![msg("user", "some content for stats test")], None);
-        let p = build_profile(&req, 1, 300).unwrap();
-        let _ = t.compute(&p); // miss（空表）
-        t.update(&p);
-        let _ = t.compute(&p); // hit
-        let s = t.stats();
-        assert!(s.misses >= 1);
-        assert!(s.hits >= 1);
+    fn compute_warm_no_new_settled_creation_zero() {
+        // warm 但 prev_n >= n-1（纯重放：上次条数 == 本次条数，无新增沉淀）→ creation=0。
+        let body = "lorem ipsum ".repeat(20);
+        let req = req_with(
+            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            None,
+        );
+        let u = compute_structural_cache_usage(&req, 1.0, Some(3)); // prev_n == n
+        assert_eq!(u.creation_est, 0, "无新增沉淀时 creation 为 0");
+        let u2 = compute_structural_cache_usage(&req, 1.0, Some(2)); // prev_n == n-1
+        assert_eq!(u2.creation_est, 0, "prev_n==n-1（末条即新增）→ 新增全是 input，creation=0");
     }
 
-    #[test]
-    fn parse_ttl_str_forms() {
-        assert_eq!(parse_ttl_str("5m"), 300);
-        assert_eq!(parse_ttl_str("1h"), 3600);
-        assert_eq!(parse_ttl_str("300"), 300);
-        assert_eq!(parse_ttl_str("garbage"), 0);
-    }
-
-    #[test]
-    fn setters_clamp() {
-        let t = tracker();
-        t.set_max_ratio(2.0);
-        assert_eq!(t.max_ratio(), 1.0);
-        t.set_max_ratio(0.1);
-        assert_eq!(t.max_ratio(), 0.5);
-        t.set_max_entries(1);
-        assert_eq!(t.max_entries(), 100);
-    }
+    // ---- isolation_seed ----------------------------------------------------
 
     #[test]
     fn isolation_seed_prefers_session_then_key() {
-        use super::super::types::Metadata;
-        let mut req = req_with(vec![msg("user", "hi")], None);
-        req.metadata = Some(Metadata {
-            user_id: Some("user_abc_account__session_XYZ".to_string()),
-        });
-        assert_eq!(isolation_seed(&req, 7), "sess:XYZ");
-        req.metadata = None;
+        let mut req = req_with(vec![msg("user", "x")], None);
         assert_eq!(isolation_seed(&req, 7), "key:7");
+        req.metadata = Some(Metadata {
+            user_id: Some("user_abc_account__session_uuid-123".to_string()),
+        });
+        assert_eq!(isolation_seed(&req, 7), "sess:uuid-123");
+    }
+
+    #[test]
+    fn extract_session_id_parses_claude_code_format() {
+        assert_eq!(
+            extract_session_id("user_xxx_account__session_0b4445e1-uuid"),
+            Some("0b4445e1-uuid".to_string())
+        );
+        assert_eq!(extract_session_id("no-session-here"), None);
+        assert_eq!(extract_session_id("trailing_session_"), None);
+    }
+
+    fn make_test_png(w: u32, h: u32) -> String {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        use image::{ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+            }
+        }
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        B64.encode(&buf)
     }
 }
-

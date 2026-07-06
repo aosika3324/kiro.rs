@@ -512,18 +512,13 @@ pub struct RuntimeGovernanceConfigResponse {
     pub response_cache_enabled: bool,
     /// 全局响应缓存默认 TTL（秒）。
     pub response_cache_ttl_secs: u64,
-    /// 指纹计量断点默认 TTL（秒）。越长跨请求命中率越高。
+    /// 缓存计量全局 read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input
+    /// （不给缓存折扣），不触碰 creation。delta-based 拆桶下 creation 每轮有界。
+    /// R=1=给足真实折扣；0=完全不给。可被 per-key `cacheReadRatio` 覆盖。
+    pub cache_read_ratio: f64,
+    /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
+    /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
     pub cache_meter_ttl_secs: u64,
-    /// 指纹计量：单请求可命中占总 input 上限 ∈ [0.5,1.0]（默认 0.85）。
-    pub cache_max_ratio: f64,
-    /// 指纹计量：断点最小可缓存 token 阈值（非 opus，默认 1024）。
-    pub cache_min_tokens: u32,
-    /// 指纹计量：opus 模型的最小可缓存 token 阈值（默认 4096）。
-    pub cache_min_tokens_opus: u32,
-    /// 指纹计量：全局 LRU 容量上限（默认 20000）。
-    pub cache_max_entries: usize,
-    /// 指纹计量实时命中率统计（entries/hits/misses/evictions/expirations）。
-    pub cache_stats: Option<crate::anthropic::cache_metering::PromptCacheStats>,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -539,21 +534,12 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u64>,
-    /// 指纹计量断点默认 TTL（秒），范围 1..=86400；缺省不修改。
+    /// 缓存计量全局 read 留存阻尼 R，范围 0..=1；缺省不修改。
+    #[serde(default)]
+    pub cache_read_ratio: Option<f64>,
+    /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub cache_meter_ttl_secs: Option<u64>,
-    /// 指纹计量单请求可命中上限 ∈ [0.5,1.0]；缺省不修改。
-    #[serde(default)]
-    pub cache_max_ratio: Option<f64>,
-    /// 指纹计量最小可缓存 token 阈值（非 opus）；缺省不修改。
-    #[serde(default)]
-    pub cache_min_tokens: Option<u32>,
-    /// 指纹计量 opus 最小可缓存 token 阈值；缺省不修改。
-    #[serde(default)]
-    pub cache_min_tokens_opus: Option<u32>,
-    /// 指纹计量全局 LRU 容量上限，范围 >=100；缺省不修改。
-    #[serde(default)]
-    pub cache_max_entries: Option<usize>,
 }
 
 /// 端点路由配置响应：首选端点 + fallback 开关 + 可选端点清单。
@@ -889,6 +875,9 @@ pub struct ClientKeyItem {
     /// 响应缓存 TTL 覆盖（秒；None = 跟随全局）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -953,6 +942,12 @@ pub struct UpdateClientKeyRequest {
     /// 响应缓存 TTL 覆盖更新（秒；字段缺省=不变更；0=清除覆盖、跟随全局）。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖更新 ∈ [0,1]。三态语义（double-option）：
+    /// - 字段缺省 → `None`：不变更
+    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随全局默认
+    /// - 数值 → `Some(Some(v))`：强制该 Key 的命中率（clamp 到 [0,1]）
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_read_ratio: Option<Option<f64>>,
 }
 
 /// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。

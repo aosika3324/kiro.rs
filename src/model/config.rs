@@ -206,39 +206,32 @@ pub struct Config {
 
     /// 中转层 prompt cache 计量的**全局 read 留存阻尼 R** ∈ [0,1]（默认 1.0）。
     ///
-    /// **已弃用**（指纹计量模型不再使用 R 留存阻尼）。保留字段仅为兼容读取旧配置文件，
-    /// 不再影响计量。命中率现由指纹模型的物理参数控制（见下方 `cache_max_ratio` 等）。
+    /// 上游不做真实缓存，cache_creation/cache_read 是中转层合成给下游看的数字（见
+    /// `crate::anthropic::cache_metering`）。计量按 delta-based 拆三桶：input=本轮新问题、
+    /// creation=本轮新写入缓存的一条 delta（有界）、read=已缓存的更早前缀。R 是 read 留存
+    /// 阻尼：保留 `read × R`，被砍部分推回 input（不给缓存折扣），**不触碰 creation**。
+    /// R=1（默认）给足真实缓存折扣;调低则更保守（少认缓存命中）;0 = 完全不给折扣。
+    /// 运行时可经 Admin API `/config/runtime-governance` 调整，并可被 per-key
+    /// `cacheReadRatio` 覆盖。clamp 到 [0,1]。
     #[serde(default = "default_cache_read_ratio")]
     pub cache_read_ratio: f64,
 
-    /// 指纹计量的**断点默认 TTL**（秒，默认 300 = 5min）。断点无显式 `cache_control.ttl`
-    /// 时用此值。TTL 越长 → 缓存前缀留存越久 → 跨请求命中率越高。运行时可经 Admin API 调整。
-    /// （字段名沿用 `cache_meter_ttl_secs` 兼容旧配置。）
+    /// 中转层 prompt cache 计量的**缓存热度 TTL**（秒，默认 300 = 5min，对齐 Anthropic
+    /// ephemeral 缓存默认有效期）。
+    ///
+    /// 方案 2 的 cold/TTL 语义旋钮：按会话（isolation_seed）记 last_seen。某会话**首次出现**、
+    /// 或距上次请求**超过此 TTL**（缓存已凉）→ 本轮视为 cold，整段可缓存前缀按 **creation**
+    /// （贵桶 1.25~2.0×）计费、read=0，如同首轮重写缓存；TTL 内的连续请求才算 warm，走
+    /// delta 拆分（creation 只一条、其余 read 0.1× 便宜桶）。
+    ///
+    /// 这是真实、可解释的 margin 旋钮：TTL 短 → 更多请求判 cold → creation 多 / read 少 →
+    /// 下游折扣自然收紧；TTL 长 → 更易判 warm → 更多 0.1× 折扣。运行时可经 Admin API 调整。
     #[serde(default = "default_cache_meter_ttl_secs")]
     pub cache_meter_ttl_secs: u64,
 
-    /// 指纹计量：单请求可命中占总 input 的**上限**（默认 0.85）。保证最新内容本轮不全命中。
-    /// 调大 → 命中率更激进；调小 → 更保守。clamp 到 [0.5,1.0]。运行时可经 Admin API 调整。
-    #[serde(default = "default_cache_max_ratio")]
-    pub cache_max_ratio: f64,
-
-    /// 指纹计量：断点**最小可缓存 token 阈值**（非 opus，默认 1024）。低于此的前缀不进缓存。
-    /// 调小 → 更多小块可缓存 → 命中率↑。
-    #[serde(default = "default_cache_min_tokens")]
-    pub cache_min_tokens: u32,
-
-    /// 指纹计量：opus 模型的最小可缓存 token 阈值（默认 4096，opus 缓存门槛更高）。
-    #[serde(default = "default_cache_min_tokens_opus")]
-    pub cache_min_tokens_opus: u32,
-
-    /// 指纹计量：全局 LRU **容量上限**（默认 20000）。超出淘汰最久未用前缀。
-    /// 调大 → 容纳更多前缀 → 高并发命中率↑（占内存更多）。clamp 到 `>= 100`。
-    #[serde(default = "default_cache_max_entries")]
-    pub cache_max_entries: usize,
-
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
-    /// 注意：这与指纹计量（`cache_*` 参数，只合成 token 计量数字）是两回事，本项缓存真实响应体。
+    /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
     #[serde(default)]
     pub response_cache_enabled: bool,
 
@@ -433,23 +426,7 @@ fn default_cache_read_ratio() -> f64 {
 }
 
 fn default_cache_meter_ttl_secs() -> u64 {
-    crate::anthropic::cache_metering::DEFAULT_CACHE_TTL_SECS
-}
-
-fn default_cache_max_ratio() -> f64 {
-    crate::anthropic::cache_metering::DEFAULT_CACHE_MAX_RATIO
-}
-
-fn default_cache_min_tokens() -> u32 {
-    crate::anthropic::cache_metering::DEFAULT_CACHE_MIN_TOKENS
-}
-
-fn default_cache_min_tokens_opus() -> u32 {
-    crate::anthropic::cache_metering::DEFAULT_CACHE_MIN_TOKENS_OPUS
-}
-
-fn default_cache_max_entries() -> usize {
-    crate::anthropic::cache_metering::DEFAULT_CACHE_MAX_ENTRIES
+    300
 }
 
 fn default_response_cache_ttl_secs() -> u64 {
@@ -509,10 +486,6 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_read_ratio: default_cache_read_ratio(),
             cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
-            cache_max_ratio: default_cache_max_ratio(),
-            cache_min_tokens: default_cache_min_tokens(),
-            cache_min_tokens_opus: default_cache_min_tokens_opus(),
-            cache_max_entries: default_cache_max_entries(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),

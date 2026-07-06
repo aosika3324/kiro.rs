@@ -13,7 +13,7 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
-    cache_metering::SharedPromptCacheTracker,
+    cache_metering::SharedMeterGovernance,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     response_cache::SharedResponseCache,
@@ -52,7 +52,7 @@ pub fn create_router(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
-    prompt_cache_tracker: Option<SharedPromptCacheTracker>,
+    meter_governance: Option<SharedMeterGovernance>,
     trace_store: Option<SharedTraceStore>,
     usage_gated_streaming: bool,
     response_cache: Option<SharedResponseCache>,
@@ -63,7 +63,7 @@ pub fn create_router(
         state = state.with_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
-    state = state.with_prompt_cache_tracker(prompt_cache_tracker);
+    state = state.with_meter_governance(meter_governance);
     state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);

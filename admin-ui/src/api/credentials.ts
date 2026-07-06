@@ -474,33 +474,15 @@ export async function setLogGovernanceConfig(
   return data
 }
 
-// 指纹计量命中率统计快照。
-export interface PromptCacheStats {
-  entries: number
-  capacity: number
-  hits: number
-  misses: number
-  evictions: number
-  expirations: number
-}
-
-// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认 + 指纹计量 5 参数 + 命中率统计
+// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）+ 缓存命中率
 export interface RuntimeGovernanceConfig {
   quotaDisableThreshold: number
   responseCacheEnabled: boolean
   responseCacheTtlSecs: number
-  /** 指纹计量断点默认 TTL（秒）。越长跨请求命中率越高。 */
+  /** 缓存计量 read 留存阻尼 R ∈ [0,1]：read 桶保留 read×R，其余推回 input（不触碰 creation）。 */
+  cacheReadRatio: number
+  /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
   cacheMeterTtlSecs: number
-  /** 指纹计量：单请求可命中占总 input 上限 ∈ [0.5,1.0]（默认 0.85）。 */
-  cacheMaxRatio: number
-  /** 指纹计量：断点最小可缓存 token 阈值（非 opus，默认 1024）。 */
-  cacheMinTokens: number
-  /** 指纹计量：opus 模型的最小可缓存 token 阈值（默认 4096）。 */
-  cacheMinTokensOpus: number
-  /** 指纹计量：全局 LRU 容量上限（默认 20000）。 */
-  cacheMaxEntries: number
-  /** 实时命中率统计（可能为 null，未注入 tracker 时）。 */
-  cacheStats?: PromptCacheStats | null
 }
 
 // 获取运行时治理配置
