@@ -175,21 +175,52 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
         }
     }
 
-    // 递归处理嵌套 properties
-    if let Some(serde_json::Value::Object(props)) = obj.remove("properties") {
-        let normalized: serde_json::Map<String, serde_json::Value> = props
-            .into_iter()
-            .map(|(k, v)| (k, normalize_property_schema(v)))
-            .collect();
-        obj.insert(
-            "properties".to_string(),
-            serde_json::Value::Object(normalized),
-        );
+    // 递归处理【所有】嵌套 schema 载体（对齐 Kiro-Go cleanSchema 的全递归）——
+    // 关键修复:旧代码只递归 properties/items,导致嵌套 oneOf/allOf/anyOf 分支里的
+    // 空 required 等 Kiro 拒绝构造未被清理 → "Improperly formed request"。
+
+    // (a) map 形式:name → 子 schema
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(m)) = obj.remove(key) {
+            let normalized: serde_json::Map<String, serde_json::Value> = m
+                .into_iter()
+                .map(|(k, v)| (k, normalize_property_schema(v)))
+                .collect();
+            obj.insert(key.to_string(), serde_json::Value::Object(normalized));
+        }
     }
 
-    // 递归处理 items（数组元素 schema）
+    // (b) array 形式:子 schema 列表(含组合器分支)
+    for key in ["oneOf", "allOf", "anyOf", "prefixItems"] {
+        if let Some(serde_json::Value::Array(arr)) = obj.remove(key) {
+            let normalized: Vec<serde_json::Value> =
+                arr.into_iter().map(normalize_property_schema).collect();
+            obj.insert(key.to_string(), serde_json::Value::Array(normalized));
+        }
+    }
+
+    // (c) 单 schema 形式(items 可为 schema 或 schema 数组;其余为单 schema)
     if let Some(items) = obj.remove("items") {
-        obj.insert("items".to_string(), normalize_property_schema(items));
+        let normalized = match items {
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.into_iter().map(normalize_property_schema).collect(),
+            ),
+            other => normalize_property_schema(other),
+        };
+        obj.insert("items".to_string(), normalized);
+    }
+    for key in ["contains", "propertyNames", "if", "then", "else", "not"] {
+        if let Some(v) = obj.remove(key) {
+            obj.insert(key.to_string(), normalize_property_schema(v));
+        }
+    }
+    // additionalProperties:object 形式是子 schema,递归;bool 等原样保留。
+    if let Some(ap) = obj.remove("additionalProperties") {
+        let normalized = match ap {
+            serde_json::Value::Object(_) => normalize_property_schema(ap),
+            other => other,
+        };
+        obj.insert("additionalProperties".to_string(), normalized);
     }
 
     serde_json::Value::Object(obj)
@@ -1873,6 +1904,41 @@ mod tests {
             Some(&serde_json::json!(["x"])),
             "non-empty required must be preserved"
         );
+    }
+
+    #[test]
+    fn test_normalize_schema_cleans_nested_combinator_empty_required() {
+        // BUG: 嵌套 oneOf/anyOf/allOf 分支里的空 required 旧代码不清理 → "Improperly formed request"。
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}, "required": []},
+                        {"type": "object", "properties": {"b": {"type": "number"}}}
+                    ]
+                },
+                "arr": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {}, "required": []}
+                }
+            },
+            "required": ["cfg"]
+        }));
+        // 深入嵌套断言:anyOf[0].required 必须已被移除。
+        let cfg = &out["properties"]["cfg"];
+        let branch0 = &cfg["anyOf"][0];
+        assert!(
+            branch0.get("required").is_none(),
+            "nested anyOf branch empty required must be stripped: {branch0}"
+        );
+        let items = &out["properties"]["arr"]["items"];
+        assert!(
+            items.get("required").is_none(),
+            "nested items empty required must be stripped: {items}"
+        );
+        // 顶层非空 required 保留。
+        assert_eq!(out["required"], serde_json::json!(["cfg"]));
     }
 
     #[test]
