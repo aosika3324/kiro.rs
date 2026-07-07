@@ -661,6 +661,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 11. 构建 UserInputMessageContext
+    // 在 move 前记录当前消息是否带 tool_result（供下方空壳兜底判据用）。
+    let current_has_tool_results = !validated_tool_results.is_empty();
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -671,7 +673,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // Bug A 根治（同 merge_user_messages）：currentMessage 若为纯空壳
+    // （无文本 + 无图片 + 无 tool_result）→ content="" → 上游 "Improperly formed request"。
+    // Codex agent 末轮可能只发空 user 推进，故此处同样兜底为 "."（对齐 Kiro-Go）。
+    // 注意 tools 是工具「定义」不算消息内容，判据只看 text/images/tool_results。
+    let content = if text_content.is_empty() && images.is_empty() && !current_has_tool_results {
+        ".".to_string()
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1351,7 +1361,18 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let mut content = content_parts.join("\n");
+
+    // Bug A 根治：历史里「纯空壳」user 消息（无文本 + 无图片 + 无 tool_result）会序列化成
+    // `userInputMessage.content = ""`，Kiro 上游要求 content 非空 → "Improperly formed request"
+    // (REQUEST_BODY_INVALID)。Codex 风格 agent 自循环（每步 assistant 输出 + 空 user 推进）
+    // 会在深会话里堆出几十条这种空壳 → opus-4-8/sonnet-5 大面积 400（opus-4-7 流量模式不同故 0%）。
+    // 对齐 Kiro-Go 的 minimalFallbackUserContent="."：仅纯空壳兜底为 "."，不动含 tool_result 的
+    // 常规工具轮（那些 content 空但有 toolResults，上游接受）。
+    if content.is_empty() && all_images.is_empty() && all_tool_results.is_empty() {
+        content = ".".to_string();
+    }
+
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1883,6 +1904,31 @@ mod tests {
             Some("xhigh"),
             "unknown future models should keep recognized effort values"
         );
+    }
+
+    #[test]
+    fn test_empty_user_history_message_gets_dot_placeholder() {
+        // Bug A: 历史里纯空壳 user 消息（无文本/图片/tool_result）→ content=""，
+        // Kiro 上游拒为 "Improperly formed request"。修复后应兜底为 "."。
+        let mut dedup = std::collections::HashSet::new();
+        let empty_user = super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!([]),
+        };
+        let out = merge_user_messages(&[&empty_user], "claude-opus-4.8", &mut dedup).unwrap();
+        assert_eq!(
+            out.user_input_message.content, ".",
+            "纯空壳 user 必须兜底为 '.'，不得为空串"
+        );
+        assert!(out.user_input_message.user_input_message_context.tool_results.is_empty());
+
+        // 有文本时保持原样。
+        let text_user = super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        };
+        let out2 = merge_user_messages(&[&text_user], "claude-opus-4.8", &mut dedup).unwrap();
+        assert_eq!(out2.user_input_message.content, "hello");
     }
 
     #[test]
