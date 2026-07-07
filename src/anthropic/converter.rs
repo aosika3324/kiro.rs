@@ -1399,7 +1399,14 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
+                                // Bedrock/Kiro 要求 toolUses[].input 必须是 JSON 对象；
+                                // 非对象（null / 字符串 / 数组 / 数字，或显式 "input": null）会被上游
+                                // 拒为 "Invalid tool use format" (REQUEST_BODY_INVALID)。
+                                // 对齐 Kiro-Go：仅当 input 为对象时保留，否则一律降级为 {}。
+                                let input = match block.input {
+                                    Some(v) if v.is_object() => v,
+                                    _ => serde_json::json!({}),
+                                };
                                 let mapped_name = map_tool_name(&name, tool_name_map);
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
@@ -1876,6 +1883,50 @@ mod tests {
             Some("xhigh"),
             "unknown future models should keep recognized effort values"
         );
+    }
+
+    #[test]
+    fn test_tool_use_non_object_input_coerced_to_object() {
+        // Bug B: 历史 assistant 里 tool_use.input 为非对象（显式 null / 字符串 / 数组 / 数字）
+        // 旧代码 `unwrap_or(json!({}))` 只在字段缺失时兜底，会把非对象原样透传给上游，
+        // 触发 Bedrock "Invalid tool use format" (REQUEST_BODY_INVALID)。
+        // 修复后：任何非对象 input 一律降级为 {}（对齐 Kiro-Go）。
+        let mut map = HashMap::new();
+        let cases = vec![
+            serde_json::json!(null),
+            serde_json::json!("a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(42),
+        ];
+        for bad in cases {
+            let msg = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": bad}
+                ]),
+            };
+            let out = convert_assistant_message(&msg, &mut map).unwrap();
+            let tus = out
+                .assistant_response_message
+                .tool_uses
+                .expect("tool_use must be present");
+            assert_eq!(tus.len(), 1);
+            assert!(
+                tus[0].input.is_object(),
+                "non-object tool_use.input must coerce to object, got: {}",
+                tus[0].input
+            );
+        }
+        // 合法对象输入保持不变。
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"path": "/x"}}
+            ]),
+        };
+        let out = convert_assistant_message(&msg, &mut map).unwrap();
+        let tus = out.assistant_response_message.tool_uses.unwrap();
+        assert_eq!(tus[0].input, serde_json::json!({"path": "/x"}));
     }
 
     #[test]
