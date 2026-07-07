@@ -1148,14 +1148,50 @@ fn shorten_tool_name(name: &str) -> String {
     format!("{}_{}", prefix, hash_suffix)
 }
 
-/// 如果名称超长则缩短，并记录映射（short → original）
-fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
-    if name.len() <= TOOL_NAME_MAX_LEN {
-        return name.to_string();
+/// 把工具名清洗成 Bedrock/Kiro 接受的字符集：`[a-zA-Z0-9_-]`，非法字符（引号、空格、
+/// 等号、斜杠、中文……）一律替换为 `_`。
+///
+/// Bug B 根因（154 抓包实证）：退化模型吐出 `<invoke name="view" path="..." type="...">`
+/// 这种带属性的畸形标签，客户端把整串（含引号/空格）当作 tool name 存进历史 tool_use 再回传；
+/// 或工具「定义」本身 name 含非法字符。kiro.rs 旧逻辑（含 Kiro-Go 的 sanitizeToolName）都不清
+/// 引号/空格 → 上游报 "Invalid tool use format" (REQUEST_BODY_INVALID)。
+///
+/// 空结果兜底为 "tool"（对齐 Kiro-Go）。仅替换字符不改长度，故不影响后续 shorten 的边界判定。
+fn sanitize_tool_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "tool".to_string()
+    } else {
+        cleaned
     }
-    let short = shorten_tool_name(name);
-    tool_name_map.insert(short.clone(), name.to_string());
-    short
+}
+
+/// 清洗非法字符 + 超长则缩短，并记录映射（最终名 → 原始名，供 `<invoke>` 打捞恢复）。
+fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
+    let sanitized = sanitize_tool_name(name);
+    // 清洗未改动且长度合法 → 原样返回（绝大多数正常工具名走这条，零开销、零映射）。
+    if sanitized == name && sanitized.len() <= TOOL_NAME_MAX_LEN {
+        return sanitized;
+    }
+    let final_name = if sanitized.len() <= TOOL_NAME_MAX_LEN {
+        sanitized
+    } else {
+        shorten_tool_name(&sanitized)
+    };
+    // 记录 最终名 → 原始 client 名，使打捞/占位符路径能还原（final_name 与原始不同才需映射）。
+    if final_name != name {
+        tool_name_map.insert(final_name.clone(), name.to_string());
+    }
+    final_name
 }
 
 /// 转换工具定义
@@ -1930,6 +1966,33 @@ mod tests {
             normalize_effort_for_model("claude-unknown-9", "xhigh").as_deref(),
             Some("xhigh"),
             "unknown future models should keep recognized effort values"
+        );
+    }
+
+    #[test]
+    fn test_tool_name_sanitized_to_bedrock_charset() {
+        // Bug B 真凶(154 抓包实证)：退化模型吐 <invoke name="view" path="..." type="...">，
+        // 畸形 name 含引号/空格进入 history tool_use 或 tools 定义 → 上游 "Invalid tool use format"。
+        // 修复：map_tool_name 用 sanitize_tool_name 把非法字符替换为 '_'。
+        let bad = "view\" path=\"modules/CourseManagement\" type=\"directory";
+        let clean = sanitize_tool_name(bad);
+        assert!(
+            clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "清洗后必须只含 [a-zA-Z0-9_-]，实际: {clean}"
+        );
+        // 正常名不变。
+        assert_eq!(sanitize_tool_name("web_search"), "web_search");
+        assert_eq!(sanitize_tool_name("mcp__server__tool-x"), "mcp__server__tool-x");
+        // 非法字符替换为 '_'（结果非空即合法，纯下划线对 Bedrock 合法）。
+        assert_eq!(sanitize_tool_name("\"\" "), "___");
+        // 空输入 → 兜底 "tool"。
+        assert_eq!(sanitize_tool_name(""), "tool");
+        // map_tool_name 对畸形名也清洗（走 tools 定义 / history tool_use 同一路径）。
+        let mut map = HashMap::new();
+        let mapped = map_tool_name(bad, &mut map);
+        assert!(
+            mapped.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "map_tool_name 输出必须合法: {mapped}"
         );
     }
 

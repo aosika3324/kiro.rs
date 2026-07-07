@@ -110,10 +110,24 @@ fn build_body_shape(
                     .collect()
             })
             .unwrap_or_default();
-        let tools_n = ctx
-            .and_then(|c| c.get("tools"))
-            .and_then(|t| t.as_array())
-            .map(|a| a.len());
+        let tools_arr = ctx.and_then(|c| c.get("tools")).and_then(|t| t.as_array());
+        let tools_n = tools_arr.map(|a| a.len());
+        // Bug B 诊断：记录 tools 定义的工具名 + 是否含非法字符（引号/空格等），
+        // 用于确认「Invalid tool use format」是否源自工具「定义」本身的畸形 name。
+        let is_valid_name =
+            |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        let tool_def_names: Vec<serde_json::Value> = tools_arr
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        t.get("toolSpecification")
+                            .and_then(|s| s.get("name"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .map(|n| json!({"name": n, "valid": is_valid_name(n)}))
+                    .collect()
+            })
+            .unwrap_or_default();
         json!({
             "kind": "user",
             "content_len": content.len(),
@@ -122,6 +136,7 @@ fn build_body_shape(
             "images": uim.get("images").and_then(|i| i.as_array()).map(|a| a.len()),
             "tool_results": tool_results,
             "tools_count": tools_n,
+            "tool_def_names": tool_def_names,
             "modelId": uim.get("modelId").and_then(|v| v.as_str()),
             "origin": uim.get("origin").and_then(|v| v.as_str()),
         })
