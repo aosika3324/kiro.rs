@@ -178,20 +178,26 @@ pub mod outcome {
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
 }
 
-/// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
+/// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8），并中和控制标记。
+///
+/// error_snippet 会在 admin UI trace 查看器里展示给操作者。上游错误体可能回显部分客户端
+/// 内容（含被恶意塞入的 `<system-reminder>` 等标记），故落库前先经
+/// `security::neutralize_control_markers` 转成惰性形态，防止查看的人被间接提示词注入操纵。
+/// 这是输出/展示侧防御，不影响转发。
 pub fn truncate_snippet(body: &str) -> Option<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.len() <= ERROR_SNIPPET_MAX {
-        return Some(trimmed.to_string());
+    let neutral = crate::security::neutralize_control_markers(trimmed);
+    if neutral.len() <= ERROR_SNIPPET_MAX {
+        return Some(neutral);
     }
     let mut end = ERROR_SNIPPET_MAX;
-    while end > 0 && !trimmed.is_char_boundary(end) {
+    while end > 0 && !neutral.is_char_boundary(end) {
         end -= 1;
     }
-    Some(format!("{}…(truncated)", &trimmed[..end]))
+    Some(format!("{}…(truncated)", &neutral[..end]))
 }
 
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]

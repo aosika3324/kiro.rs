@@ -30,16 +30,22 @@ use parking_lot::Mutex;
 /// 避免 RUST_LOG=debug 时 200K 级请求体被完整格式化拖垮代理。
 const LOG_BODY_MAX_BYTES: usize = 2048;
 
-/// 为 debug 日志截断请求体（UTF-8 安全,只在字符边界切）。
+/// 为 debug 日志截断请求体（UTF-8 安全,只在字符边界切），并中和其中的控制标记。
+///
+/// 仅用于 `tracing::debug!` 输出，**不影响实际发送内容**。除截断外，还调用
+/// `security::neutralize_control_markers` 把客户端内容里可能被恶意塞入的 `<system-reminder>`
+/// 等标记转成惰性全角形态——防止操作者/取证 agent 回读日志时被间接提示词注入操纵
+/// （kiro.rs 是代理，会搬运任意客户端对话内容）。这是输出/展示侧防御，转发路径不受影响。
 pub(crate) fn truncate_for_log(body: &str) -> std::borrow::Cow<'_, str> {
     if body.len() <= LOG_BODY_MAX_BYTES {
-        return std::borrow::Cow::Borrowed(body);
+        return std::borrow::Cow::Owned(crate::security::neutralize_control_markers(body));
     }
     let mut end = LOG_BODY_MAX_BYTES;
     while end > 0 && !body.is_char_boundary(end) {
         end -= 1;
     }
-    std::borrow::Cow::Owned(format!("{}…[截断,完整 {} bytes]", &body[..end], body.len()))
+    let neutral = crate::security::neutralize_control_markers(&body[..end]);
+    std::borrow::Cow::Owned(format!("{}…[截断,完整 {} bytes]", neutral, body.len()))
 }
 
 /// 结构化诊断抓包：已写出的样本数（进程级上限，避免刷爆磁盘/日志）。
