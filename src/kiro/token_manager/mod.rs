@@ -1022,6 +1022,12 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 自动禁用（`TooManyFailures`）发生的时刻，用于限时半开恢复。
+    /// `Some(t)`：距今超过 `auto_disable_recovery_secs` 后，该凭据在候选筛选时被自动半开
+    /// （清 disabled + 重置 failure_count，给一次新机会）；避免瞬态上游抖动把账号永久踢出池
+    /// （旧逻辑只在"整池全禁用"时才一次性自愈，且羊群式全放，易再次集体 429）。
+    /// 不持久化，进程重启即等价于全部恢复。
+    auto_disabled_at: Option<Instant>,
 }
 
 /// 单凭据的运行时并发状态。
@@ -1578,6 +1584,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    auto_disabled_at: None,
                 }
             })
             .collect();
@@ -1851,8 +1858,33 @@ impl MultiTokenManager {
         large_penalty: usize,
     ) -> Vec<CredentialCandidate> {
         let now = Instant::now();
+        let recovery_secs = self.config.auto_disable_recovery_secs;
         let available_entries: Vec<_> = {
-            let entries = self.entries.lock();
+            let mut entries = self.entries.lock();
+            // 半开恢复：自动禁用（TooManyFailures）超过恢复窗口的账号在此就地"半开"，
+            // 给一次新机会（清禁用+重置失败计数）。逐账号按各自禁用时刻错峰恢复，避免旧的
+            // 整池一次性自愈造成的羊群再限流。recovery_secs==0 时关闭（退回旧行为）。
+            // 此处已持 entries 独占锁，改 iter_mut 不引入额外锁竞争。
+            if recovery_secs > 0 {
+                for e in entries.iter_mut() {
+                    if e.disabled
+                        && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                        && e.auto_disabled_at
+                            .map(|t| now.saturating_duration_since(t).as_secs() >= recovery_secs)
+                            .unwrap_or(true)
+                    {
+                        e.disabled = false;
+                        e.disabled_reason = None;
+                        e.failure_count = 0;
+                        e.auto_disabled_at = None;
+                        tracing::info!(
+                            "凭据 #{} 自动禁用已达半开恢复窗口（{}s），重新纳入调度试放一次",
+                            e.id,
+                            recovery_secs
+                        );
+                    }
+                }
+            }
             entries
                 .iter()
                 .filter(|e| {
@@ -1957,6 +1989,7 @@ impl MultiTokenManager {
                             e.disabled = false;
                             e.disabled_reason = None;
                             e.failure_count = 0;
+                            e.auto_disabled_at = None;
                         }
                     }
                     drop(entries);
@@ -2598,6 +2631,8 @@ impl MultiTokenManager {
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
+                // 半开成功 = 该凭据已恢复健康，清掉自动禁用时刻
+                entry.auto_disabled_at = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -2647,6 +2682,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                entry.auto_disabled_at = Some(Instant::now());
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -3030,6 +3066,7 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
+                entry.auto_disabled_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -3788,6 +3825,66 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_auto_disable_half_open_recovery() {
+        // 自动禁用达半开窗口后，账号在候选筛选时被就地恢复、重新纳入调度。
+        let config = Config::default(); // auto_disable_recovery_secs 默认 600
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 连续失败 3 次 → TooManyFailures 自动禁用
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+        assert!(
+            manager.ranked_available_credentials(None, None, 0).is_empty(),
+            "刚被自动禁用（窗口未到）不应恢复"
+        );
+
+        // 把 auto_disabled_at 回拨到窗口之前（None 等价于“未知/已超期”，恢复条件按超期处理）
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            assert!(e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures));
+            e.auto_disabled_at = None;
+        }
+
+        // 再次筛选 → 半开恢复
+        let cands = manager.ranked_available_credentials(None, None, 0);
+        assert_eq!(cands.len(), 1, "达半开窗口后应恢复该账号");
+        {
+            let entries = manager.entries.lock();
+            let e = entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(!e.disabled, "恢复后 disabled 应清除");
+            assert_eq!(e.failure_count, 0, "恢复应重置失败计数");
+            assert!(e.auto_disabled_at.is_none());
+        }
+    }
+
+    #[test]
+    fn test_auto_disable_recovery_disabled_when_zero() {
+        // recovery_secs==0 关闭半开，退回旧行为：自动禁用不自动恢复。
+        let mut config = Config::default();
+        config.auto_disable_recovery_secs = 0;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+        // 即便回拨时间，recovery_secs==0 也不恢复
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 1).unwrap().auto_disabled_at = None;
+        }
+        assert!(
+            manager.ranked_available_credentials(None, None, 0).is_empty(),
+            "recovery_secs==0 时不应半开恢复"
+        );
     }
 
     #[test]

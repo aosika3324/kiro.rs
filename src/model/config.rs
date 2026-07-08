@@ -147,6 +147,15 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
 
+    /// 自动禁用（连续失败达阈值 TooManyFailures）后的半开恢复窗口（秒，默认 600）。
+    ///
+    /// 被自动禁用的账号在此窗口后于候选筛选时自动"半开"（清禁用+重置失败计数，给一次新机会）：
+    /// 半开后一次成功即完全恢复健康；若立即再失败达阈值则再次禁用、重新计时。这避免了瞬态上游
+    /// 抖动/短时 429 把账号永久踢出池——旧逻辑只在"整池全被自动禁用"时才一次性、羊群式全放，
+    /// 部分禁用时被禁账号会一直卡死直到全禁用或人工启用。设 0 关闭半开恢复（退回旧行为）。
+    #[serde(default = "default_auto_disable_recovery_secs")]
+    pub auto_disable_recovery_secs: u64,
+
     /// 单账号最大并发请求数（默认 2）。
     ///
     /// 用于避免同一账号被无限并发打爆；不是串行，多个账号的整体并发约为
@@ -385,6 +394,10 @@ fn default_rate_limit_cooldown_secs() -> u64 {
     5
 }
 
+fn default_auto_disable_recovery_secs() -> u64 {
+    10 * 60
+}
+
 fn default_account_max_concurrency() -> usize {
     2
 }
@@ -475,6 +488,7 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            auto_disable_recovery_secs: default_auto_disable_recovery_secs(),
             account_max_concurrency: default_account_max_concurrency(),
             account_acquire_timeout_secs: default_account_acquire_timeout_secs(),
             extract_thinking: default_extract_thinking(),

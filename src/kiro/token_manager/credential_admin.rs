@@ -196,6 +196,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                auto_disabled_at: None,
             });
         }
         {
