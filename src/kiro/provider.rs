@@ -333,6 +333,18 @@ impl ClientCache {
 }
 
 /// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
+///
+/// # 并发特性（重要）
+///
+/// `account_guard`（[`CallContext`]，内含 `CredentialLease`）持有该凭据的一个
+/// Semaphore 并发 permit。在流式路径中，它被移入流处理闭包，**直到流的最后一个 chunk
+/// 发出后才 drop**，permit 才归还。这意味着：慢速上游、或被下游客户端拖住读取速度的流，
+/// 会长期占用该账号的并发槽位。高并发下大量慢流可能把所有账号的槽位耗尽，触发
+/// `acquire_idle_permit` 的"池忙"效应（非阻塞模式下由 provider 重试链退避后换 attempt）。
+///
+/// 这是设计上的权衡（permit 生命周期 == 流生命周期，保证在途计数准确），不是 bug——
+/// 但它使实际并发行为部分取决于下游客户端的读速度。调优点：`account_acquire_timeout_secs`
+/// 控制阻塞模式的最长等待，账号并发上限由各凭据的 Semaphore 容量决定。
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,

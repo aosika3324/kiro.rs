@@ -1787,6 +1787,12 @@ pub async fn post_messages_cc(
     };
 
     // 转换请求
+    //
+    // 注意（已知局部重复）：下面这段「prompt_filter::apply → convert_within_limit → 序列化 →
+    // token 计算」与 `prepare_kiro_request`（本文件唯一的请求侧真相源，见其 doc）步骤序列相同。
+    // `prepare_kiro_request` 是后来提炼的，post_messages 非流式分支已走它，但 /cc/v1 的流式分支
+    // 因需要在中途插入 GatedStreamContext 相关逻辑仍保留了这段内联副本。修改请求侧转换逻辑时
+    // 两处需同步；后续可考虑把这段也收敛进 prepare_kiro_request。
     let conversion_started = Instant::now();
     // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
     // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
