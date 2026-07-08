@@ -87,8 +87,12 @@ pub fn body_log_summary(body: &str) -> String {
 ///
 /// ⚠️ 仅在展示出口调用，切勿用于 provider 转发 / cache / 计量路径。
 pub fn neutralize_control_markers(input: &str) -> String {
-    // 仅中和这些"看起来像 harness 指令外壳"的控制标记（大小写不敏感靠逐个列全角替换成本低，
-    // 这里覆盖常见形态）。用全角尖括号替换半角，避免误伤正常含 `<`/`>` 的代码/文本。
+    // 仅中和这些"看起来像 harness 指令外壳"的控制标记。用全角尖括号替换半角，
+    // 避免误伤正常含 `<`/`>` 的代码/文本。
+    //
+    // 大小写不敏感：`<SYSTEM-REMINDER>` / `<System_Reminder>` 等变体只需改一个字母的大小写
+    // 就能绕过精确匹配，故在此逐位置做 ASCII 大小写不敏感匹配，命中后替换【原文对应片段】
+    // （保留其原大小写）的半角尖括号，既中和又不丢失取证时的原始形态。
     const MARKERS: [&str; 8] = [
         "<system-reminder>",
         "</system-reminder>",
@@ -99,11 +103,30 @@ pub fn neutralize_control_markers(input: &str) -> String {
         "<important_instructions>",
         "</important_instructions>",
     ];
-    let mut out = input.to_string();
-    for m in MARKERS {
-        if out.contains(m) {
-            let neutral: String = m.replace('<', "‹").replace('>', "›");
-            out = out.replace(m, &neutral);
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // 仅在 '<' 处尝试匹配任一标记（标记均以 '<' 开头）。
+        let matched = if bytes[i] == b'<' {
+            MARKERS.iter().find(|m| {
+                let mb = m.as_bytes();
+                i + mb.len() <= bytes.len()
+                    && bytes[i..i + mb.len()].eq_ignore_ascii_case(mb)
+            })
+        } else {
+            None
+        };
+        if let Some(m) = matched {
+            // 取原文对应片段（保留大小写），仅替换首尾尖括号为全角。
+            let seg = &input[i..i + m.len()];
+            out.push_str(&seg.replace('<', "‹").replace('>', "›"));
+            i += m.len();
+        } else {
+            // 按字符推进，保证多字节 UTF-8 边界安全。
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     out
@@ -171,6 +194,27 @@ mod tests {
         // 无标记的正常文本(含普通 < >)无损返回。
         let normal = "if a < b && b > c { ok }";
         assert_eq!(neutralize_control_markers(normal), normal);
+    }
+
+    #[test]
+    fn control_markers_neutralized_case_insensitively() {
+        // 大写/混合大小写变体不得绕过。
+        let payload = "<SYSTEM-REMINDER>x</System_Reminder> <Important_Instructions>y</IMPORTANT_INSTRUCTIONS>";
+        let out = neutralize_control_markers(payload);
+        assert!(!out.contains('<'), "任何半角开标记都应被中和：{out}");
+        assert!(!out.contains('>'), "任何半角闭标记都应被中和：{out}");
+        // 原大小写形态保留（仅尖括号变全角），便于取证。
+        assert!(out.contains("‹SYSTEM-REMINDER›"), "应保留原大小写：{out}");
+        assert!(out.contains("‹/IMPORTANT_INSTRUCTIONS›"), "应保留原大小写：{out}");
+        // 内容文本保留。
+        assert!(out.contains('x') && out.contains('y'));
+    }
+
+    #[test]
+    fn neutralize_preserves_multibyte_text() {
+        // 含多字节 UTF-8 的正常文本无损返回（边界安全）。
+        let s = "中文 <tag> 结束 emoji 🚀 end";
+        assert_eq!(neutralize_control_markers(s), s);
     }
 
     #[test]
