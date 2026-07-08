@@ -554,13 +554,14 @@ fn create_placeholder_tool(name: &str) -> Tool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
             description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
+            // 必须走 normalize_json_schema：否则会带上 $schema 与空 `required: []`，
+            // 二者都是上游 "Improperly formed request" 400 的诱因（见 normalize 注释）。
+            // 占位工具在 build 后单独 push，不经 convert_tools，故此处显式规范化。
+            input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!({
                 "type": "object",
                 "properties": {},
-                "required": [],
                 "additionalProperties": true
-            })),
+            }))),
         },
     }
 }
@@ -2265,6 +2266,18 @@ mod tests {
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("\"name\":\"my_custom_tool\""));
+
+        // C2 防回归：占位工具的 schema 必须已走 normalize，
+        // 不得带 $schema（上游拒绝）或空 required:[]（Improperly formed 400 诱因）。
+        let schema = &tool.tool_specification.input_schema.json;
+        assert!(
+            schema.get("$schema").is_none(),
+            "占位工具 schema 不应含 $schema：{schema}"
+        );
+        assert!(
+            schema.get("required").is_none(),
+            "占位工具 schema 不应含空 required：{schema}"
+        );
     }
 
     #[test]
