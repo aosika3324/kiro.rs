@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.10] - 2026-07-10
+
+主题：**放宽 Admin API 请求体上限，修复批量导入凭据时大 JSON 被拒的 413 问题**。批量导入会一次性提交待导入凭据，包含 `refreshToken`、`clientSecret` 等较长字段；当条目较多时，请求体容易超过 axum 默认 2MB 限制并返回 HTTP 413。本版将 Admin 路由请求体上限统一放宽到 50MB，与 Anthropic 路由保持一致，确保大批量导入请求能进入服务端有界并发处理流程。
+
+### 🔧 修复 — Admin 批量导入 413
+
+> 来源：[PR #34](https://github.com/ZyphrZero/kiro.rs/pull/34)。提交人：[@l-spaces](https://github.com/l-spaces)（哈哈先生），感谢贡献。
+
+- **Admin 路由请求体上限提升至 50MB**：为 Admin router 增加 `DefaultBodyLimit::max(50 * 1024 * 1024)`，覆盖 `POST /credentials/batch-import` 等 Admin API，避免批量导入凭据时因默认 2MB body limit 被 axum 提前拒绝。
+- **保持批量导入处理链路不变**：前端仍一次性 POST 待导入条目，服务端继续按既有并发度处理并通过 SSE 回传逐条结果；本次只调整网关层请求体限制，不改变导入、验活、去重或回滚语义。
+
 ## [0.6.9] - 2026-07-06
 
 主题：**Tool Call 全链路加固、tool inputSchema 规范化、CCH 缓存计量与 Thinking effort 修复、凭据持久化原子落盘，并回退 v0.6.7 的远程部署 Social 登录**。本版汇总 0.6.8 以来累积的多项 Rust 侧健壮性加固与一处回退：工具调用改为按 `tool_use_id` 缓冲后整体解析并显式暴露非法 JSON、Claude Code 内置工具名双向映射与 `<tool_use>` XML 泄漏过滤；规范化 MCP 工具 schema 以规避 Bedrock `TOOL_SCHEMA_INVALID` 400；修正主 Key 缓存计量口径并放宽原生 Thinking effort 下发范围；凭据回写改为 tmp+rename 原子落盘并锁定整个「快照 + 写盘」临界区（issue #23）；同时因 Kiro 收紧 OAuth 回调白名单，回退 v0.6.7 的远程部署 Social 登录（`redirect_uri` 恢复为本机 `127.0.0.1`，远程访问保留手动粘贴兜底）。多数改动参考 `Kiro-RS-Tool` 定位并移植 / 优化。
