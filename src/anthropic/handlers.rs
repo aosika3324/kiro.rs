@@ -494,7 +494,15 @@ pub(crate) fn compute_cache_usage_for_key(
         }
         None => Some(payload.messages.len().saturating_sub(1)),
     };
-    super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count)
+    let mut usage =
+        super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count);
+    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实 Anthropic 口径 +
+    // 利润控制器（Cb 回流）。关闭时 billing_mode=false，split_final 退回原比例分摊（零回归）。
+    usage.billing_mode = key_ctx.anthropic_billing_mode;
+    if usage.billing_mode {
+        usage.creation_reflow = key_ctx.cache_creation_reflow.unwrap_or(0.0);
+    }
+    usage
 }
 
 /// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。
@@ -1501,7 +1509,7 @@ async fn handle_non_stream_request(
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
     // 互斥分摊：input + cache_creation + cache_read == total
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        cache_usage.split_final(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1516,7 +1524,11 @@ async fn handle_non_stream_request(
             "input_tokens": final_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": cache_creation_tokens,
+                "ephemeral_1h_input_tokens": 0
+            }
         }
     });
 

@@ -1095,7 +1095,11 @@ impl SseStateManager {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": cache_creation_input_tokens,
+                            "ephemeral_1h_input_tokens": 0
+                        }
                     }
                 }),
             ));
@@ -1195,7 +1199,7 @@ impl StreamContext {
             .context_input_tokens
             .map(|c| c.max(self.input_tokens))
             .unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        self.cache_usage.split_final(total_real)
     }
     /// 创建 StreamContext
     pub fn new_with_thinking(
@@ -1250,7 +1254,11 @@ impl StreamContext {
                     "input_tokens": self.input_tokens,
                     "output_tokens": 1,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    }
                 }
             }
         })
@@ -2353,6 +2361,10 @@ impl BufferedStreamContext {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": cache_creation,
+                            "ephemeral_1h_input_tokens": 0
+                        });
                     }
                 }
             }
@@ -2495,6 +2507,10 @@ impl GatedStreamContext {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": cache_creation,
+                            "ephemeral_1h_input_tokens": 0
+                        });
                     }
                 }
             }

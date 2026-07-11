@@ -407,6 +407,10 @@ export interface ClientKeyItem {
   responseCacheTtlSecs?: number
   /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
   cacheReadRatio?: number
+  /** Anthropic 标准计费模式（默认 false）：usage 走真实 Anthropic 口径 + 利润控制器 */
+  anthropicBillingMode?: boolean
+  /** 利润控制器·创建回流 Cb 覆盖 ∈ [0,1]（undefined = 跟随全局默认 0；仅标准模式生效） */
+  cacheCreationReflow?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -448,6 +452,10 @@ export interface UpdateClientKeyRequest {
   responseCacheTtlSecs?: number
   /** 缓存 read 留存阻尼 R 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
   cacheReadRatio?: number | null
+  /** Anthropic 标准计费模式开关更新（省略=不变更；true/false=开关） */
+  anthropicBillingMode?: boolean
+  /** 利润控制器·创建回流 Cb 覆盖更新 ∈ [0,1]（省略=不变更；null=复位；数值=强制） */
+  cacheCreationReflow?: number | null
 }
 
 // ============ 用量统计 ============

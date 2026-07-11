@@ -51,6 +51,13 @@ pub struct CacheUsage {
     pub prompt_total_est: i32,
     /// read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input（不给缓存折扣）。
     pub read_ratio: f64,
+    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`CacheUsage::split_final`] 走
+    /// [`CacheUsage::split_anthropic_standard`]：末条消息并入 creation、input 取纯余数（floor 1），
+    /// 复现真实 Anthropic 暖缓存下 input≈1-2 的口径。关闭则走原 [`CacheUsage::split_against_total`]。
+    pub billing_mode: bool,
+    /// 利润控制器·创建回流 Cb ∈ [0,1]（仅标准模式生效，默认 0）：read 被 R 砍掉的溢出量，
+    /// 有 `spill×Cb` 进入贵桶 creation（1.25x）、`spill×(1−Cb)` 进入 input（1x）。默认 0 = 全进 input。
+    pub creation_reflow: f64,
 }
 
 impl Default for CacheUsage {
@@ -61,6 +68,8 @@ impl Default for CacheUsage {
             creation_est: 0,
             prompt_total_est: 0,
             read_ratio: 1.0,
+            billing_mode: false,
+            creation_reflow: 0.0,
         }
     }
 }
@@ -98,6 +107,70 @@ impl CacheUsage {
         let read = read.clamp(0, read_base);
         input += read_base - read;
         (input, creation, read)
+    }
+
+    /// 最终分摊入口：按 `billing_mode` 选择口径。关（默认）→ 原 [`Self::split_against_total`]
+    /// （全局默认路径，零回归）；开 → [`Self::split_anthropic_standard`]（真实 Anthropic 口径 +
+    /// 利润控制器）。三桶恒满足 `input + creation + read == total_real`。
+    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
+        if self.billing_mode {
+            self.split_anthropic_standard(total_real)
+        } else {
+            self.split_against_total(total_real)
+        }
+    }
+
+    /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
+    ///
+    /// **基线（利润器恒等，R=1/Cb=0）**：复现真实 Anthropic 暖缓存口径——
+    /// - `read0` = 已缓存前缀 = `total − creation_delta`（creation_delta 为本轮新增，含末条消息）；
+    /// - `creation0` = 本轮新增（`creation_est + input_est` 的占比折算，末条并入缓存写入）；
+    /// - `input0` = `total − read0 − creation0`，**floor 到 1**（永不 0，暖缓存下天然 1-2）。
+    ///
+    /// **利润控制器**（下游按上报 usage 付费，价 read 0.1x < input 1x < creation 1.25x）：
+    /// - R = `read_ratio` ∈ [0,1]：`read_final = read0 × R`，`spill = read0 − read_final`；
+    /// - Cb = `creation_reflow` ∈ [0,1]：`creation += spill × Cb`（进贵桶）、`input += spill × (1−Cb)`。
+    /// - 默认 R=1/Cb=0 → `spill=0` → 纯基线（真实 Anthropic）。R↓ 缩便宜 read、Cb↑ 塞进贵 creation → 保利润。
+    ///
+    /// cold（`creation_est` 覆盖整段前缀、无 read 基数）时 read0=0，退化为整段 creation、input floor 1。
+    pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        if self.prompt_total_est <= 0 || total == 0 {
+            return (total, 0, 0);
+        }
+        let denom = self.prompt_total_est as f64;
+        // 标准模式：末条消息（input_est）并入「本轮新增」= creation，复现 Anthropic 把末条也缓存。
+        let creation_est = self.creation_est.saturating_add(self.input_est);
+        let creation_share = (creation_est as f64 / denom).clamp(0.0, 1.0);
+
+        // creation0 = 本轮新增折算；read0 = 已缓存前缀（余下全部）；input0 = 纯余数 floor 1。
+        let mut creation0 = ((total as f64) * creation_share).round() as i32;
+        creation0 = creation0.clamp(0, total);
+        let mut read0 = total - creation0;
+        // input 取纯余数并 floor 1（暖缓存下 read0 吃大头、creation0=新增 → input0≈1-2）。
+        // 从 read0 借 1 给 input（若 read0>0），保证 input>=1 且三桶和恒等 total。
+        let input0 = if read0 > 0 {
+            read0 -= 1;
+            1
+        } else if creation0 > 0 {
+            creation0 -= 1;
+            1
+        } else {
+            // 无可缓存内容：全部 input。
+            return (total, 0, 0);
+        };
+
+        // 利润控制器：R 砍 read 留存，spill 按 Cb 分配到 creation / input。
+        let r = self.read_ratio.clamp(0.0, 1.0);
+        let read_final = ((read0 as f64) * r).round() as i32;
+        let read_final = read_final.clamp(0, read0);
+        let spill = read0 - read_final;
+        let cb = self.creation_reflow.clamp(0.0, 1.0);
+        let to_creation = ((spill as f64) * cb).round() as i32;
+        let to_creation = to_creation.clamp(0, spill);
+        let creation_final = creation0 + to_creation;
+        let input_final = input0 + (spill - to_creation);
+        (input_final, creation_final, read_final)
     }
 }
 
@@ -246,6 +319,7 @@ pub fn compute_structural_cache_usage(
             creation_est: 0,
             prompt_total_est: 0,
             read_ratio: read_ratio.clamp(0.0, 1.0),
+            ..CacheUsage::default()
         };
     }
 
@@ -274,6 +348,7 @@ pub fn compute_structural_cache_usage(
         creation_est,
         prompt_total_est,
         read_ratio: read_ratio.clamp(0.0, 1.0),
+        ..CacheUsage::default()
     }
 }
 
@@ -496,6 +571,7 @@ mod tests {
             creation_est: 5,
             prompt_total_est: 100,
             read_ratio: 1.0,
+            ..CacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input, 100);
@@ -513,6 +589,7 @@ mod tests {
             creation_est: 20,
             prompt_total_est: 100,
             read_ratio: 1.0,
+            ..CacheUsage::default()
         };
         // 长历史：同样的 input/creation 占比，但 prompt_total 大得多（read 基数暴涨）
         let long = CacheUsage {
@@ -520,6 +597,7 @@ mod tests {
             creation_est: 20,
             prompt_total_est: 1000,
             read_ratio: 1.0,
+            ..CacheUsage::default()
         };
         let (_, c_short, _) = short.split_against_total(300);
         let (_, c_long, r_long) = long.split_against_total(3000);
@@ -537,6 +615,7 @@ mod tests {
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.5,
+            ..CacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         // base: input=100, creation=100, read_base=800
@@ -555,6 +634,7 @@ mod tests {
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.0,
+            ..CacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(creation, 100);
@@ -573,6 +653,7 @@ mod tests {
             creation_est: 0,
             prompt_total_est: 1000, // >0 触发分摊；input/creation 占比为 0 → read_base=total
             read_ratio: r,
+            ..CacheUsage::default()
         };
         let hit = |(_i, _c, rd): (i32, i32, i32), tot: i32| rd as f64 / tot as f64;
 
@@ -592,6 +673,7 @@ mod tests {
             creation_est: 41,
             prompt_total_est: 207,
             read_ratio: 1.0,
+            ..CacheUsage::default()
         };
         let a = u.split_against_total(4096);
         let b = u.split_against_total(4096);
@@ -606,8 +688,106 @@ mod tests {
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 1.0,
+            ..CacheUsage::default()
         };
         assert_eq!(u.split_against_total(0), (0, 0, 0));
+    }
+
+    // ---- split_anthropic_standard（标准计费模式 + 利润控制器）-----------------
+
+    /// 标准模式基线（R=1/Cb=0）：暖缓存下 input 塌到 1，read 吃绝大部分，creation=本轮新增。
+    /// 复现真实 Anthropic（input≈1-2）。
+    fn std_usage(input_est: i32, creation_est: i32, total_est: i32, r: f64, cb: f64) -> CacheUsage {
+        CacheUsage {
+            input_est,
+            creation_est,
+            prompt_total_est: total_est,
+            read_ratio: r,
+            billing_mode: true,
+            creation_reflow: cb,
+        }
+    }
+
+    #[test]
+    fn std_baseline_warm_input_floors_to_one() {
+        // 暖缓存：input_est=5(末条)、creation_est=15(中间新增)、prompt=1000。
+        // 标准模式把末条并入 creation：creation_share=(5+15)/1000=2% → creation0=total×2%。
+        // read0=total−creation0，再从 read0 借 1 给 input → input=1。
+        let u = std_usage(5, 15, 1000, 1.0, 0.0);
+        let (i, c, r) = u.split_final(10000);
+        assert_eq!(i, 1, "暖缓存 input 应 floor 到 1（复现真实 Anthropic）");
+        assert_eq!(c, 200, "creation = total × (5+15)/1000 = 200");
+        assert_eq!(r, 10000 - 1 - 200, "read = 余下全部");
+        assert_eq!(i + c + r, 10000, "三桶和恒等 total");
+    }
+
+    #[test]
+    fn std_baseline_equals_no_profit_knob() {
+        // R=1/Cb=0 → spill=0 → 纯基线，creation/read 无利润偏移。
+        let u = std_usage(2, 8, 500, 1.0, 0.0);
+        let (i, c, r) = u.split_final(4000);
+        assert_eq!(i + c + r, 4000);
+        assert_eq!(i, 1);
+        // creation0 = 4000 × 10/500 = 80；read0 = 4000-80=3920，借 1 给 input → read=3919。
+        assert_eq!(c, 80);
+        assert_eq!(r, 3919);
+    }
+
+    #[test]
+    fn std_profit_r_shrinks_read_reflow_to_input() {
+        // R=0.5/Cb=0：read0 砍半，spill 全进 input（便宜 read → 标准 input，升利润）。
+        let u = std_usage(2, 8, 500, 0.5, 0.0);
+        let (i, c, r) = u.split_final(4000);
+        // creation0=80, read0=3920(借1后 input0=1,read0=3919)。read_final=3919×0.5≈1960。
+        // spill=3919-1960=1959 全进 input → input=1+1959=1960。
+        assert_eq!(c, 80, "Cb=0 时 creation 不被 R 影响");
+        assert_eq!(r, 1960, "read 留存 = read0 × 0.5");
+        assert_eq!(i, 1 + (3919 - 1960), "spill 全推回 input");
+        assert_eq!(i + c + r, 4000);
+    }
+
+    #[test]
+    fn std_profit_cb_reflows_to_creation() {
+        // R=0.5/Cb=1.0：read 砍半的 spill 全进贵桶 creation（最大化利润）。
+        let u = std_usage(2, 8, 500, 0.5, 1.0);
+        let (i, c, r) = u.split_final(4000);
+        // read0=3919, read_final≈1960, spill=1959 全进 creation → creation=80+1959=2039, input=1。
+        assert_eq!(r, 1960);
+        assert_eq!(c, 80 + 1959, "Cb=1 → spill 全塞进 creation（贵桶）");
+        assert_eq!(i, 1, "input 不吃 spill");
+        assert_eq!(i + c + r, 4000);
+    }
+
+    #[test]
+    fn std_cold_no_read_whole_creation() {
+        // cold：creation_est 覆盖整段前缀、input_est=末条。标准模式末条并入 creation →
+        // creation_share≈100% → creation0≈total，read0≈0，input floor 1。
+        let u = std_usage(10, 990, 1000, 1.0, 0.0);
+        let (i, c, r) = u.split_final(1000);
+        assert_eq!(i, 1, "input floor 1");
+        assert_eq!(r, 0, "cold 无 read 基数");
+        assert_eq!(c, 999, "整段计 creation，借 1 给 input");
+        assert_eq!(i + c + r, 1000);
+    }
+
+    #[test]
+    fn std_disabled_falls_back_to_legacy_split() {
+        // billing_mode=false → split_final 走原 split_against_total（零回归）。
+        let u = CacheUsage {
+            input_est: 10,
+            creation_est: 5,
+            prompt_total_est: 100,
+            read_ratio: 1.0,
+            billing_mode: false,
+            creation_reflow: 0.0,
+        };
+        assert_eq!(u.split_final(1000), u.split_against_total(1000));
+    }
+
+    #[test]
+    fn std_no_cacheable_all_input() {
+        let u = std_usage(0, 0, 0, 1.0, 0.0);
+        assert_eq!(u.split_final(500), (500, 0, 0));
     }
 
     // ---- compute_structural_cache_usage ------------------------------------

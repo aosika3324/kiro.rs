@@ -72,6 +72,15 @@ pub struct ClientKey {
     /// 控制该 Key 的 read 桶留存比例（被砍部分推回 input，不触碰 creation）。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_ratio: Option<f64>,
+    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的 usage 走真实 Anthropic 口径
+    /// （末条并入 creation、input 取纯余数 floor 1，暖缓存下 input≈1-2）+ 利润控制器（R/Cb）。
+    /// 关闭（默认）则走原比例分摊，行为与今天一致。老数据无此字段时默认 false。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anthropic_billing_mode: bool,
+    /// 利润控制器·创建回流 Cb per-key 覆盖 ∈ [0,1]（None = 跟随全局默认 0；仅标准模式生效）。
+    /// read 被 R 砍掉的溢出量按 Cb 进 creation（贵桶 1.25x）、其余进 input。老数据无此字段时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_reflow: Option<f64>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -246,6 +255,8 @@ impl ClientKeyManager {
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
+            anthropic_billing_mode: false,
+            cache_creation_reflow: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -326,6 +337,8 @@ impl ClientKeyManager {
                     response_cache_enabled: None,
                     response_cache_ttl_secs: None,
                     cache_read_ratio: None,
+                    anthropic_billing_mode: false,
+                    cache_creation_reflow: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -384,6 +397,8 @@ impl ClientKeyManager {
         response_cache_enabled: Option<Option<bool>>,
         response_cache_ttl_secs: Option<Option<u32>>,
         cache_read_ratio: Option<Option<f64>>,
+        anthropic_billing_mode: Option<bool>,
+        cache_creation_reflow: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -419,6 +434,13 @@ impl ClientKeyManager {
                 if let Some(v) = cache_read_ratio {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局
                     e.cache_read_ratio = v.map(|r| r.clamp(0.0, 1.0));
+                }
+                if let Some(v) = anthropic_billing_mode {
+                    e.anthropic_billing_mode = v;
+                }
+                if let Some(v) = cache_creation_reflow {
+                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局默认
+                    e.cache_creation_reflow = v.map(|r| r.clamp(0.0, 1.0));
                 }
                 true
             }
@@ -467,6 +489,25 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .and_then(|e| e.cache_read_ratio)
+    }
+
+    /// 返回指定 Key 是否启用 Anthropic 标准计费模式（Key 不存在时 false）。
+    pub fn anthropic_billing_mode_of(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.anthropic_billing_mode)
+            .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 的创建回流 Cb 覆盖（None = 跟随全局默认；Key 不存在时也返回 None）。
+    pub fn cache_creation_reflow_of(&self, id: u64) -> Option<f64> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.cache_creation_reflow)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -750,6 +791,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             None
         ));
         assert!(mgr.cache_enabled_of(entry.id));
@@ -774,6 +817,8 @@ mod tests {
             Some(Some(true)),
             Some(Some(60)),
             None,
+            None,
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -788,6 +833,8 @@ mod tests {
             None,
             None,
             Some(Some(0)),
+            None,
+            None,
             None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
