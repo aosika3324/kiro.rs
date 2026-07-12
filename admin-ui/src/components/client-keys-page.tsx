@@ -591,7 +591,7 @@ export function ClientKeysPage() {
                   <div>
                     <div className="text-sm">read 留存 R 覆盖</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅在启用计量合成时生效。
+                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅普通计量模式生效；开启「Anthropic 标准计费模式」后此项不使用（利润改由 Cb 控制）。
                     </p>
                   </div>
                   <Input
@@ -621,9 +621,9 @@ export function ClientKeysPage() {
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm">创建回流 Cb 覆盖</div>
+                    <div className="text-sm">利润·创建回流 Cb 覆盖</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局默认 0；0~1。read 被 R 砍掉的溢出量按 Cb 进 creation（贵桶 1.25x）、其余进 input。仅标准计费模式生效。
+                      留空＝跟随全局默认 0；0~1。标准模式下 input 恒钉 1，利润全靠此旋钮：把 read（便宜 0.1x）按 Cb 升级成 creation（贵 1.25x）。Cb=0＝纯真实 Anthropic，Cb=1＝read 全升级（利润最大）。仅标准计费模式生效。
                     </p>
                   </div>
                   <Input

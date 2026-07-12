@@ -122,20 +122,27 @@ impl CacheUsage {
 
     /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
     ///
-    /// **基线（利润器恒等，R=1/Cb=0）**：复现真实 Anthropic 暖缓存口径——
-    /// - `read0` = 已缓存前缀 = `total − creation_delta`（creation_delta 为本轮新增，含末条消息）；
+    /// **input 恒钉 1**（有可缓存内容时）——复现真实 Anthropic：暖缓存下几乎整段 prompt 都命中
+    /// 缓存断点，未缓存的 input 只剩 1。剩余 `total − 1` 全部落在缓存两桶（read + creation），
+    /// input **不参与利润拨动**（永远 1），所以调利润时 input 也不会变。
+    ///
+    /// **基线（Cb=0，纯真实 Anthropic）**：
+    /// - `input = 1`；
     /// - `creation0` = 本轮新增（`creation_est + input_est` 的占比折算，末条并入缓存写入）；
-    /// - `input0` = `total − read0 − creation0`，**floor 到 1**（永不 0，暖缓存下天然 1-2）。
+    /// - `read0` = 已缓存前缀 = `total − 1 − creation0`（暖缓存下吃绝大部分）。
     ///
-    /// **利润控制器**（下游按上报 usage 付费，价 read 0.1x < input 1x < creation 1.25x）：
-    /// - R = `read_ratio` ∈ [0,1]：`read_final = read0 × R`，`spill = read0 − read_final`；
-    /// - Cb = `creation_reflow` ∈ [0,1]：`creation += spill × Cb`（进贵桶）、`input += spill × (1−Cb)`。
-    /// - 默认 R=1/Cb=0 → `spill=0` → 纯基线（真实 Anthropic）。R↓ 缩便宜 read、Cb↑ 塞进贵 creation → 保利润。
+    /// **利润控制器 Cb = `creation_reflow` ∈ [0,1]**（下游按上报 usage 付费，价 read 0.1x <
+    /// input 1x < creation 1.25x）：把便宜的 read **升级**成贵的 creation——
+    /// - `upgrade = read0 × Cb`；`creation_final = creation0 + upgrade`；`read_final = read0 − upgrade`。
+    /// - Cb=0 → 纯真实 Anthropic（read 吃大头、利润 0 折扣）；Cb=1 → read 全部升级成 creation（利润最大）。
+    /// - input 恒 1 不动，三桶和恒等 `total`。read_ratio(R) 在标准模式**不使用**（避免污染 input）。
     ///
-    /// cold（`creation_est` 覆盖整段前缀、无 read 基数）时 read0=0，退化为整段 creation、input floor 1。
+    /// cold（`creation_est` 覆盖整段前缀）时 creation0≈total−1、read0≈0，退化为整段 creation、input=1。
+    /// 无可缓存内容（`prompt_total_est<=0` 或 `total<=1`）时全部计入 input，不凭空造缓存计数。
     pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
-        if self.prompt_total_est <= 0 || total == 0 {
+        // total<=1 或无可缓存内容：无法在钉 input=1 的同时再分缓存桶，全计 input。
+        if self.prompt_total_est <= 0 || total <= 1 {
             return (total, 0, 0);
         }
         let denom = self.prompt_total_est as f64;
@@ -143,34 +150,19 @@ impl CacheUsage {
         let creation_est = self.creation_est.saturating_add(self.input_est);
         let creation_share = (creation_est as f64 / denom).clamp(0.0, 1.0);
 
-        // creation0 = 本轮新增折算；read0 = 已缓存前缀（余下全部）；input0 = 纯余数 floor 1。
-        let mut creation0 = ((total as f64) * creation_share).round() as i32;
-        creation0 = creation0.clamp(0, total);
-        let mut read0 = total - creation0;
-        // input 取纯余数并 floor 1（暖缓存下 read0 吃大头、creation0=新增 → input0≈1-2）。
-        // 从 read0 借 1 给 input（若 read0>0），保证 input>=1 且三桶和恒等 total。
-        let input0 = if read0 > 0 {
-            read0 -= 1;
-            1
-        } else if creation0 > 0 {
-            creation0 -= 1;
-            1
-        } else {
-            // 无可缓存内容：全部 input。
-            return (total, 0, 0);
-        };
+        // input 恒钉 1；剩余 (total-1) 在 creation / read 两桶间分配。
+        let cacheable = total - 1;
+        let mut creation0 = ((cacheable as f64) * creation_share).round() as i32;
+        creation0 = creation0.clamp(0, cacheable);
+        let read0 = cacheable - creation0;
 
-        // 利润控制器：R 砍 read 留存，spill 按 Cb 分配到 creation / input。
-        let r = self.read_ratio.clamp(0.0, 1.0);
-        let read_final = ((read0 as f64) * r).round() as i32;
-        let read_final = read_final.clamp(0, read0);
-        let spill = read0 - read_final;
+        // 利润控制器：把 read0 的 Cb 比例升级成贵桶 creation（read→creation，input 不动）。
         let cb = self.creation_reflow.clamp(0.0, 1.0);
-        let to_creation = ((spill as f64) * cb).round() as i32;
-        let to_creation = to_creation.clamp(0, spill);
-        let creation_final = creation0 + to_creation;
-        let input_final = input0 + (spill - to_creation);
-        (input_final, creation_final, read_final)
+        let upgrade = ((read0 as f64) * cb).round() as i32;
+        let upgrade = upgrade.clamp(0, read0);
+        let creation_final = creation0 + upgrade;
+        let read_final = read0 - upgrade;
+        (1, creation_final, read_final)
     }
 }
 
@@ -695,78 +687,74 @@ mod tests {
 
     // ---- split_anthropic_standard（标准计费模式 + 利润控制器）-----------------
 
-    /// 标准模式基线（R=1/Cb=0）：暖缓存下 input 塌到 1，read 吃绝大部分，creation=本轮新增。
-    /// 复现真实 Anthropic（input≈1-2）。
-    fn std_usage(input_est: i32, creation_est: i32, total_est: i32, r: f64, cb: f64) -> CacheUsage {
+    /// 标准模式：input 恒钉 1；(total-1) 分到 creation/read；Cb 把 read 升级成 creation。
+    /// read_ratio 在标准模式不使用（传 1.0 占位）。
+    fn std_usage(input_est: i32, creation_est: i32, total_est: i32, cb: f64) -> CacheUsage {
         CacheUsage {
             input_est,
             creation_est,
             prompt_total_est: total_est,
-            read_ratio: r,
+            read_ratio: 1.0,
             billing_mode: true,
             creation_reflow: cb,
         }
     }
 
     #[test]
-    fn std_baseline_warm_input_floors_to_one() {
-        // 暖缓存：input_est=5(末条)、creation_est=15(中间新增)、prompt=1000。
-        // 标准模式把末条并入 creation：creation_share=(5+15)/1000=2% → creation0=total×2%。
-        // read0=total−creation0，再从 read0 借 1 给 input → input=1。
-        let u = std_usage(5, 15, 1000, 1.0, 0.0);
+    fn std_input_always_one_warm() {
+        // 暖缓存：input_est=5、creation_est=15、prompt=1000 → creation_share=2%。
+        // input 恒 1；cacheable=total-1=9999；creation0=9999×2%≈200；read0=余下。
+        let u = std_usage(5, 15, 1000, 0.0);
         let (i, c, r) = u.split_final(10000);
-        assert_eq!(i, 1, "暖缓存 input 应 floor 到 1（复现真实 Anthropic）");
-        assert_eq!(c, 200, "creation = total × (5+15)/1000 = 200");
-        assert_eq!(r, 10000 - 1 - 200, "read = 余下全部");
+        assert_eq!(i, 1, "input 恒钉 1");
+        assert_eq!(c, 200, "creation0 = (total-1) × 2% ≈ 200");
+        assert_eq!(r, 9999 - 200, "read = cacheable − creation0");
         assert_eq!(i + c + r, 10000, "三桶和恒等 total");
     }
 
     #[test]
-    fn std_baseline_equals_no_profit_knob() {
-        // R=1/Cb=0 → spill=0 → 纯基线，creation/read 无利润偏移。
-        let u = std_usage(2, 8, 500, 1.0, 0.0);
+    fn std_baseline_cb_zero_pure_anthropic() {
+        // Cb=0：read 不升级，纯真实 Anthropic 口径，利润 0 折扣。
+        let u = std_usage(2, 8, 500, 0.0);
         let (i, c, r) = u.split_final(4000);
-        assert_eq!(i + c + r, 4000);
-        assert_eq!(i, 1);
-        // creation0 = 4000 × 10/500 = 80；read0 = 4000-80=3920，借 1 给 input → read=3919。
+        assert_eq!(i, 1, "input 恒 1");
+        // cacheable=3999；creation0=3999×10/500=80(round)；read0=3919。
         assert_eq!(c, 80);
         assert_eq!(r, 3919);
-    }
-
-    #[test]
-    fn std_profit_r_shrinks_read_reflow_to_input() {
-        // R=0.5/Cb=0：read0 砍半，spill 全进 input（便宜 read → 标准 input，升利润）。
-        let u = std_usage(2, 8, 500, 0.5, 0.0);
-        let (i, c, r) = u.split_final(4000);
-        // creation0=80, read0=3920(借1后 input0=1,read0=3919)。read_final=3919×0.5≈1960。
-        // spill=3919-1960=1959 全进 input → input=1+1959=1960。
-        assert_eq!(c, 80, "Cb=0 时 creation 不被 R 影响");
-        assert_eq!(r, 1960, "read 留存 = read0 × 0.5");
-        assert_eq!(i, 1 + (3919 - 1960), "spill 全推回 input");
         assert_eq!(i + c + r, 4000);
     }
 
     #[test]
-    fn std_profit_cb_reflows_to_creation() {
-        // R=0.5/Cb=1.0：read 砍半的 spill 全进贵桶 creation（最大化利润）。
-        let u = std_usage(2, 8, 500, 0.5, 1.0);
+    fn std_profit_cb_upgrades_read_to_creation_input_stays_one() {
+        // Cb=0.5：read0 的一半升级成贵桶 creation；input 仍恒 1（关键：调利润 input 不变）。
+        let u = std_usage(2, 8, 500, 0.5);
         let (i, c, r) = u.split_final(4000);
-        // read0=3919, read_final≈1960, spill=1959 全进 creation → creation=80+1959=2039, input=1。
-        assert_eq!(r, 1960);
-        assert_eq!(c, 80 + 1959, "Cb=1 → spill 全塞进 creation（贵桶）");
-        assert_eq!(i, 1, "input 不吃 spill");
+        // creation0=80, read0=3919。upgrade=3919×0.5≈1960。creation=80+1960=2040, read=3919-1960=1959。
+        assert_eq!(i, 1, "调利润时 input 依然恒 1");
+        assert_eq!(c, 80 + 1960, "read 的一半升级进 creation");
+        assert_eq!(r, 3919 - 1960);
         assert_eq!(i + c + r, 4000);
     }
 
     #[test]
-    fn std_cold_no_read_whole_creation() {
-        // cold：creation_est 覆盖整段前缀、input_est=末条。标准模式末条并入 creation →
-        // creation_share≈100% → creation0≈total，read0≈0，input floor 1。
-        let u = std_usage(10, 990, 1000, 1.0, 0.0);
+    fn std_profit_cb_one_all_read_to_creation() {
+        // Cb=1：read 全部升级成 creation（利润最大），read=0，input 仍 1。
+        let u = std_usage(2, 8, 500, 1.0);
+        let (i, c, r) = u.split_final(4000);
+        assert_eq!(i, 1);
+        assert_eq!(r, 0, "Cb=1 → read 清零");
+        assert_eq!(c, 3999, "cacheable 全进 creation（贵桶）");
+        assert_eq!(i + c + r, 4000);
+    }
+
+    #[test]
+    fn std_cold_whole_creation_input_one() {
+        // cold：creation_est 覆盖整段前缀 → creation_share≈100% → creation0≈cacheable, read0≈0, input=1。
+        let u = std_usage(10, 990, 1000, 0.0);
         let (i, c, r) = u.split_final(1000);
-        assert_eq!(i, 1, "input floor 1");
+        assert_eq!(i, 1, "input 恒 1");
         assert_eq!(r, 0, "cold 无 read 基数");
-        assert_eq!(c, 999, "整段计 creation，借 1 给 input");
+        assert_eq!(c, 999, "整段计 creation（cacheable=999）");
         assert_eq!(i + c + r, 1000);
     }
 
@@ -786,7 +774,7 @@ mod tests {
 
     #[test]
     fn std_no_cacheable_all_input() {
-        let u = std_usage(0, 0, 0, 1.0, 0.0);
+        let u = std_usage(0, 0, 0, 0.0);
         assert_eq!(u.split_final(500), (500, 0, 0));
     }
 
