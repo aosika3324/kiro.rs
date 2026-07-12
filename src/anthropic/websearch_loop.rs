@@ -726,7 +726,11 @@ fn render_json(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            }
         }
     });
     (StatusCode::OK, Json(body)).into_response()
@@ -782,7 +786,11 @@ fn build_sse_events(
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    }
                 }
             }
         }),

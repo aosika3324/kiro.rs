@@ -174,6 +174,9 @@ mod tests {
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
+            anthropic_billing_mode: false,
+            cache_creation_reflow: None,
+            anthropic_input_tokens: None,
             key_source: TraceKeySource::ClientKey,
         }
     }

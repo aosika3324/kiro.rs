@@ -76,6 +76,11 @@ export function ClientKeysPage() {
   const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
   // 缓存命中率 R 覆盖：空串=跟随全局，否则 0~1
   const [editCacheRatio, setEditCacheRatio] = useState('')
+  // Anthropic 标准计费模式开关（默认关）+ 利润控制器·创建回流 Cb（空串=跟随全局默认 0）
+  const [editBillingMode, setEditBillingMode] = useState(false)
+  const [editReflow, setEditReflow] = useState('')
+  // 标准模式钉住的 input token 数（空串=跟随默认 2）
+  const [editInputTokens, setEditInputTokens] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -187,6 +192,9 @@ export function ClientKeysPage() {
     )
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
+    setEditBillingMode(item.anthropicBillingMode ?? false)
+    setEditReflow(item.cacheCreationReflow != null ? String(item.cacheCreationReflow) : '')
+    setEditInputTokens(item.anthropicInputTokens != null ? String(item.anthropicInputTokens) : '')
     setEditOpen(true)
   }
 
@@ -209,6 +217,20 @@ export function ClientKeysPage() {
       toast.error('缓存命中率需在 0..=1，或留空跟随全局')
       return
     }
+    // 创建回流 Cb：空串→null（复位跟随全局默认 0）；否则 0~1
+    const reflowRaw = editReflow.trim()
+    const cacheCreationReflow = reflowRaw === '' ? null : parseFloat(reflowRaw)
+    if (reflowRaw !== '' && (isNaN(cacheCreationReflow as number) || (cacheCreationReflow as number) < 0 || (cacheCreationReflow as number) > 1)) {
+      toast.error('创建回流 Cb 需在 0..=1，或留空跟随全局默认')
+      return
+    }
+    // 标准模式 input token：空串→null（复位跟随默认 2）；否则 >=1 的整数
+    const inputTokRaw = editInputTokens.trim()
+    const anthropicInputTokens = inputTokRaw === '' ? null : parseInt(inputTokRaw, 10)
+    if (inputTokRaw !== '' && (isNaN(anthropicInputTokens as number) || (anthropicInputTokens as number) < 1)) {
+      toast.error('标准模式 input token 需为 ≥1 的整数，或留空跟随默认 2')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -223,6 +245,9 @@ export function ClientKeysPage() {
           responseCacheEnabled: respCacheEnabled,
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
+          anthropicBillingMode: editBillingMode,
+          cacheCreationReflow,
+          anthropicInputTokens,
         },
       })
       toast.success('已更新')
@@ -577,7 +602,7 @@ export function ClientKeysPage() {
                   <div>
                     <div className="text-sm">read 留存 R 覆盖</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅在启用计量合成时生效。
+                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅普通计量模式生效；开启「Anthropic 标准计费模式」后此项不使用（利润改由 Cb 控制）。
                     </p>
                   </div>
                   <Input
@@ -589,6 +614,56 @@ export function ClientKeysPage() {
                     value={editCacheRatio}
                     onChange={(e) => setEditCacheRatio(e.target.value)}
                     disabled={updateKey.isPending || !editCacheEnabled}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">Anthropic 标准计费模式</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      开启后 usage 走真实 Anthropic 口径（末条并入 creation、input 取纯余数，暖缓存下 input≈1-2）+ 利润控制器。默认关＝维持原比例分摊。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editBillingMode}
+                    onCheckedChange={setEditBillingMode}
+                    disabled={updateKey.isPending || !editCacheEnabled}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">利润·创建回流 Cb 覆盖</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局默认 0；0~1。标准模式下 input 恒定，利润全靠此旋钮：把 read（便宜 0.1x）按 Cb 升级成 creation（贵 1.25x）。Cb=0＝纯真实 Anthropic，Cb=1＝read 全升级（利润最大）。仅标准计费模式生效。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    placeholder="跟随全局"
+                    value={editReflow}
+                    onChange={(e) => setEditReflow(e.target.value)}
+                    disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">标准模式 input token 数</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝默认 2；≥1 的整数。标准计费模式下钉住的 input token 值（复现真实 Anthropic 暖缓存 input 小常数）。调利润（Cb）时此值不变。仅标准计费模式生效。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    step={1}
+                    placeholder="默认 2"
+                    value={editInputTokens}
+                    onChange={(e) => setEditInputTokens(e.target.value)}
+                    disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
                     className="h-8 w-28 text-xs"
                   />
                 </div>
