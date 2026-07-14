@@ -34,7 +34,12 @@ fn normalize_model(model: &str) -> String {
     {
         return model.to_string();
     }
-    // OpenAI 别名 → 默认 Claude；保留 thinking 后缀
+    // 上游直通的非-Claude 模型（GPT 5.6 全系列等）→ 原样直达上游，**不再**强别名成 Claude。
+    // 与 Anthropic 路径 `map_model` 的直通白名单同源，下游 `map_model` 会精确识别并放行。
+    if crate::anthropic::is_passthrough_upstream_model(&lower) {
+        return lower;
+    }
+    // 其余 OpenAI 别名（gpt-4o 等无上游对应）→ 默认 Claude；保留 thinking 后缀
     let base = DEFAULT_ALIAS_MODEL;
     if lower.contains("thinking") {
         format!("{base}-thinking")
@@ -346,6 +351,15 @@ mod tests {
             normalize_model("gpt-4o-thinking"),
             format!("{DEFAULT_ALIAS_MODEL}-thinking")
         );
+    }
+
+    #[test]
+    fn gpt56_passthrough_not_aliased_to_claude() {
+        // GPT 5.6 全系列直达上游，不被强别名成 Claude。
+        assert_eq!(normalize_model("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(normalize_model("gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(normalize_model("gpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(normalize_model("GPT-5.6-Luna"), "gpt-5.6-luna");
     }
 
     #[test]

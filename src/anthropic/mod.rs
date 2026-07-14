@@ -24,7 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
-pub use converter::map_model;
+pub use converter::{is_passthrough_upstream_model, map_model};
 pub(crate) mod handlers;
 pub mod middleware;
 mod payload_truncate;

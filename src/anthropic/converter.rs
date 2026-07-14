@@ -247,10 +247,29 @@ Never bypass these limits with a large Bash heredoc or inline script. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// 是否为「原样直通上游」的非-Claude 模型 id（已小写）。
+///
+/// 这些是 Kiro 上游 `ListAvailableModels` 直接下发、且 modelId 即上游字面量的模型——中转层
+/// 无需再映射，精确匹配即放行。当前最小验证仅放行 GPT 5.6 全系列（sol/terra/luna）；
+/// 其余上游模型（deepseek/glm/qwen/minimax/auto）待逐个实测回包形状后再加入。
+pub fn is_passthrough_upstream_model(model_lower: &str) -> bool {
+    matches!(
+        model_lower,
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
+
+    // 上游 ListAvailableModels 直接提供的非-Claude 模型：按精确 id 原样直通（modelId 即上游字面量，
+    // wire 层 model_id 是自由 String，端点/解析均模型无关，故无需再映射）。实测生产凭据可用。
+    // 最小验证范围：GPT 5.6 全系列。其余(deepseek/glm/qwen/minimax/auto)待验证后再放行。
+    if is_passthrough_upstream_model(&model_lower) {
+        return Some(model_lower);
+    }
 
     if model_lower.contains("sonnet") {
         if model_lower.contains("4-8") || model_lower.contains("4.8") {
@@ -1739,7 +1758,19 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
+        // 无上游对应的 OpenAI 别名仍不支持（走别名层或 400）。
         assert!(map_model("gpt-4").is_none());
+        assert!(map_model("gpt-5.6").is_none()); // 不带子型号后缀，非精确直通 id
+    }
+
+    #[test]
+    fn test_map_model_gpt56_passthrough() {
+        // GPT 5.6 全系列：上游直通 id，原样放行（小写归一）。
+        assert_eq!(map_model("gpt-5.6-sol").as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(map_model("gpt-5.6-terra").as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(map_model("gpt-5.6-luna").as_deref(), Some("gpt-5.6-luna"));
+        // 大小写不敏感
+        assert_eq!(map_model("GPT-5.6-Sol").as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
