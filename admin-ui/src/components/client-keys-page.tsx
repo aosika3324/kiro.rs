@@ -74,13 +74,12 @@ export function ClientKeysPage() {
   const [editRespCache, setEditRespCache] = useState<'global' | 'on' | 'off'>('global')
   // 响应缓存 TTL 覆盖（秒）；空串=跟随全局
   const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
-  // 缓存命中率 R 覆盖：空串=跟随全局，否则 0~1
+  // 缓存命中率 R 覆盖（利润档）：空串=跟随全局，否则 0~1
   const [editCacheRatio, setEditCacheRatio] = useState('')
-  // Anthropic 标准计费模式开关（默认关）+ 利润控制器·read 膨胀系数 p（空串=跟随默认 0.2）
-  const [editBillingMode, setEditBillingMode] = useState(false)
-  const [editInflation, setEditInflation] = useState('')
-  // 标准模式钉住的 input token 数（空串=跟随默认 2）
-  const [editInputTokens, setEditInputTokens] = useState('')
+  // multiplier 护栏上限覆盖：空串=跟随默认 1.25，否则 0.1~1.25
+  const [editMultiplierCap, setEditMultiplierCap] = useState('')
+  // 编辑弹窗当前分类 tab
+  const [editTab, setEditTab] = useState<'basic' | 'metering' | 'filter' | 'respcache'>('basic')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -192,9 +191,8 @@ export function ClientKeysPage() {
     )
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
-    setEditBillingMode(item.anthropicBillingMode ?? false)
-    setEditInflation(item.cacheReadInflation != null ? String(item.cacheReadInflation) : '')
-    setEditInputTokens(item.anthropicInputTokens != null ? String(item.anthropicInputTokens) : '')
+    setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
+    setEditTab('basic')
     setEditOpen(true)
   }
 
@@ -217,18 +215,11 @@ export function ClientKeysPage() {
       toast.error('缓存命中率需在 0..=1，或留空跟随全局')
       return
     }
-    // read 膨胀系数 p：空串→null（复位跟随默认 0.2）；否则 0~9
-    const inflRaw = editInflation.trim()
-    const cacheReadInflation = inflRaw === '' ? null : parseFloat(inflRaw)
-    if (inflRaw !== '' && (isNaN(cacheReadInflation as number) || (cacheReadInflation as number) < 0 || (cacheReadInflation as number) > 9)) {
-      toast.error('read 膨胀系数 p 需在 0..=9，或留空跟随默认 0.2')
-      return
-    }
-    // 标准模式 input token：空串→null（复位跟随默认 2）；否则 >=1 的整数
-    const inputTokRaw = editInputTokens.trim()
-    const anthropicInputTokens = inputTokRaw === '' ? null : parseInt(inputTokRaw, 10)
-    if (inputTokRaw !== '' && (isNaN(anthropicInputTokens as number) || (anthropicInputTokens as number) < 1)) {
-      toast.error('标准模式 input token 需为 ≥1 的整数，或留空跟随默认 2')
+    // multiplier 护栏上限：空串→null（复位跟随默认 1.25）；否则 0.1~1.25
+    const capRaw = editMultiplierCap.trim()
+    const cacheMultiplierCap = capRaw === '' ? null : parseFloat(capRaw)
+    if (capRaw !== '' && (isNaN(cacheMultiplierCap as number) || (cacheMultiplierCap as number) < 0.1 || (cacheMultiplierCap as number) > 1.25)) {
+      toast.error('multiplier 护栏上限需在 0.1..=1.25，或留空跟随默认 1.25')
       return
     }
     try {
@@ -245,9 +236,7 @@ export function ClientKeysPage() {
           responseCacheEnabled: respCacheEnabled,
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
-          anthropicBillingMode: editBillingMode,
-          cacheReadInflation,
-          anthropicInputTokens,
+          cacheMultiplierCap,
         },
       })
       toast.success('已更新')
@@ -561,6 +550,32 @@ export function ClientKeysPage() {
             <DialogDescription>修改名称、描述、分组及缓存行为（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
+            {/* 分类 tab 切换 */}
+            <div className="flex gap-1 rounded-md bg-muted p-1 text-xs">
+              {([
+                ['basic', '基本信息'],
+                ['metering', '缓存计量'],
+                ['filter', '提示词过滤'],
+                ['respcache', '响应缓存'],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setEditTab(key)}
+                  className={
+                    'flex-1 rounded px-2 py-1 transition-colors ' +
+                    (editTab === key
+                      ? 'bg-background font-medium shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground')
+                  }
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {editTab === 'basic' && (
+            <div className="space-y-3">
             <div>
               <label className="text-[12px] text-muted-foreground">名称</label>
               <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
@@ -582,9 +597,13 @@ export function ClientKeysPage() {
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
             </div>
+            </div>
+            )}
+
+            {editTab === 'metering' && (
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium">Prompt cache 计量</div>
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="text-sm">启用计量合成</div>
@@ -598,77 +617,72 @@ export function ClientKeysPage() {
                     disabled={updateKey.isPending}
                   />
                 </div>
+                {/* 利润档滑块（复用 R）：命中率≈R，multiplier≈1−0.9R；越左命中越高利润越低 */}
+                {(() => {
+                  const r = editCacheRatio.trim() === '' ? 1.0 : parseFloat(editCacheRatio)
+                  const rv = isNaN(r) ? 1.0 : Math.min(1, Math.max(0, r))
+                  const capRaw = editMultiplierCap.trim() === '' ? 1.25 : parseFloat(editMultiplierCap)
+                  const cap = isNaN(capRaw) ? 1.25 : Math.min(1.25, Math.max(0.1, capRaw))
+                  const hit = Math.round(rv * 100)
+                  const mult = Math.min(cap, 1 - 0.9 * rv)
+                  const band = mult <= 1.0 ? ['正常', 'text-emerald-600'] : mult <= 1.25 ? ['临界', 'text-amber-600'] : ['异常', 'text-red-600']
+                  return (
+                    <div>
+                      <div className="mb-1 flex items-center justify-between">
+                        <div className="text-sm">利润档（read 留存 R）</div>
+                        <span className="text-[11px] text-muted-foreground">
+                          {editCacheRatio.trim() === '' ? '跟随全局' : `R=${rv.toFixed(2)}`}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={rv}
+                        onChange={(e) => setEditCacheRatio(e.target.value)}
+                        disabled={updateKey.isPending || !editCacheEnabled}
+                        className="w-full accent-primary disabled:opacity-50"
+                      />
+                      <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
+                        <span>← 命中率高·利润低</span>
+                        <span>利润高·命中率低 →</span>
+                      </div>
+                      <div className="mt-2 flex items-center gap-3 rounded bg-muted/60 px-2 py-1 text-[11px]">
+                        <span>预计命中率 <b>{hit}%</b></span>
+                        <span>multiplier <b>{mult.toFixed(2)}×</b></span>
+                        <span>检测带 <b className={band[1]}>{band[0]}</b></span>
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        R 越低 → 越多 read(0.1x) 挪回 input(1.0x)：命中率降、利润升、multiplier 向 1.0 爬。留空＝跟随全局。预览为纯暖轮近似，实际随冷/热轮与真实占比浮动。
+                      </p>
+                    </div>
+                  )
+                })()}
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm">read 留存 R 覆盖</div>
+                    <div className="text-sm">multiplier 护栏上限</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅普通计量模式生效；开启「Anthropic 标准计费模式」后此项不使用（利润改由 Cb 控制）。
+                      留空＝默认 1.25（真实 Anthropic 暖缓存自然上限，常态不触发）；0.1~1.25。weighted/baseline 超此值时把 input→read 压回（绝不碰 creation）。收紧到 1.0 留足检测余量，绝不越异常线。
                     </p>
                   </div>
                   <Input
                     type="number"
-                    min={0}
-                    max={1}
+                    min={0.1}
+                    max={1.25}
                     step={0.05}
-                    placeholder="跟随全局"
-                    value={editCacheRatio}
-                    onChange={(e) => setEditCacheRatio(e.target.value)}
+                    placeholder="默认 1.25"
+                    value={editMultiplierCap}
+                    onChange={(e) => setEditMultiplierCap(e.target.value)}
                     disabled={updateKey.isPending || !editCacheEnabled}
-                    className="h-8 w-28 text-xs"
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm">Anthropic 标准计费模式</div>
-                    <p className="text-[11px] text-muted-foreground">
-                      开启后 usage 走真实 Anthropic 口径（末条并入 creation、input 取纯余数，暖缓存下 input≈1-2）+ 利润控制器。默认关＝维持原比例分摊。
-                    </p>
-                  </div>
-                  <Switch
-                    checked={editBillingMode}
-                    onCheckedChange={setEditBillingMode}
-                    disabled={updateKey.isPending || !editCacheEnabled}
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm">利润·read 膨胀系数 p 覆盖</div>
-                    <p className="text-[11px] text-muted-foreground">
-                      留空＝默认 0.2（+20%）；0~9。标准模式下把便宜的 cache_read（0.1x）超报 ×(1+p) 出利润。input 恒定、creation 保持自然小值（约 3%），利润只藏在 read。p=0＝纯真实 Anthropic，p 越大利润越高（上报总量随之超真实）。仅标准计费模式生效。
-                    </p>
-                  </div>
-                  <Input
-                    type="number"
-                    min={0}
-                    max={9}
-                    step={0.1}
-                    placeholder="默认 0.2"
-                    value={editInflation}
-                    onChange={(e) => setEditInflation(e.target.value)}
-                    disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
-                    className="h-8 w-28 text-xs"
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm">标准模式 input token 数</div>
-                    <p className="text-[11px] text-muted-foreground">
-                      留空＝默认 2；≥1 的整数。标准计费模式下钉住的 input token 值（复现真实 Anthropic 暖缓存 input 小常数）。调利润（Cb）时此值不变。仅标准计费模式生效。
-                    </p>
-                  </div>
-                  <Input
-                    type="number"
-                    min={1}
-                    step={1}
-                    placeholder="默认 2"
-                    value={editInputTokens}
-                    onChange={(e) => setEditInputTokens(e.target.value)}
-                    disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
                     className="h-8 w-28 text-xs"
                   />
                 </div>
               </div>
             </div>
+            )}
+
+            {editTab === 'filter' && (
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium text-pink-600">提示词过滤</div>
               <div className="space-y-2">
@@ -713,6 +727,9 @@ export function ClientKeysPage() {
                 </div>
               </div>
             </div>
+            )}
+
+            {editTab === 'respcache' && (
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium">响应缓存（per-key 覆盖）</div>
               <div className="space-y-2">
@@ -754,6 +771,7 @@ export function ClientKeysPage() {
                 </div>
               </div>
             </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
               <Button type="submit" disabled={updateKey.isPending}>

@@ -446,18 +446,6 @@ fn classify_input_tier(input_tokens: i32) -> InputTier {
     }
 }
 
-/// 取 `max(contextUsage 折算值, 本地 fallback)`：contextUsage 是上游按百分比×窗口
-/// 折算的估算值，低估时会盖过本地真实转发量，导致上报 input_tokens 偏低、客户端
-/// 永不触发 auto-compact。max 保证上报量不低于本地真值，正确驱动客户端压缩。
-/// 仅影响上报口径，不动真实计费。
-fn resolve_usage_input_tokens(
-    fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens
-        .map(|c| c.max(fallback_total_input_tokens))
-        .unwrap_or(fallback_total_input_tokens)
-}
 
 /// 计算本次请求的结构化缓存覆盖。
 ///
@@ -496,19 +484,11 @@ pub(crate) fn compute_cache_usage_for_key(
     };
     let mut usage =
         super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count);
-    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实 Anthropic 口径 +
-    // 利润控制器（p 超报 read）。关闭时 billing_mode=false，split_final 退回原比例分摊（零回归）。
-    usage.billing_mode = key_ctx.anthropic_billing_mode;
-    if usage.billing_mode {
-        // read 膨胀系数 p：per-key 覆盖优先，否则默认 +20%（DEFAULT_READ_INFLATION）。
-        usage.read_inflation = key_ctx
-            .cache_read_inflation
-            .unwrap_or(super::cache_metering::DEFAULT_READ_INFLATION);
-        usage.pinned_input = key_ctx
-            .anthropic_input_tokens
-            .unwrap_or(super::cache_metering::DEFAULT_PINNED_INPUT);
-        // creation_ratio 已由 CacheUsage::default() 设为 DEFAULT_CREATION_RATIO（3%），无需覆盖。
-    }
+    // multiplier 护栏上限（C）：per-key 覆盖优先，否则默认 1.25（DEFAULT_MULTIPLIER_CAP）。
+    // weighted/baseline 超此值时 split_against_total 把 input→read 压回（不碰 creation）。
+    usage.multiplier_cap = key_ctx
+        .cache_multiplier_cap
+        .unwrap_or(super::cache_metering::DEFAULT_MULTIPLIER_CAP);
     usage
 }
 
@@ -1512,11 +1492,17 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 缓存三桶分摊的真实总量 total_real 用**本地 count_all_tokens 估算**，不用上游
+    // contextUsage 折算值（`context_usage% × window` 很粗，一个真实 ~10k 的对话会被算成
+    // ~140k，使 read 远超真实量、上报总量 / baseline 冲到 7~20x 被检测判 Abnormal）。本地估算
+    // 是对真实 prompt 做 tokenize，最接近检测方独立数出的 baseline → 三桶和恒等真实量、
+    // multiplier≈1x（round1 略>1 因 1.25x write，暖轮<1 因 0.1x read），形状对齐真实 Anthropic。
+    // context_input_tokens 仅用于 stop_reason（窗口超限）判定，不进计量拆分。
+    let _ = context_input_tokens;
+    let total_input_tokens = input_tokens.max(0);
     // 互斥分摊：input + cache_creation + cache_read == total
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_final(total_input_tokens);
+        cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -2589,18 +2575,6 @@ mod tests {
 
         assert!(ids.contains(&"claude-sonnet-5"));
         assert!(ids.contains(&"claude-sonnet-5-thinking"));
-    }
-
-    /// resolve_usage_input_tokens 取 max(本地 fallback, 上游折算值)，
-    /// 不让上游低估盖过本地真实转发量，从而正确驱动客户端 auto-compact。
-    #[test]
-    fn resolve_usage_input_tokens_takes_max() {
-        // 上游折算偏低：取本地 fallback。
-        assert_eq!(resolve_usage_input_tokens(120_000, Some(90_000)), 120_000);
-        // 上游折算更大：取上游。
-        assert_eq!(resolve_usage_input_tokens(120_000, Some(150_000)), 150_000);
-        // 无上游信号：回退本地 fallback。
-        assert_eq!(resolve_usage_input_tokens(120_000, None), 120_000);
     }
 
     #[test]

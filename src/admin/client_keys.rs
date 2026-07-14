@@ -72,19 +72,10 @@ pub struct ClientKey {
     /// 控制该 Key 的 read 桶留存比例（被砍部分推回 input，不触碰 creation）。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_ratio: Option<f64>,
-    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的 usage 走真实 Anthropic 口径
-    /// （末条并入 creation、input 取纯余数 floor 1，暖缓存下 input≈1-2）+ 利润控制器（R/Cb）。
-    /// 关闭（默认）则走原比例分摊，行为与今天一致。老数据无此字段时默认 false。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub anthropic_billing_mode: bool,
-    /// 利润控制器·read 膨胀系数 p per-key 覆盖 ≥0（None = 跟随默认 0；仅标准模式生效）。
-    /// read_final = read0 × (1+p) 超报便宜的 cache_read（0.1x）出利润。老数据无此字段时为 None。
+    /// 缓存计量 multiplier 护栏上限 per-key 覆盖（None = 跟随默认 1.25）。`weighted/baseline` 超此
+    /// 值时把 input→read 压回（不碰 creation）。收紧到 1.0 留足检测余量；老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_inflation: Option<f64>,
-    /// Anthropic 标准计费模式下钉住的 input token 数 per-key 覆盖（None = 跟随默认 2；仅标准模式生效）。
-    /// 复现真实 Anthropic 暖缓存 input 为小常数的口径。老数据无此字段时为 None。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anthropic_input_tokens: Option<i32>,
+    pub cache_multiplier_cap: Option<f64>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -259,9 +250,7 @@ impl ClientKeyManager {
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
-            anthropic_billing_mode: false,
-            cache_read_inflation: None,
-            anthropic_input_tokens: None,
+            cache_multiplier_cap: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -342,9 +331,7 @@ impl ClientKeyManager {
                     response_cache_enabled: None,
                     response_cache_ttl_secs: None,
                     cache_read_ratio: None,
-                    anthropic_billing_mode: false,
-                    cache_read_inflation: None,
-                    anthropic_input_tokens: None,
+                    cache_multiplier_cap: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -403,9 +390,7 @@ impl ClientKeyManager {
         response_cache_enabled: Option<Option<bool>>,
         response_cache_ttl_secs: Option<Option<u32>>,
         cache_read_ratio: Option<Option<f64>>,
-        anthropic_billing_mode: Option<bool>,
-        cache_read_inflation: Option<Option<f64>>,
-        anthropic_input_tokens: Option<Option<i32>>,
+        cache_multiplier_cap: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -442,17 +427,15 @@ impl ClientKeyManager {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局
                     e.cache_read_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
-                if let Some(v) = anthropic_billing_mode {
-                    e.anthropic_billing_mode = v;
-                }
-                if let Some(v) = cache_read_inflation {
-                    // clamp 到 [0, MAX]；Some(None) 清除覆盖、跟随全局默认
-                    e.cache_read_inflation =
-                        v.map(|r| r.clamp(0.0, super::super::anthropic::cache_metering::MAX_READ_INFLATION));
-                }
-                if let Some(v) = anthropic_input_tokens {
-                    // clamp 到 >=1；Some(None) 清除覆盖、跟随默认 2
-                    e.anthropic_input_tokens = v.map(|t| t.max(1));
+                if let Some(v) = cache_multiplier_cap {
+                    // clamp 到 [0.1, 1.25]（下限=纯 read 桶权重，上限=真实 Anthropic 自然上限）；
+                    // Some(None) 清除覆盖、跟随默认 1.25
+                    e.cache_multiplier_cap = v.map(|r| {
+                        r.clamp(
+                            super::super::anthropic::cache_metering::WEIGHT_READ,
+                            super::super::anthropic::cache_metering::DEFAULT_MULTIPLIER_CAP,
+                        )
+                    });
                 }
                 true
             }
@@ -503,32 +486,13 @@ impl ClientKeyManager {
             .and_then(|e| e.cache_read_ratio)
     }
 
-    /// 返回指定 Key 是否启用 Anthropic 标准计费模式（Key 不存在时 false）。
-    pub fn anthropic_billing_mode_of(&self, id: u64) -> bool {
+    /// 返回指定 Key 的 multiplier 护栏上限覆盖（None = 跟随默认 1.25；Key 不存在时也返回 None）。
+    pub fn cache_multiplier_cap_of(&self, id: u64) -> Option<f64> {
         self.inner
             .read()
             .entries
             .get(&id)
-            .map(|e| e.anthropic_billing_mode)
-            .unwrap_or(false)
-    }
-
-    /// 返回指定 Key 的 read 膨胀系数 p 覆盖（None = 跟随默认 0；Key 不存在时也返回 None）。
-    pub fn cache_read_inflation_of(&self, id: u64) -> Option<f64> {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .and_then(|e| e.cache_read_inflation)
-    }
-
-    /// 返回指定 Key 标准模式钉住的 input token 数覆盖（None = 跟随默认 2；Key 不存在时也返回 None）。
-    pub fn anthropic_input_tokens_of(&self, id: u64) -> Option<i32> {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .and_then(|e| e.anthropic_input_tokens)
+            .and_then(|e| e.cache_multiplier_cap)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -814,8 +778,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None
         ));
         assert!(mgr.cache_enabled_of(entry.id));
     }
@@ -840,8 +802,6 @@ mod tests {
             Some(Some(60)),
             None,
             None,
-            None,
-            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -856,8 +816,6 @@ mod tests {
             None,
             None,
             Some(Some(0)),
-            None,
-            None,
             None,
             None,
         ));

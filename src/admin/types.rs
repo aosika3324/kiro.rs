@@ -878,15 +878,9 @@ pub struct ClientKeyItem {
     /// 缓存命中率 R 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_ratio: Option<f64>,
-    /// Anthropic 标准计费模式（默认 false）。
-    #[serde(default)]
-    pub anthropic_billing_mode: bool,
-    /// 利润控制器·read 膨胀系数 p 覆盖 ≥0（None = 跟随默认 0）。
+    /// 缓存 multiplier 护栏上限覆盖（None = 跟随默认 1.25）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_inflation: Option<f64>,
-    /// 标准模式钉住 input token 数覆盖（None = 跟随默认 2）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anthropic_input_tokens: Option<i32>,
+    pub cache_multiplier_cap: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -957,18 +951,12 @@ pub struct UpdateClientKeyRequest {
     /// - 数值 → `Some(Some(v))`：强制该 Key 的命中率（clamp 到 [0,1]）
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub cache_read_ratio: Option<Option<f64>>,
-    /// Anthropic 标准计费模式开关更新（字段缺省=不变更；true/false=开/关）。
-    #[serde(default)]
-    pub anthropic_billing_mode: Option<bool>,
-    /// 利润控制器·read 膨胀系数 p 覆盖更新 ≥0。三态语义（double-option）：
+    /// 缓存 multiplier 护栏上限覆盖更新。三态语义（double-option）：
     /// - 字段缺省 → `None`：不变更
-    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随默认 0
-    /// - 数值 → `Some(Some(v))`：强制该 Key 的 p（read×(1+p) 超报；clamp 到 [0, MAX]）
+    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随默认 1.25
+    /// - 数值 → `Some(Some(v))`：强制该 Key 的护栏上限（clamp 到 [0.1, 1.25]）
     #[serde(default, deserialize_with = "deserialize_double_option")]
-    pub cache_read_inflation: Option<Option<f64>>,
-    /// 标准模式钉住 input token 数覆盖更新（省略=不变更；null=复位跟随默认 2；数值=强制，>=1）。
-    #[serde(default, deserialize_with = "deserialize_double_option")]
-    pub anthropic_input_tokens: Option<Option<i32>>,
+    pub cache_multiplier_cap: Option<Option<f64>>,
 }
 
 /// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。

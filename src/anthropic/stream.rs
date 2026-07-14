@@ -1195,11 +1195,11 @@ impl StreamContext {
     /// 正确驱动客户端压缩。仅影响上报口径与 cache split 展示，不动真实计费
     /// （计费 credits 独立来自上游 metering.usage 事件）。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self
-            .context_input_tokens
-            .map(|c| c.max(self.input_tokens))
-            .unwrap_or(self.input_tokens);
-        self.cache_usage.split_final(total_real)
+        // total_real 用**本地 count_all_tokens 估算**（不再 max contextUsage 折算值）：
+        // contextUsage = context_usage% × window 很粗，真实 ~10k 对话会被算成 ~140k，使
+        // 三桶和 / baseline 冲到 7~20x 被检测判 Abnormal。本地估算最接近检测方数出的 baseline
+        // → multiplier≈1x、形状对齐真实 Anthropic。窗口超限 stop_reason 仍走 context_usage%。
+        self.cache_usage.split_against_total(self.input_tokens.max(0))
     }
     /// 创建 StreamContext
     pub fn new_with_thinking(
@@ -2691,38 +2691,33 @@ mod tests {
         );
     }
 
-    /// 内容先到、contextUsage 后到（fallback 放闸）：除 message_start.usage.input_tokens
-    /// 外其余事件序列一致；这是 A1 文档约定的取舍——message_start 用"当时已知最佳值"
-    /// （fallback），最终值由 message_delta.usage 兜底（与 buffered 相同）。
+    /// 检测安全不变量：contextUsage 折算值**不得**抬高上报 input_tokens。改用本地估算作 total_real
+    /// 后（见 [`StreamContext::resolved_usage`]），无论 context 事件报多大，message_start /
+    /// message_delta 的 input_tokens 都恒等本地 fallback（100），gated 与 buffered 完全一致。
+    /// 这正是消除 context%×window 14x 膨胀、过检测的口径体现。
     #[test]
     fn gated_content_first_defers_final_usage_to_message_delta() {
         let events = vec![assistant("hi"), context_usage(20.0), assistant(" there")];
         let gated = run_gated(&events);
         let buffered = run_buffered(&events);
 
-        // 1) message_start：gated 用 fallback（100），buffered 用已解析真值（40000）。
+        // 1) message_start：两者都恒等本地 fallback（100），context 20%×window 不抬高。
         assert_eq!(input_tokens_of(&gated, "message_start"), Some(100));
-        assert!(input_tokens_of(&buffered, "message_start").unwrap() > 100);
+        assert_eq!(input_tokens_of(&buffered, "message_start"), Some(100));
 
-        // 2) message_delta（最终口径）：两者必须一致且为解析真值。
+        // 2) message_delta（最终口径）：同样恒等 100，两者一致。
+        assert_eq!(input_tokens_of(&gated, "message_delta"), Some(100));
         assert_eq!(
             input_tokens_of(&gated, "message_delta"),
             input_tokens_of(&buffered, "message_delta"),
             "最终 message_delta.usage 必须与 buffered 一致"
         );
-        assert!(input_tokens_of(&gated, "message_delta").unwrap() > 100);
 
-        // 3) 除 message_start 外的事件序列必须完全一致。
-        let strip_ms = |evs: &[SseEvent]| -> Vec<(String, serde_json::Value)> {
-            normalize(evs)
-                .into_iter()
-                .filter(|(n, _)| n != "message_start")
-                .collect()
-        };
+        // 3) contextUsage 先/后到都不影响，gated 与 buffered 事件序列（含 message_start）完全一致。
         assert_eq!(
-            strip_ms(&gated),
-            strip_ms(&buffered),
-            "除 message_start 外，gated 与 buffered 事件序列必须一致"
+            normalize(&gated),
+            normalize(&buffered),
+            "本地估算口径下 gated 与 buffered 输出必须完全一致"
         );
     }
 
@@ -2756,20 +2751,20 @@ mod tests {
         );
     }
 
-    /// message_start 的 input_tokens：收到 contextUsageEvent 时应反映折算真值
-    /// （max(context, fallback)），而非仅 fallback。
+    /// message_start 的 input_tokens：**不再**采信 contextUsage 折算值（避免 context%×window
+    /// 把上报量撑大 14x → 检测判 Abnormal）。恒用本地估算 fallback。
     #[test]
-    fn gated_message_start_uses_resolved_input_tokens() {
-        // context 15% × 200000 window = 30000 >> fallback 100，应取 30000。
+    fn gated_message_start_uses_local_estimate_not_context() {
+        // context 15% × 200000 window = 30000，但**不得**采信；应恒取本地 fallback 100。
         let events = vec![context_usage(15.0), assistant("x")];
         let gated = run_gated(&events);
         let ms = gated.iter().find(|e| e.event == "message_start").unwrap();
         let it = ms.data["message"]["usage"]["input_tokens"]
             .as_i64()
             .unwrap();
-        assert!(
-            it > 100,
-            "message_start.input_tokens 应反映 contextUsage 折算值（得到 {it}）"
+        assert_eq!(
+            it, 100,
+            "message_start.input_tokens 恒用本地估算，不被 contextUsage 折算值抬高（得到 {it}）"
         );
     }
 
@@ -5098,28 +5093,29 @@ mod tests {
         }));
     }
 
-    /// resolved_usage 取 max(本地真值, 上游折算值)，不让上游低估盖过本地真实转发量。
-    /// 默认 CacheUsage 无缓存覆盖，split_against_total 全量计入 input，故 .0 == total_real。
+    /// resolved_usage 用**本地真值**做 total_real，**不再** max 上游 contextUsage 折算值
+    /// （避免 context_usage%×window 的粗估把盘子撑大 14x → 检测判 Abnormal）。默认 CacheUsage
+    /// 无缓存覆盖，split_against_total 全量计入 input，故 .0 == 本地 input_tokens。
     #[test]
-    fn resolved_usage_takes_max_of_local_and_upstream() {
+    fn resolved_usage_uses_local_estimate_not_context() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
-            120_000, // 本地 count_all_tokens 真值（大）
+            120_000, // 本地 count_all_tokens 真值
             false,
             HashMap::new(),
             test_known_tools(),
         );
 
-        // 上游 contextUsage 折算偏低：不得盖过本地真值。
+        // 上游 contextUsage 折算偏低：用本地真值。
         ctx.context_input_tokens = Some(90_000);
-        assert_eq!(ctx.resolved_usage().0, 120_000, "上游低估时取本地真值");
+        assert_eq!(ctx.resolved_usage().0, 120_000, "始终用本地真值");
 
-        // 上游折算更大：取上游。
+        // 上游折算更大（如 context%×window 撑大）：仍用本地真值，不被撑大。
         ctx.context_input_tokens = Some(150_000);
-        assert_eq!(ctx.resolved_usage().0, 150_000, "上游更大时取上游");
+        assert_eq!(ctx.resolved_usage().0, 120_000, "上游撑大也不采信，用本地真值");
 
-        // 无上游信号：回退到本地 input_tokens。
+        // 无上游信号：本地 input_tokens。
         ctx.context_input_tokens = None;
-        assert_eq!(ctx.resolved_usage().0, 120_000, "None 回退本地 fallback");
+        assert_eq!(ctx.resolved_usage().0, 120_000, "本地 input_tokens");
     }
 }
