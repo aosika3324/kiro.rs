@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-15
 
 主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
 
