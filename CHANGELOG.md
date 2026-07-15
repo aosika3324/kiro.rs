@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
+
+### ✨ 新功能 — GPT-5.6 与 OpenAI 协议兼容
+
+> 来源：[PR #38](https://github.com/ZyphrZero/kiro.rs/pull/38)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+- **新增 GPT-5.6 模型族**：支持 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`，模型 ID 原样传递给 Kiro；上下文窗口按 272K 处理，并通过 `GET /v1/models` 对外公布。
+- **新增 Chat Completions 端点**：`POST /v1/chat/completions` 支持 OpenAI 消息、工具调用、`reasoning_effort`、非流式响应与 SSE 响应，内部复用既有 Anthropic 请求管道。
+- **新增 Responses 端点**：`POST /v1/responses` 支持新版 Codex CLI 使用的 Responses API，转换 instructions / input / reasoning / function call，并生成对应的非流式响应或 SSE 事件序列。
+- **复用现有运行时能力**：两个 OpenAI 端点沿用同一套 API Key 鉴权、模型映射、多凭据故障转移、用量统计及 Kiro MCP WebSearch；`/cc/v1` Claude Code 路径保持不变。
+
+### 🔧 修复 — API Key 生成、自定义与轮换语义
+
+- **生成格式统一为 `sk-`**：服务端创建和轮换的客户端 Key 均为 `sk-` 加 32 位 base62 随机字符串；默认配置的生成值与示例配置值同样以 `sk-` 开头。
+- **鉴权只做完整值匹配**：删除 `csk_` 前缀常量与前缀校验，不增加旧前缀兼容分支；请求携带的 Key 只与未禁用的已存储明文做常量时间精确比较。
+- **允许任意自定义配置值**：`config.json.apiKey` 不要求 `sk-` 前缀。每次启动都将其同步为唯一的系统密钥 `id=0`；修改配置后旧系统密钥立即失效，现有名称、描述、分组与统计保持不变。
+- **Unicode 自定义 Key 安全脱敏**：管理端按 Unicode 字符而非 UTF-8 字节切片，非 ASCII 自定义 Key 不再因切到字符中间而触发运行时 panic。
+- **清理过时说明**：README、示例配置、Rust 注释与 Admin UI 统一为“系统密钥不可删除、可轮换”，移除当前文档中的 `csk_*` 生成规则描述。
+
 ## [0.6.11] - 2026-07-12
 
 主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
@@ -783,4 +804,3 @@ project adheres to [Semantic Versioning](https://semver.org/).
    - 如需开启每日自动更新，添加 `"updateAutoApply": true` 与 `"updateAutoApplyTime": "03:00"`。
 4. **首次发布**
    - 维护者需在仓库 Settings → Secrets 添加 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`，否则 CI 推送会失败。
-
