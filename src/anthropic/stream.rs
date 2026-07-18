@@ -1199,7 +1199,8 @@ impl StreamContext {
         // contextUsage = context_usage% × window 很粗，真实 ~10k 对话会被算成 ~140k，使
         // 三桶和 / baseline 冲到 7~20x 被检测判 Abnormal。本地估算最接近检测方数出的 baseline
         // → multiplier≈1x、形状对齐真实 Anthropic。窗口超限 stop_reason 仍走 context_usage%。
-        self.cache_usage.split_against_total(self.input_tokens.max(0))
+        // split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径（超报）。
+        self.cache_usage.split_final(self.input_tokens.max(0))
     }
     /// 创建 StreamContext
     pub fn new_with_thinking(

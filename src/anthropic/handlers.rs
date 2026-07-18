@@ -484,11 +484,25 @@ pub(crate) fn compute_cache_usage_for_key(
     };
     let mut usage =
         super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count);
-    // multiplier 护栏上限（C）：per-key 覆盖优先，否则默认 1.25（DEFAULT_MULTIPLIER_CAP）。
+    // multiplier 护栏上限（C，仅默认模式生效）：per-key 覆盖优先，否则默认 1.25。
     // weighted/baseline 超此值时 split_against_total 把 input→read 压回（不碰 creation）。
     usage.multiplier_cap = key_ctx
         .cache_multiplier_cap
         .unwrap_or(super::cache_metering::DEFAULT_MULTIPLIER_CAP);
+    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实 Anthropic 口径 +
+    // 超报利润控制器（p 超报 read，⚠️ 可被检测判 Abnormal）。关闭时走检测安全的 split_against_total。
+    usage.billing_mode = key_ctx.anthropic_billing_mode;
+    if usage.billing_mode {
+        // read 膨胀系数 p：per-key 覆盖优先，否则默认 +20%（DEFAULT_READ_INFLATION）。
+        usage.read_inflation = key_ctx
+            .cache_read_inflation
+            .unwrap_or(super::cache_metering::DEFAULT_READ_INFLATION);
+        // 钉住的 input token 数：per-key 覆盖优先，否则默认 2（DEFAULT_PINNED_INPUT）。
+        usage.pinned_input = key_ctx
+            .anthropic_input_tokens
+            .unwrap_or(super::cache_metering::DEFAULT_PINNED_INPUT);
+        // creation_ratio 已由 CacheUsage::default() 设为 DEFAULT_CREATION_RATIO（3%），无需覆盖。
+    }
     usage
 }
 
@@ -1500,9 +1514,9 @@ async fn handle_non_stream_request(
     // context_input_tokens 仅用于 stop_reason（窗口超限）判定，不进计量拆分。
     let _ = context_input_tokens;
     let total_input_tokens = input_tokens.max(0);
-    // 互斥分摊：input + cache_creation + cache_read == total
+    // 分摊入口 split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        cache_usage.split_final(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({

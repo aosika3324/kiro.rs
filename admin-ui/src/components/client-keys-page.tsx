@@ -78,6 +78,11 @@ export function ClientKeysPage() {
   const [editCacheRatio, setEditCacheRatio] = useState('')
   // multiplier 护栏上限覆盖：空串=跟随默认 1.25，否则 0.1~1.25
   const [editMultiplierCap, setEditMultiplierCap] = useState('')
+  // Anthropic 标准计费模式开关（默认关）+ 利润控制器·read 膨胀系数 p（空串=跟随默认 0.2）
+  const [editBillingMode, setEditBillingMode] = useState(false)
+  const [editInflation, setEditInflation] = useState('')
+  // 标准模式钉住的 input token 数（空串=跟随默认 2）
+  const [editInputTokens, setEditInputTokens] = useState('')
   // 编辑弹窗当前分类 tab
   const [editTab, setEditTab] = useState<'basic' | 'metering' | 'filter' | 'respcache'>('basic')
 
@@ -192,6 +197,9 @@ export function ClientKeysPage() {
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
+    setEditBillingMode(item.anthropicBillingMode ?? false)
+    setEditInflation(item.cacheReadInflation != null ? String(item.cacheReadInflation) : '')
+    setEditInputTokens(item.anthropicInputTokens != null ? String(item.anthropicInputTokens) : '')
     setEditTab('basic')
     setEditOpen(true)
   }
@@ -222,6 +230,20 @@ export function ClientKeysPage() {
       toast.error('multiplier 护栏上限需在 0.1..=1.25，或留空跟随默认 1.25')
       return
     }
+    // read 膨胀系数 p：空串→null（复位跟随默认 0.2）；否则 0~9
+    const inflRaw = editInflation.trim()
+    const cacheReadInflation = inflRaw === '' ? null : parseFloat(inflRaw)
+    if (inflRaw !== '' && (isNaN(cacheReadInflation as number) || (cacheReadInflation as number) < 0 || (cacheReadInflation as number) > 9)) {
+      toast.error('read 膨胀系数 p 需在 0..=9，或留空跟随默认 0.2')
+      return
+    }
+    // 标准模式 input token：空串→null（复位跟随默认 2）；否则 >=1 的整数
+    const inputTokRaw = editInputTokens.trim()
+    const anthropicInputTokens = inputTokRaw === '' ? null : parseInt(inputTokRaw, 10)
+    if (inputTokRaw !== '' && (isNaN(anthropicInputTokens as number) || (anthropicInputTokens as number) < 1)) {
+      toast.error('标准模式 input token 需为 ≥1 的整数，或留空跟随默认 2')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -237,6 +259,9 @@ export function ClientKeysPage() {
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
           cacheMultiplierCap,
+          anthropicBillingMode: editBillingMode,
+          cacheReadInflation,
+          anthropicInputTokens,
         },
       })
       toast.success('已更新')
@@ -677,6 +702,60 @@ export function ClientKeysPage() {
                     disabled={updateKey.isPending || !editCacheEnabled}
                     className="h-8 w-28 text-xs"
                   />
+                </div>
+
+                {/* Anthropic 标准计费模式（互斥于上面的检测安全默认）*/}
+                <div className="mt-1 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm">Anthropic 标准计费模式</div>
+                      <p className="text-[11px] text-muted-foreground">
+                        开启后 usage 走真实 Anthropic 口径（input 钉小常数、creation 自然占比、read×(1+p) 超报）+ 利润控制器，<b className="text-amber-600">此时上面的护栏/利润档不生效</b>。⚠️ 上报总量 &gt; 真实、multiplier&gt;1x，<b className="text-amber-600">可能被检测平台判 Abnormal</b>——仅对不跑检测的下游开启。默认关＝检测安全比例分摊。
+                      </p>
+                    </div>
+                    <Switch
+                      checked={editBillingMode}
+                      onCheckedChange={setEditBillingMode}
+                      disabled={updateKey.isPending || !editCacheEnabled}
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm">利润·read 膨胀系数 p</div>
+                      <p className="text-[11px] text-muted-foreground">
+                        留空＝默认 0.2（+20%）；0~9。把便宜的 cache_read（0.1x）超报 ×(1+p) 出利润。p=0＝纯真实 Anthropic 形状不超报。仅标准计费模式生效。
+                      </p>
+                    </div>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={9}
+                      step={0.1}
+                      placeholder="默认 0.2"
+                      value={editInflation}
+                      onChange={(e) => setEditInflation(e.target.value)}
+                      disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
+                      className="h-8 w-28 text-xs"
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm">钉住 input token 数</div>
+                      <p className="text-[11px] text-muted-foreground">
+                        留空＝默认 2；≥1 整数。复现真实 Anthropic 暖缓存下 input 为小常数的口径。调利润时此值不变。仅标准计费模式生效。
+                      </p>
+                    </div>
+                    <Input
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="默认 2"
+                      value={editInputTokens}
+                      onChange={(e) => setEditInputTokens(e.target.value)}
+                      disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
+                      className="h-8 w-28 text-xs"
+                    />
+                  </div>
                 </div>
               </div>
             </div>

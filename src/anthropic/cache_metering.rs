@@ -52,10 +52,25 @@ pub struct CacheUsage {
     /// read 留存阻尼 R ∈ [0,1]（利润档）：read 桶保留 `read × R`，其余推回 input（不给缓存折扣）。
     /// R 越低 → 越多 read 挪 input → 加权收入越高、命中率越低。可全局设也可 per-key 覆盖。
     pub read_ratio: f64,
-    /// multiplier 护栏上限（C）：`weighted/baseline` 超此值时把 input→read 压回（见
-    /// [`CacheUsage::apply_multiplier_cap`]）。默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25（真实 Anthropic
-    /// 暖缓存自然上限，常态 no-op）；per-key 可收紧。`<=0` 表示不设护栏。
+    /// multiplier 护栏上限（C，仅**检测安全默认模式**生效）：`weighted/baseline` 超此值时把
+    /// input→read 压回（见 [`CacheUsage::apply_multiplier_cap`]）。默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25。
+    /// `billing_mode` 开启（标准计费）时**不施加**此护栏（标准模式故意超报，护栏会抵消利润）。
     pub multiplier_cap: f64,
+    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`CacheUsage::split_final`] 走
+    /// [`CacheUsage::split_anthropic_standard`]：input 钉小常数、creation 自然占比、read×(1+p) 超报，
+    /// 复现真实 Anthropic 暖缓存口径 + 利润控制器。⚠️ 会使上报总量 > 真实、multiplier>1x，
+    /// **可被检测平台判 Abnormal**——仅对不跑检测的下游开启。关闭（默认）走检测安全的
+    /// [`CacheUsage::split_against_total`]（受 multiplier_cap 护栏）。
+    pub billing_mode: bool,
+    /// 利润控制器·read 膨胀系数 p ≥ 0（仅标准模式生效，默认 0.2）：把便宜的 cache_read 桶**超报**——
+    /// `read_final = read0 × (1 + p)`。多报的 read（0.1x）即利润，上报总量随之 > 真实 total。
+    pub read_inflation: f64,
+    /// 标准模式 creation 占比（仅标准模式生效，默认 0.03）：creation = `cacheable × creation_ratio`，
+    /// 复现真实 Anthropic 每轮写入一小段缓存（自然的小值，不塌成 1）。read = cacheable − creation。
+    pub creation_ratio: f64,
+    /// Anthropic 标准计费模式下钉住的 input token 数（默认 2，可 per-key 覆盖）。复现真实 Anthropic
+    /// 暖缓存下 input 为小常数（1/2）的口径；剩余 `total − pinned_input` 落缓存两桶。仅标准模式生效。
+    pub pinned_input: i32,
 }
 
 /// 下游按此权重给三桶计价（对齐真实 Anthropic：input 1.0 / cache_creation 1.25 / cache_read 0.1）。
@@ -70,6 +85,18 @@ pub const WEIGHT_READ: f64 = 0.1;
 /// 故默认不扭曲正常形状、仅兜底保证绝不越异常线；per-key 可收紧到 1.0 留足检测余量。
 pub const DEFAULT_MULTIPLIER_CAP: f64 = 1.25;
 
+/// 标准计费模式默认钉住的 input token 数。
+pub const DEFAULT_PINNED_INPUT: i32 = 2;
+
+/// read 膨胀系数 p 的上限（read 最多 ×(1+MAX)）。
+pub const MAX_READ_INFLATION: f64 = 9.0;
+
+/// 标准模式 read 膨胀系数默认值（+20% 利润）。
+pub const DEFAULT_READ_INFLATION: f64 = 0.2;
+
+/// 标准模式 creation 占比默认值（cacheable 的 3%，自然的小值）。
+pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
+
 impl Default for CacheUsage {
     /// 默认 = 不模拟缓存：`prompt_total_est == 0` 使 `split_against_total` 全量计入 input。
     fn default() -> Self {
@@ -79,6 +106,10 @@ impl Default for CacheUsage {
             prompt_total_est: 0,
             read_ratio: 1.0,
             multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            billing_mode: false,
+            read_inflation: 0.0,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            pinned_input: DEFAULT_PINNED_INPUT,
         }
     }
 }
@@ -150,6 +181,49 @@ impl CacheUsage {
         (input - mv, creation, read + mv)
     }
 
+    /// 最终分摊入口：按 `billing_mode` 选择口径。关（默认）→ [`Self::split_against_total`]
+    /// （检测安全默认路径，含 multiplier_cap 护栏）；开 → [`Self::split_anthropic_standard`]
+    /// （真实 Anthropic 口径 + 超报利润控制器，**不受护栏**、可被检测判 Abnormal）。
+    /// 三桶恒满足标准模式 `input + creation + read ==` 上报总量（≥ 真实 total）。
+    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
+        if self.billing_mode {
+            self.split_anthropic_standard(total_real)
+        } else {
+            self.split_against_total(total_real)
+        }
+    }
+
+    /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
+    ///
+    /// 三桶按「固定形状」合成，复现真实 Anthropic 暖缓存 + 利润：
+    /// - **input = `pinned_input`（默认 2）**：小常数，像真实 Anthropic 暖缓存未命中的碎屑；恒定不参与利润拨动。
+    /// - **creation = `cacheable × creation_ratio`（默认 3%）**：每轮写入一小段缓存的自然小值（不塌成 1）。
+    /// - **read = (cacheable − creation) × (1 + `read_inflation`)（默认 +20%）**：占比最大的桶 + 超报利润。
+    ///
+    /// 其中 `cacheable = total − pinned`。利润来自超报便宜的 read（0.1x）——`p>0` 时上报总量 > 真实 total。
+    /// creation_ratio 决定「写多少」（形状),read_inflation 决定「读超报多少」（利润）。二者 per-key 可调。
+    /// **不施加 multiplier_cap 护栏**：标准模式的利润正来自超报，护栏会把它抵消掉。
+    ///
+    /// `total <= pinned_input` 或无可缓存内容（`prompt_total_est<=0`）时全部计入 input，不凭空造缓存计数。
+    pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        // pinned>=1；total<=pinned 或无可缓存内容：无法在钉 input=pinned 的同时再分缓存桶，全计 input。
+        let pinned = self.pinned_input.max(1);
+        if self.prompt_total_est <= 0 || total <= pinned {
+            return (total, 0, 0);
+        }
+        // input 恒钉 pinned；剩余 (total-pinned) 为可缓存部分。
+        let cacheable = total - pinned;
+        // creation = cacheable × creation_ratio（固定占比的自然小值，复现真实 Anthropic 每轮写一小段）。
+        let cr = self.creation_ratio.clamp(0.0, 1.0);
+        let creation = ((cacheable as f64) * cr).round() as i32;
+        let creation = creation.clamp(0, cacheable);
+        let read0 = cacheable - creation;
+        // 利润控制器：超报 read（0.1x 桶），read_final = read0 × (1+p)。creation 不动、input 不动。
+        let p = self.read_inflation.clamp(0.0, MAX_READ_INFLATION);
+        let read_final = ((read0 as f64) * (1.0 + p)).round() as i32;
+        (pinned, creation, read_final)
+    }
 }
 
 /// 计量运行时治理：持有全局 read 留存阻尼 R + 缓存热度 TTL + 按会话的 last_seen 表
@@ -730,6 +804,7 @@ mod tests {
             prompt_total_est: 100,
             read_ratio: 0.0,
             multiplier_cap: 0.5,
+            ..CacheUsage::default()
         };
         let (i, c, r) = u.split_against_total(1000);
         assert_eq!(c, 100, "creation 绝不被护栏改动（诚实，不伪造暖轮 read）");
@@ -747,8 +822,124 @@ mod tests {
             prompt_total_est: 100,
             read_ratio: 0.0,
             multiplier_cap: 0.0,
+            ..CacheUsage::default()
         };
         assert_eq!(u.split_against_total(1000), (900, 100, 0), "cap=0 关闭护栏");
+    }
+
+    // ---- split_anthropic_standard（标准计费模式 + 利润控制器）-----------------
+
+    /// 标准模式：input 恒钉 `pinned`；creation = cacheable×creation_ratio；read = 余下×(1+p)。
+    fn std_usage(
+        input_est: i32,
+        creation_est: i32,
+        total_est: i32,
+        p: f64,
+        pinned: i32,
+    ) -> CacheUsage {
+        CacheUsage {
+            input_est,
+            creation_est,
+            prompt_total_est: total_est,
+            read_ratio: 1.0,
+            billing_mode: true,
+            read_inflation: p,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            pinned_input: pinned,
+            ..CacheUsage::default()
+        }
+    }
+
+    /// 同上但可指定 creation_ratio。
+    fn std_usage_cr(total_est: i32, p: f64, pinned: i32, cr: f64) -> CacheUsage {
+        CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: total_est,
+            read_ratio: 1.0,
+            billing_mode: true,
+            read_inflation: p,
+            creation_ratio: cr,
+            pinned_input: pinned,
+            ..CacheUsage::default()
+        }
+    }
+
+    #[test]
+    fn std_input_pinned_and_shape() {
+        // 默认 creation_ratio=3%, p=0。total=10000, pinned=2 → cacheable=9998。
+        // creation=9998×3%≈300；read0=9698；p=0 → read=9698。
+        let u = std_usage(5, 15, 1000, 0.0, 2);
+        let (i, c, r) = u.split_final(10000);
+        assert_eq!(i, 2, "input 恒钉 pinned=2");
+        assert_eq!(c, 300, "creation = cacheable × 3% ≈ 300");
+        assert_eq!(r, 9698, "read = cacheable − creation（p=0 不膨胀）");
+        assert_eq!(i + c + r, 10000, "p=0 时三桶和恒等 total");
+    }
+
+    #[test]
+    fn std_input_pinned_configurable() {
+        let u = std_usage(5, 15, 1000, 0.0, 5);
+        assert_eq!(u.split_final(10000).0, 5, "input 恒钉 pinned=5（可配置）");
+        let u1 = std_usage(5, 15, 1000, 0.0, 1);
+        assert_eq!(u1.split_final(10000).0, 1, "pinned=1 → input 恒 1");
+    }
+
+    #[test]
+    fn std_baseline_p_zero_shape() {
+        // p=0：read 不膨胀。cr=3%。total=4000,pinned=2 → cacheable=3998。
+        // creation=3998×3%≈120；read=3878。
+        let u = std_usage(2, 8, 500, 0.0, 2);
+        let (i, c, r) = u.split_final(4000);
+        assert_eq!(i, 2, "input 恒 pinned=2");
+        assert_eq!(c, 120, "creation = 3998 × 3% ≈ 120");
+        assert_eq!(r, 3878);
+        assert_eq!(i + c + r, 4000, "p=0 时和恒等 total");
+    }
+
+    #[test]
+    fn std_profit_p_inflates_read_only() {
+        // p=0.2（默认利润）：read 超报 20%；creation 与 input 不动。
+        let u = std_usage(2, 8, 500, 0.2, 2);
+        let (i, c, r) = u.split_final(4000);
+        // creation=120, read0=3878。read_final=3878×1.2=4654(round)。
+        assert_eq!(i, 2, "input 不变");
+        assert_eq!(c, 120, "creation 不受 p 影响");
+        assert_eq!(r, 4654, "read 超报 20% = 3878×1.2");
+        assert!(i + c + r > 4000, "上报总量 > 真实 total（多报 read 即利润）");
+    }
+
+    #[test]
+    fn std_creation_ratio_configurable() {
+        // creation_ratio=1% vs 5%：creation 随之变，read=余下。total=10002,pinned=2→cacheable=10000。
+        let lo = std_usage_cr(1000, 0.0, 2, 0.01);
+        let (_, c1, _) = lo.split_final(10002);
+        assert_eq!(c1, 100, "1% → creation=100");
+        let hi = std_usage_cr(1000, 0.0, 2, 0.05);
+        let (_, c5, _) = hi.split_final(10002);
+        assert_eq!(c5, 500, "5% → creation=500");
+    }
+
+    #[test]
+    fn std_no_cacheable_all_input_std() {
+        // total<=pinned → 全计 input。
+        let u = std_usage(0, 0, 0, 0.2, 2);
+        assert_eq!(u.split_final(2), (2, 0, 0));
+    }
+
+    #[test]
+    fn std_billing_mode_off_uses_safe_default() {
+        // billing_mode 关（默认）→ split_final 走 split_against_total（检测安全），不走标准口径。
+        let u = CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: 1000,
+            read_ratio: 1.0,
+            ..CacheUsage::default()
+        };
+        assert!(!u.billing_mode, "默认关");
+        // 纯 read 重放：默认模式 R=1 → 全 read；标准模式会钉 input=2。用差异确认走的是默认。
+        assert_eq!(u.split_final(1000), (0, 0, 1000), "默认模式全 read，非标准钉 input");
     }
 
     // ---- compute_structural_cache_usage ------------------------------------

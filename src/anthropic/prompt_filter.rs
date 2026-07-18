@@ -175,6 +175,9 @@ mod tests {
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
             cache_multiplier_cap: None,
+            anthropic_billing_mode: false,
+            cache_read_inflation: None,
+            anthropic_input_tokens: None,
             key_source: TraceKeySource::ClientKey,
         }
     }
