@@ -6,14 +6,15 @@ RUN bun install --frozen-lockfile --ignore-scripts
 COPY admin-ui ./
 RUN bun run build
 
-FROM rust:1.92-alpine AS builder
+# glibc 构建镜像(非 alpine/musl)：TLS 指纹依赖 boring-sys2(BoringSSL) 的 bindgen 需
+# dlopen libclang，而 rust:alpine 的 build-script 是静态 musl 二进制、不支持动态加载
+# (报 "Dynamic loading not supported")。glibc(bookworm) 无此限制。
+# 需要：cmake(编 BoringSSL) + clang/libclang-dev(bindgen) + git(boring-sys2 打补丁) + perl。
+FROM rust:1.92-bookworm AS builder
 
-# musl-dev/perl/make：既有；cmake + clang/llvm + g++：TLS 指纹依赖 boring-sys2(BoringSSL)
-# 需 cmake 编译 + libclang 跑 bindgen。alpine 的 clang 包自带 builtin headers(stddef.h 等)，
-# 无需额外 -I（区别于 pip libclang）。若 musl 下 BoringSSL 构建失败，回退方案见 README/memory：
-# 把本 stage 换成 rust:1.92-bookworm(glibc) + 对应 glibc runtime base。
-RUN apk add --no-cache musl-dev perl make cmake clang clang-dev llvm-dev g++ linux-headers git
-ENV LIBCLANG_PATH=/usr/lib
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake clang libclang-dev git perl make \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
@@ -24,9 +25,12 @@ COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 # 二者不冲突(无 openssl-sys)。若不需指纹，用纯 `--no-default-features` 即可(不引入 BoringSSL)。
 RUN cargo build --release --no-default-features --features tls-fingerprint
 
-FROM alpine:3.21
+# glibc 运行时(与 bookworm builder 的 glibc 匹配)。debian-slim ~80MB。
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
