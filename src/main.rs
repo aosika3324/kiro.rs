@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod fingerprint_client;
 mod http_client;
 mod image_resize;
 mod kiro;

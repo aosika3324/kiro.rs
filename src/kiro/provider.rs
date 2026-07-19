@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
+use crate::fingerprint_client::UpstreamResponse;
+#[cfg(feature = "tls-fingerprint")]
+use crate::fingerprint_client::{build_fingerprint_client, send_via_wreq};
 use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME;
 use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
@@ -367,7 +370,7 @@ impl ClientCache {
 /// 但它使实际并发行为部分取决于下游客户端的读速度。调优点：`account_acquire_timeout_secs`
 /// 控制阻塞模式的最长等待，账号并发上限由各凭据的 Semaphore 容量决定。
 pub struct KiroCallResult {
-    pub response: reqwest::Response,
+    pub response: UpstreamResponse,
     pub credential_id: u64,
     pub account_guard: CallContext,
 }
@@ -387,6 +390,11 @@ pub struct KiroProvider {
     /// 与 `client_cache` 同构、同样按 effective proxy 缓存，但每条流用全新连接，
     /// 避免长流被上游中途掐断导致的"断流"。
     streaming_client_cache: Mutex<ClientCache>,
+    /// TLS 指纹 (wreq) 客户端缓存。仅当 `config.tls_fingerprint_enabled` 开启时才会建/用。
+    /// key = (effective proxy, 是否流式禁复用, profile 名)；三者任一不同即用独立 client。
+    /// 惰性构建（默认关闭时不产生任何 wreq client / BoringSSL 开销），带容量上限简单淘汰。
+    #[cfg(feature = "tls-fingerprint")]
+    wreq_client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool, String), wreq::Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -471,6 +479,8 @@ impl KiroProvider {
             token_manager,
             client_cache: Mutex::new(client_cache),
             streaming_client_cache: Mutex::new(streaming_client_cache),
+            #[cfg(feature = "tls-fingerprint")]
+            wreq_client_cache: Mutex::new(HashMap::new()),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -506,6 +516,62 @@ impl KiroProvider {
         let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// 获取（或惰性创建并缓存）TLS 指纹 wreq 客户端。
+    ///
+    /// `streaming` 为 true 时禁用空闲连接复用（同 [`build_streaming_client`] 语义）。
+    /// 缓存 key 含 profile，改预设后自动用新 client；简单容量上限，超限清空重来（预设/代理
+    /// 组合数很小，不会频繁触发）。
+    #[cfg(feature = "tls-fingerprint")]
+    fn wreq_client_for(
+        &self,
+        credentials: &KiroCredentials,
+        streaming: bool,
+        profile: &str,
+    ) -> anyhow::Result<wreq::Client> {
+        const WREQ_CACHE_CAP: usize = 64;
+        let global_proxy = self.token_manager.proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
+        let key = (effective.clone(), streaming, profile.to_string());
+        let mut cache = self.wreq_client_cache.lock();
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+        let pool = if streaming { 0 } else { 8 };
+        let client = build_fingerprint_client(effective.as_ref(), 720, profile, pool)?;
+        if cache.len() >= WREQ_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, client.clone());
+        Ok(client)
+    }
+
+    /// 发送已装饰好的上游请求，按 TLS 指纹开关选择 reqwest 或 wreq 路径。
+    ///
+    /// 关闭时（默认）：走传入的 reqwest `http_client`，与历史行为逐字节一致。
+    /// 开启时：把该 `reqwest::Request` 重放到带浏览器指纹的 wreq 客户端。两路的响应
+    /// 统一封装为 [`UpstreamResponse`]，下游流/非流处理无需分叉。错误统一为 `anyhow`
+    /// （调用点仅 `.to_string()` 记录并计入 `last_error`，网络错误可重试性由既有策略判定）。
+    #[allow(unused_variables)] // credentials/streaming 仅在 tls-fingerprint 特性下使用
+    async fn execute_upstream(
+        &self,
+        http_client: &Client,
+        credentials: &KiroCredentials,
+        streaming: bool,
+        request: reqwest::Request,
+    ) -> anyhow::Result<UpstreamResponse> {
+        #[cfg(feature = "tls-fingerprint")]
+        {
+            let (fp_enabled, fp_profile) = self.token_manager.tls_fingerprint();
+            if fp_enabled {
+                let client = self.wreq_client_for(credentials, streaming, &fp_profile)?;
+                let resp = send_via_wreq(&client, request).await?;
+                return Ok(UpstreamResponse::Wreq(resp));
+            }
+        }
+        let resp = http_client.execute(request).await?;
+        Ok(UpstreamResponse::Reqwest(resp))
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -681,12 +747,12 @@ impl KiroProvider {
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -725,14 +791,24 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let http_client = self.client_for(&ctx.credentials)?;
+            let base = http_client
                 .post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
-            let request = endpoint.decorate_mcp(base, &rctx);
+            let request = match endpoint.decorate_mcp(base, &rctx).build() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("构建 MCP 请求失败: {}", e));
+                    continue;
+                }
+            };
 
-            let response = match request.send().await {
+            // MCP 为非流式；TLS 指纹开启时同样经 wreq 发出。
+            let response = match self
+                .execute_upstream(&http_client, &ctx.credentials, false, request)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -741,7 +817,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    last_error = Some(e.into());
+                    last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -1007,7 +1083,10 @@ impl KiroProvider {
                         );
                     }
                 }
-                let response = match http_client.execute(request).await {
+                let response = match self
+                    .execute_upstream(&http_client, &ctx.credentials, is_stream && !stream_reuse, request)
+                    .await
+                {
                     Ok(resp) => resp,
                     Err(e) => {
                         tracing::warn!(

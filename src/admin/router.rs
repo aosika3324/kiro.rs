@@ -23,6 +23,7 @@ use super::{
         set_client_key_disabled, set_credential_concurrency, set_credential_disabled,
         set_credential_overage, set_credential_priority, set_endpoint_routing_config,
         set_global_proxy, set_load_balancing_mode, set_log_governance_config, set_model_mappings,
+        set_tls_fingerprint,
         set_prompt_filter_defaults, set_proxy_enabled, set_runtime_governance_config,
         set_update_config, social_oauth_callback, start_idc_login, start_idc_relogin,
         start_social_login, start_social_relogin, stats_by_credential, stats_by_model,
@@ -126,6 +127,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/global-proxy",
             get(get_global_proxy).put(set_global_proxy),
+        )
+        .route(
+            "/config/tls-fingerprint",
+            put(set_tls_fingerprint),
         )
         .route(
             "/config/update",

@@ -25,7 +25,8 @@ use super::{
         CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
         SetConcurrencyRequest, SetDisabledRequest, SetEndpointRoutingConfigRequest,
         SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest,
+        SetPriorityRequest, SetRuntimeGovernanceConfigRequest, SetTlsFingerprintRequest,
+        SetUpdateConfigRequest,
         StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
         UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
@@ -829,8 +830,11 @@ fn render_callback_page(success: bool, message: &str) -> String {
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
+    let (tls_fingerprint_enabled, tls_fingerprint_profile) = state.service.get_tls_fingerprint();
     Json(GlobalProxyResponse {
         proxy_url: state.service.get_global_proxy(),
+        tls_fingerprint_enabled,
+        tls_fingerprint_profile,
     })
 }
 
@@ -842,6 +846,21 @@ pub async fn set_global_proxy(
 ) -> impl IntoResponse {
     match state.service.set_global_proxy(payload.proxy_url) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/tls-fingerprint
+/// 设置 TLS 指纹伪装开关与浏览器预设
+pub async fn set_tls_fingerprint(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetTlsFingerprintRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_tls_fingerprint(payload.enabled, payload.profile)
+    {
+        Ok(_) => Json(SuccessResponse::new("TLS 指纹设置已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

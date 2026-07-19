@@ -94,6 +94,17 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// 是否启用 TLS 指纹伪装（默认关闭）。开启后上游请求改由 wreq(BoringSSL) 发出，
+    /// 模拟浏览器 JA3/JA4+HTTP2 指纹，用于绕过对 TLS 指纹校验严格的目标。AWS 上游不需要，
+    /// 属 opt-in 能力；关闭时走原 reqwest 路径不变。
+    #[serde(default)]
+    pub tls_fingerprint_enabled: bool,
+
+    /// TLS 指纹使用的浏览器预设（如 "chrome"/"firefox"/"safari"/"edge"，默认最新 Chrome）。
+    /// 取值见 `fingerprint_client::profile_to_emulation`。
+    #[serde(default = "default_tls_fingerprint_profile")]
+    pub tls_fingerprint_profile: String,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -378,6 +389,10 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_tls_fingerprint_profile() -> String {
+    "chrome".to_string()
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
@@ -478,6 +493,8 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            tls_fingerprint_enabled: false,
+            tls_fingerprint_profile: default_tls_fingerprint_profile(),
             admin_api_key: None,
             update_previous_version: None,
             github_token: None,

@@ -18,6 +18,7 @@ import {
   useSetLogGovernanceConfig,
   useGlobalProxy,
   useSetGlobalProxy,
+  useSetTlsFingerprint,
   useEndpointRoutingConfig,
   useSetEndpointRoutingConfig,
 } from '@/hooks/use-credentials'
@@ -397,6 +398,7 @@ function LogProxySection() {
   const setLog = useSetLogGovernanceConfig()
   const { data: proxy, isLoading: pl } = useGlobalProxy()
   const setProxy = useSetGlobalProxy()
+  const setFp = useSetTlsFingerprint()
   const [traceDays, setTraceDays] = useState('')
   const [usageDays, setUsageDays] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -475,6 +477,52 @@ function LogProxySection() {
           <Input placeholder="http://host:port（留空清除）" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} disabled={setProxy.isPending} className="h-8 text-xs" />
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={setProxy.isPending}>保存</Button>
         </form>
+      </div>
+
+      <ToggleRow
+        label={proxy?.tlsFingerprintEnabled ? 'TLS 指纹伪装：已启用' : 'TLS 指纹伪装：已关闭'}
+        desc="开启后上游请求改由 wreq(BoringSSL) 发出，模拟浏览器 JA3/JA4+HTTP2 指纹。AWS 上游无需此项；用于绕过对 TLS 指纹校验严格的目标。"
+        checked={proxy?.tlsFingerprintEnabled ?? false}
+        disabled={pl || setFp.isPending}
+        onChange={(v) =>
+          setFp.mutate(
+            { enabled: v },
+            {
+              onSuccess: () => toast.success(v ? '已开启 TLS 指纹伪装' : '已关闭 TLS 指纹伪装'),
+              onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
+            },
+          )
+        }
+      />
+
+      <div>
+        <div className="mb-1.5 text-sm font-medium">
+          指纹浏览器预设（当前 {pl ? '…' : proxy?.tlsFingerprintProfile || 'chrome'}）
+        </div>
+        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
+          选择要模拟的浏览器指纹。仅在 TLS 指纹伪装启用时生效。
+        </div>
+        <select
+          value={proxy?.tlsFingerprintProfile || 'chrome'}
+          disabled={pl || setFp.isPending}
+          onChange={(e) =>
+            setFp.mutate(
+              { enabled: proxy?.tlsFingerprintEnabled ?? false, profile: e.target.value },
+              {
+                onSuccess: () => toast.success('指纹预设已更新'),
+                onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
+              },
+            )
+          }
+          className="h-8 w-full max-w-[240px] rounded-md border border-input bg-background px-2 text-xs"
+        >
+          <option value="chrome">Chrome</option>
+          <option value="firefox">Firefox</option>
+          <option value="safari">Safari</option>
+          <option value="edge">Edge</option>
+          <option value="okhttp">OkHttp</option>
+          <option value="opera">Opera</option>
+        </select>
       </div>
     </SettingSection>
   )

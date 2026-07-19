@@ -2069,7 +2069,7 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
-    response: reqwest::Response,
+    response: crate::fingerprint_client::UpstreamResponse,
     ctx: BufferedStreamContext,
     hook: UsageRecordHook,
     credential_id: u64,

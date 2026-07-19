@@ -1559,6 +1559,34 @@ impl AdminService {
         Ok(())
     }
 
+    /// 获取当前 TLS 指纹设置 `(enabled, profile)`。
+    pub fn get_tls_fingerprint(&self) -> (bool, String) {
+        self.token_manager.tls_fingerprint()
+    }
+
+    /// 设置 TLS 指纹开关与浏览器预设（热更新 + 持久化）。`profile` 为 None 时保留当前预设。
+    pub fn set_tls_fingerprint(
+        &self,
+        enabled: bool,
+        profile: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        let (_, current_profile) = self.token_manager.tls_fingerprint();
+        let profile = profile
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or(current_profile);
+
+        self.token_manager
+            .set_tls_fingerprint(enabled, profile.clone());
+
+        let profile_for_save = profile;
+        self.update_config_file(move |c| {
+            c.tls_fingerprint_enabled = enabled;
+            c.tls_fingerprint_profile = profile_for_save;
+        });
+        Ok(())
+    }
+
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
     pub fn persist_admin_key(&self, new_key: &str) {
         let key = new_key.to_string();

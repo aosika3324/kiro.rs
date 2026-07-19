@@ -29,6 +29,7 @@ import type {
   CompleteSocialLoginRequest,
   GlobalProxyResponse,
   SetGlobalProxyRequest,
+  SetTlsFingerprintRequest,
   UpdateConfigResponse,
   SetUpdateConfigRequest,
   ImageUpdateResponse,
@@ -596,6 +597,12 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 设置 TLS 指纹伪装（开关 + 浏览器预设）
+export async function setTlsFingerprint(req: SetTlsFingerprintRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/config/tls-fingerprint', req)
   return data
 }
 

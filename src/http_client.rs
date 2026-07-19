@@ -16,6 +16,26 @@ fn env_secs(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// 分层超时配置（秒），由 `KIRO_RS_HTTP_*` 环境变量覆盖。作为 reqwest 与 TLS 指纹
+/// (wreq) 两条客户端构建路径的**单一数据源**，保证两者超时/保活/连接池语义一致。
+#[derive(Debug, Clone, Copy)]
+pub struct HttpTimeouts {
+    pub connect: u64,
+    pub read: u64,
+    pub keepalive: u64,
+    pub pool_idle: u64,
+}
+
+/// 解析分层超时（见各字段在 [`build_client_inner`] 的语义说明）。
+pub fn resolve_http_timeouts() -> HttpTimeouts {
+    HttpTimeouts {
+        connect: env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 15),
+        read: env_secs("KIRO_RS_HTTP_READ_TIMEOUT_SECS", 300),
+        keepalive: env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60),
+        pool_idle: env_secs("KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS", 15),
+    }
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
@@ -95,14 +115,16 @@ fn build_client_inner(
     // - read_timeout：每次读操作超时，**成功读一次即重置**。用于探测"建连后迟迟不吐字节"
     //   的挂死连接；首字节一到即重置，因此大上下文的长 prefill 与长生成都不会被误杀。
     // 这是高并发下的关键：避免少数挂死请求长时间霸占稀缺的账号并发槽，拖垮整个池子的首 token。
-    let connect_timeout = env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 15);
-    let read_timeout = env_secs("KIRO_RS_HTTP_READ_TIMEOUT_SECS", 300);
-    let keepalive = env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60);
     // 连接池空闲超时**必须短于上游服务端的空闲关闭时间**(AWS ALB 默认 ~60s),
     // 否则池里会留存已被服务端 RST/FIN 的"半死"连接,下一个请求取到它直接
     // "socket closed unexpectedly"。取 15s 远低于 60s,使陈旧连接在被复用前先被淘汰;
     // 取连接瞬间仍可能撞上服务端刚关闭的竞态,由上层重试循环兜底(execute 失败即重试)。
-    let pool_idle = env_secs("KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS", 15);
+    let HttpTimeouts {
+        connect: connect_timeout,
+        read: read_timeout,
+        keepalive,
+        pool_idle,
+    } = resolve_http_timeouts();
 
     let mut builder = Client::builder()
         // 总超时仍保留为大兜底（含完整流式响应）；read_timeout 才是挂死探测主力。

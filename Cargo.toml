@@ -4,8 +4,13 @@ version = "0.6.29"
 edition = "2024"
 
 [features]
-default = ["native-tls"]
+# 默认启用 TLS 指纹（wreq/BoringSSL）。native-tls 仍可选，但与 tls-fingerprint 互斥：
+# openssl-sys(native-tls-vendored) 与 boring-sys2 都导出 BIO_* 等符号，同时静态链接会
+# 重复符号报错。两者取一：默认走 rustls + 指纹;需 native-tls 时用
+# `--no-default-features --features native-tls`。部署镜像用 `--no-default-features --features tls-fingerprint`。
+default = ["tls-fingerprint"]
 native-tls = ["reqwest/native-tls-vendored"]
+tls-fingerprint = ["dep:wreq", "dep:wreq-util"]
 
 [profile.release]
 lto = "thin"
@@ -16,6 +21,14 @@ strip = true
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
+# TLS 指纹伪装客户端(可选启用,由 config.tls_fingerprint_enabled 运行时开关控制)。
+# wreq 基于 BoringSSL(boring-sys2),可模拟浏览器 JA3/JA4/HTTP2 指纹;wreq-util 提供 Emulation 预设。
+# 构建需 cmake + libclang(见 Dockerfile / memory: wreq-boringssl-build-recipe)。
+# 注：暂不启用 wreq 的 socks 特性（tokio-socks 未在离线缓存内且当前网络代理不稳定）；
+# SOCKS 代理仍由 reqwest 主路径支持，指纹路径先支持 http/https 代理。待网络恢复可加回 "socks"。
+# 由 `tls-fingerprint` 特性按需启用（与 native-tls 互斥，见 [features] 注释）。
+wreq = { version = "5", default-features = false, features = ["stream", "webpki-roots"], optional = true }
+wreq-util = { version = "2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"

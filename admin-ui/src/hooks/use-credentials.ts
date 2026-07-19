@@ -29,6 +29,7 @@ import {
   setPromptFilterDefaults,
   getGlobalProxy,
   setGlobalProxy,
+  setTlsFingerprint,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -347,6 +348,17 @@ export function useSetGlobalProxy() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: setGlobalProxy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['globalProxy'] })
+    },
+  })
+}
+
+// 设置 TLS 指纹伪装
+export function useSetTlsFingerprint() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setTlsFingerprint,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['globalProxy'] })
     },

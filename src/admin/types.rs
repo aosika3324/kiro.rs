@@ -705,6 +705,10 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 是否启用 TLS 指纹伪装
+    pub tls_fingerprint_enabled: bool,
+    /// TLS 指纹浏览器预设
+    pub tls_fingerprint_profile: String,
 }
 
 /// 设置全局代理请求
@@ -713,6 +717,17 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+}
+
+/// 设置 TLS 指纹请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTlsFingerprintRequest {
+    /// 是否启用
+    pub enabled: bool,
+    /// 浏览器预设（如 "chrome"/"firefox"/"safari"/"edge"），省略则保持/默认 chrome
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 // ============ 在线更新配置 ============

@@ -89,7 +89,7 @@ fn should_search_round(round_idx: usize, tool_uses: &[DecodedToolUse]) -> bool {
 
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
-    response: reqwest::Response,
+    response: crate::fingerprint_client::UpstreamResponse,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> RoundOutcome {

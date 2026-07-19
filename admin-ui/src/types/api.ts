@@ -253,10 +253,21 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  /** 是否启用 TLS 指纹伪装 */
+  tlsFingerprintEnabled: boolean
+  /** TLS 指纹浏览器预设 */
+  tlsFingerprintProfile: string
 }
 
 export interface SetGlobalProxyRequest {
   proxyUrl: string | null
+}
+
+// TLS 指纹伪装设置
+export interface SetTlsFingerprintRequest {
+  enabled: boolean
+  /** 浏览器预设（省略则保持当前） */
+  profile?: string
 }
 
 // 在线更新配置

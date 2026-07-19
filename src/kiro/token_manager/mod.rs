@@ -1383,6 +1383,9 @@ pub struct MultiTokenManager {
     config: Config,
     /// 全局代理（运行时可修改）
     proxy: Mutex<Option<ProxyConfig>>,
+    /// TLS 指纹开关 + 浏览器预设（运行时可修改，与 `proxy` 同为热更新通道）。
+    /// `(enabled, profile)`。启动时从 config 初始化，Admin 改动后对后续请求立即生效。
+    tls_fingerprint: Mutex<(bool, String)>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -1645,9 +1648,14 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let tls_fingerprint_init = (
+            config.tls_fingerprint_enabled,
+            config.tls_fingerprint_profile.clone(),
+        );
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
+            tls_fingerprint: Mutex::new(tls_fingerprint_init),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
@@ -1708,6 +1716,16 @@ impl MultiTokenManager {
     /// 设置全局代理配置（运行时修改，可传 None 清除）
     pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
         *self.proxy.lock() = proxy;
+    }
+
+    /// 获取 TLS 指纹设置的克隆：`(enabled, profile)`。
+    pub fn tls_fingerprint(&self) -> (bool, String) {
+        self.tls_fingerprint.lock().clone()
+    }
+
+    /// 设置 TLS 指纹开关与浏览器预设（运行时修改，对后续请求立即生效）。
+    pub fn set_tls_fingerprint(&self, enabled: bool, profile: String) {
+        *self.tls_fingerprint.lock() = (enabled, profile);
     }
 
     /// 获取凭据总数
