@@ -489,19 +489,15 @@ pub(crate) fn compute_cache_usage_for_key(
     usage.multiplier_cap = key_ctx
         .cache_multiplier_cap
         .unwrap_or(super::cache_metering::DEFAULT_MULTIPLIER_CAP);
-    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实 Anthropic 口径 +
-    // 超报利润控制器（p 超报 read，⚠️ 可被检测判 Abnormal）。关闭时走检测安全的 split_against_total。
+    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实互斥三桶口径
+    // （不超报、不双重收费，且不施加 multiplier_cap 护栏）；利润来自 R 挪桶。关闭时走
+    // 检测安全的 split_against_total（受护栏）。
     usage.billing_mode = key_ctx.anthropic_billing_mode;
     if usage.billing_mode {
-        // read 膨胀系数 p：per-key 覆盖优先，否则默认 +20%（DEFAULT_READ_INFLATION）。
-        usage.read_inflation = key_ctx
-            .cache_read_inflation
-            .unwrap_or(super::cache_metering::DEFAULT_READ_INFLATION);
-        // 钉住的 input token 数：per-key 覆盖优先，否则默认 2（DEFAULT_PINNED_INPUT）。
-        usage.pinned_input = key_ctx
-            .anthropic_input_tokens
-            .unwrap_or(super::cache_metering::DEFAULT_PINNED_INPUT);
-        // creation_ratio 已由 CacheUsage::default() 设为 DEFAULT_CREATION_RATIO（3%），无需覆盖。
+        // creation 占比：per-key 覆盖优先，否则默认 3%（DEFAULT_CREATION_RATIO）。定 creation 形状。
+        usage.creation_ratio = key_ctx
+            .cache_creation_ratio
+            .unwrap_or(super::cache_metering::DEFAULT_CREATION_RATIO);
     }
     usage
 }
@@ -1519,6 +1515,8 @@ async fn handle_non_stream_request(
     // 分摊入口 split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_final(total_input_tokens);
+    // creation 按入站 cache_control.ttl 归 5m / 1h 桶（顶层字段仍取总和以兼容旧口径）。
+    let (creation_5m, creation_1h) = cache_usage.creation_split(cache_creation_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1535,8 +1533,8 @@ async fn handle_non_stream_request(
             "cache_creation_input_tokens": cache_creation_tokens,
             "cache_read_input_tokens": cache_read_tokens,
             "cache_creation": {
-                "ephemeral_5m_input_tokens": cache_creation_tokens,
-                "ephemeral_1h_input_tokens": 0
+                "ephemeral_5m_input_tokens": creation_5m,
+                "ephemeral_1h_input_tokens": creation_1h
             }
         }
     });

@@ -420,12 +420,10 @@ export interface ClientKeyItem {
   cacheReadRatio?: number
   /** 缓存 multiplier 护栏上限覆盖（undefined = 跟随默认 1.25） */
   cacheMultiplierCap?: number
-  /** Anthropic 标准计费模式（默认 false）：usage 走真实 Anthropic 口径 + 超报利润控制器 */
+  /** Anthropic 标准计费模式（默认 false）：真实互斥三桶口径（不超报），仅不施加护栏；利润来自 R 挪桶 */
   anthropicBillingMode?: boolean
-  /** 利润控制器·read 膨胀系数 p 覆盖 ≥0（undefined = 跟随默认 0.2；仅标准模式生效） */
-  cacheReadInflation?: number
-  /** 标准模式钉住的 input token 数覆盖（undefined = 跟随默认 2；仅标准模式生效） */
-  anthropicInputTokens?: number
+  /** 标准模式 creation 占比覆盖 ∈ [0,1]（undefined = 跟随默认 3%；仅标准模式生效） */
+  cacheCreationRatio?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -471,10 +469,8 @@ export interface UpdateClientKeyRequest {
   cacheMultiplierCap?: number | null
   /** Anthropic 标准计费模式开关更新（省略=不变更；true/false=开/关） */
   anthropicBillingMode?: boolean
-  /** 利润控制器·read 膨胀系数 p 覆盖更新 ≥0（省略=不变更；null=复位；数值=强制 read×(1+p)） */
-  cacheReadInflation?: number | null
-  /** 标准模式钉住 input token 数覆盖更新（省略=不变更；null=复位跟随默认 2；数值=强制,>=1） */
-  anthropicInputTokens?: number | null
+  /** 标准模式 creation 占比覆盖更新 ∈ [0,1]（省略=不变更；null=复位跟随默认 3%；数值=强制） */
+  cacheCreationRatio?: number | null
 }
 
 // ============ 用量统计 ============

@@ -1071,14 +1071,20 @@ impl SseStateManager {
         None
     }
 
-    /// 生成最终事件序列
+    /// 生成最终事件序列。
+    ///
+    /// `cache_creation_5m` / `cache_creation_1h` 是 creation 桶按入站 `cache_control.ttl` 归桶后的
+    /// 5m / 1h 拆分（二者之和 = 总 creation，上报进 `cache_creation.ephemeral_{5m,1h}_input_tokens`；
+    /// 顶层 `cache_creation_input_tokens` 取二者之和以兼容旧字段）。
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
-        cache_creation_input_tokens: i32,
+        cache_creation_5m: i32,
+        cache_creation_1h: i32,
         cache_read_input_tokens: i32,
     ) -> Vec<SseEvent> {
+        let cache_creation_input_tokens = cache_creation_5m + cache_creation_1h;
         let mut events = Vec::new();
 
         // 关闭所有未关闭的块
@@ -1137,8 +1143,8 @@ impl SseStateManager {
                         "cache_creation_input_tokens": cache_creation_input_tokens,
                         "cache_read_input_tokens": cache_read_input_tokens,
                         "cache_creation": {
-                            "ephemeral_5m_input_tokens": cache_creation_input_tokens,
-                            "ephemeral_1h_input_tokens": 0
+                            "ephemeral_5m_input_tokens": cache_creation_5m,
+                            "ephemeral_1h_input_tokens": cache_creation_1h
                         }
                     }
                 }),
@@ -2219,10 +2225,12 @@ impl StreamContext {
         // 当正文吐出会让下游看到伪造的标签碎片。直接走 state_manager 收尾发 `error` 事件。
         if self.state_manager.is_interrupted() {
             let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+            let (creation_5m, creation_1h) = self.cache_usage.creation_split(cache_creation);
             events.extend(self.state_manager.generate_final_events(
                 final_input_tokens,
                 self.output_tokens,
-                cache_creation,
+                creation_5m,
+                creation_1h,
                 cache_read,
             ));
             return events;
@@ -2317,12 +2325,14 @@ impl StreamContext {
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let (creation_5m, creation_1h) = self.cache_usage.creation_split(cache_creation);
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             self.output_tokens,
-            cache_creation,
+            creation_5m,
+            creation_1h,
             cache_read,
         ));
         events
@@ -2413,6 +2423,7 @@ impl BufferedStreamContext {
 
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
         let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let (creation_5m, creation_1h) = self.inner.cache_usage.creation_split(cache_creation);
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
@@ -2427,8 +2438,8 @@ impl BufferedStreamContext {
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                         usage["cache_creation"] = serde_json::json!({
-                            "ephemeral_5m_input_tokens": cache_creation,
-                            "ephemeral_1h_input_tokens": 0
+                            "ephemeral_5m_input_tokens": creation_5m,
+                            "ephemeral_1h_input_tokens": creation_1h
                         });
                     }
                 }
@@ -2565,6 +2576,7 @@ impl GatedStreamContext {
     fn open_gate(&mut self, current_events: Vec<SseEvent>) -> Vec<SseEvent> {
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
         let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let (creation_5m, creation_1h) = self.inner.cache_usage.creation_split(cache_creation);
         for event in &mut self.pre_gate_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
@@ -2573,8 +2585,8 @@ impl GatedStreamContext {
                         usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
                         usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                         usage["cache_creation"] = serde_json::json!({
-                            "ephemeral_5m_input_tokens": cache_creation,
-                            "ephemeral_1h_input_tokens": 0
+                            "ephemeral_5m_input_tokens": creation_5m,
+                            "ephemeral_1h_input_tokens": creation_1h
                         });
                     }
                 }

@@ -76,17 +76,20 @@ pub struct ClientKey {
     /// 值时把 input→read 压回（不碰 creation）。收紧到 1.0 留足检测余量；老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_multiplier_cap: Option<f64>,
-    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的 usage 走真实 Anthropic 口径
-    /// （input 钉小常数、creation 自然占比、read×(1+p) 超报）+ 利润控制器。⚠️ 可被检测判 Abnormal，
-    /// 仅对不跑检测的下游开启。关闭（默认）走检测安全的比例分摊。老数据无此字段时默认 false。
+    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的 usage 走**真实互斥三桶口径**
+    /// （`input + creation + read == total`，绝不超报/双重收费）；利润来自 R 挪桶（read→input）。
+    /// 与关闭（默认）的唯一区别：标准模式**不施加 multiplier_cap 护栏**（接受更高检测风险换 margin）。
+    /// creation 形状由 [`Self::cache_creation_ratio`] 定。老数据无此字段时默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub anthropic_billing_mode: bool,
-    /// 利润控制器·read 膨胀系数 p per-key 覆盖 ≥0（None = 跟随默认 0.2；仅标准模式生效）。
-    /// read_final = read0 × (1+p) 超报便宜的 cache_read（0.1x）出利润。老数据无此字段时为 None。
+    /// 标准模式 creation 占比 per-key 覆盖 ∈ [0,1]（None = 跟随默认 3%）。`creation = cacheable ×
+    /// creation_ratio`，定"每轮写多少缓存"的形状;与 R 正交,二者都不破坏 sum==total。老数据无此字段时 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<f64>,
+    /// **已废弃**（标准模式改互斥口径后不再超报，此字段被忽略）。保留仅为老配置反序列化兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_inflation: Option<f64>,
-    /// Anthropic 标准计费模式下钉住的 input token 数 per-key 覆盖（None = 跟随默认 2；仅标准模式生效）。
-    /// 复现真实 Anthropic 暖缓存 input 为小常数的口径。老数据无此字段时为 None。
+    /// **已废弃**（标准模式改互斥口径后 input 由结构占比折算，不再钉常数）。保留仅为老配置反序列化兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_input_tokens: Option<i32>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
@@ -265,6 +268,7 @@ impl ClientKeyManager {
             cache_read_ratio: None,
             cache_multiplier_cap: None,
             anthropic_billing_mode: false,
+            cache_creation_ratio: None,
             cache_read_inflation: None,
             anthropic_input_tokens: None,
             total_credits: 0.0,
@@ -349,6 +353,7 @@ impl ClientKeyManager {
                     cache_read_ratio: None,
                     cache_multiplier_cap: None,
                     anthropic_billing_mode: false,
+                    cache_creation_ratio: None,
                     cache_read_inflation: None,
                     anthropic_input_tokens: None,
                     total_credits: 0.0,
@@ -411,8 +416,7 @@ impl ClientKeyManager {
         cache_read_ratio: Option<Option<f64>>,
         cache_multiplier_cap: Option<Option<f64>>,
         anthropic_billing_mode: Option<bool>,
-        cache_read_inflation: Option<Option<f64>>,
-        anthropic_input_tokens: Option<Option<i32>>,
+        cache_creation_ratio: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -462,14 +466,9 @@ impl ClientKeyManager {
                 if let Some(v) = anthropic_billing_mode {
                     e.anthropic_billing_mode = v;
                 }
-                if let Some(v) = cache_read_inflation {
-                    // clamp 到 [0, MAX]；Some(None) 清除覆盖、跟随默认 0.2
-                    e.cache_read_inflation = v
-                        .map(|r| r.clamp(0.0, super::super::anthropic::cache_metering::MAX_READ_INFLATION));
-                }
-                if let Some(v) = anthropic_input_tokens {
-                    // clamp 到 >=1；Some(None) 清除覆盖、跟随默认 2
-                    e.anthropic_input_tokens = v.map(|t| t.max(1));
+                if let Some(v) = cache_creation_ratio {
+                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随默认 3%
+                    e.cache_creation_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
                 true
             }
@@ -539,22 +538,13 @@ impl ClientKeyManager {
             .unwrap_or(false)
     }
 
-    /// 返回指定 Key 的 read 膨胀系数 p 覆盖（None = 跟随默认 0.2；Key 不存在时也返回 None）。
-    pub fn cache_read_inflation_of(&self, id: u64) -> Option<f64> {
+    /// 返回指定 Key 的标准模式 creation 占比覆盖（None = 跟随默认 3%；Key 不存在时也返回 None）。
+    pub fn cache_creation_ratio_of(&self, id: u64) -> Option<f64> {
         self.inner
             .read()
             .entries
             .get(&id)
-            .and_then(|e| e.cache_read_inflation)
-    }
-
-    /// 返回指定 Key 标准模式钉住的 input token 数覆盖（None = 跟随默认 2；Key 不存在时也返回 None）。
-    pub fn anthropic_input_tokens_of(&self, id: u64) -> Option<i32> {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .and_then(|e| e.anthropic_input_tokens)
+            .and_then(|e| e.cache_creation_ratio)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -842,7 +832,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         assert!(mgr.cache_enabled_of(entry.id));
     }
@@ -869,7 +858,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -884,7 +872,6 @@ mod tests {
             None,
             None,
             Some(Some(0)),
-            None,
             None,
             None,
             None,
