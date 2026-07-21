@@ -46,7 +46,13 @@ interface SelectContentProps
 
 const SelectContext = React.createContext<SelectContextValue | null>(null)
 const SelectDisabledContext = React.createContext(false)
-const SelectGroup = DropdownMenuPrimitive.Group
+const SelectGroup = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Group>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Group>
+>((props, ref) => (
+  <DropdownMenuPrimitive.Group ref={ref} data-slot="select-group" {...props} />
+))
+SelectGroup.displayName = 'SelectGroup'
 
 function useSelectContext() {
   const ctx = React.useContext(SelectContext)
@@ -86,7 +92,7 @@ function Select({ value, onValueChange, disabled, children }: SelectProps) {
 
   return (
     <SelectContext.Provider value={contextValue}>
-      <DropdownMenuPrimitive.Root modal={false}>
+      <DropdownMenuPrimitive.Root modal={false} data-slot="select">
         <SelectDisabledContext.Provider value={disabled ?? false}>
           {children}
         </SelectDisabledContext.Provider>
@@ -100,7 +106,7 @@ function SelectValue({ placeholder }: { placeholder?: React.ReactNode }) {
   const { value, labels } = useSelectContext()
   const label = value === undefined ? undefined : labels.get(value)
   if (label === undefined || label === null || label === '') {
-    return <span className="text-muted-foreground">{placeholder}</span>
+    return <span data-slot="select-value" className="text-muted-foreground">{placeholder}</span>
   }
   return <>{label}</>
 }
@@ -124,6 +130,7 @@ const SelectTrigger = React.forwardRef<
   return (
     <DropdownMenuPrimitive.Trigger
       ref={triggerRef}
+      data-slot="select-trigger"
       disabled={disabled}
       className={cn(
         'flex h-8 w-full items-center justify-between gap-2 rounded-md border border-border/70 bg-background px-2.5 text-[13px]',
@@ -152,6 +159,7 @@ const SelectContent = React.forwardRef<
     <DropdownMenuPrimitive.Portal container={container ?? dialog ?? undefined}>
       <DropdownMenuPrimitive.Content
         ref={ref}
+        data-slot="select-content"
         sideOffset={sideOffset}
         className={cn(
           'z-50 max-h-72 min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-2xl border border-border/60 bg-popover/90 p-1.5 text-popover-foreground shadow-apple-lg backdrop-blur-2xl backdrop-saturate-150',
@@ -173,6 +181,7 @@ const SelectLabel = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DropdownMenuPrimitive.Label
     ref={ref}
+    data-slot="select-label"
     className={cn(
       'px-2.5 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground',
       className
@@ -192,6 +201,7 @@ const SelectItem = React.forwardRef<
   return (
     <DropdownMenuPrimitive.Item
       ref={ref}
+      data-slot="select-item"
       onSelect={() => onValueChange?.(value)}
       className={cn(
         'relative flex cursor-default select-none items-center rounded-lg py-1.5 pl-7 pr-2.5 text-sm outline-none transition-colors',
@@ -201,7 +211,7 @@ const SelectItem = React.forwardRef<
       {...props}
     >
       {isSelected && (
-        <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+        <span data-slot="select-item-indicator" className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
           <Check className="h-4 w-4" />
         </span>
       )}

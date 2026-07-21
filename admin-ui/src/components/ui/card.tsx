@@ -7,6 +7,7 @@ const Card = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <div
     ref={ref}
+    data-slot="card"
     className={cn(
       'rounded-2xl border border-border/60 bg-card/80 backdrop-blur-xl backdrop-saturate-150 text-card-foreground shadow-apple transition-all duration-200 ease-apple',
       className
@@ -20,7 +21,7 @@ const CardHeader = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
 >(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn('flex flex-col space-y-1.5 p-5', className)} {...props} />
+  <div ref={ref} data-slot="card-header" className={cn('flex flex-col space-y-1.5 p-5', className)} {...props} />
 ))
 CardHeader.displayName = 'CardHeader'
 
@@ -30,6 +31,7 @@ const CardTitle = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <h3
     ref={ref}
+    data-slot="card-title"
     className={cn('text-base font-semibold leading-tight tracking-tight', className)}
     {...props}
   />
@@ -40,7 +42,7 @@ const CardDescription = React.forwardRef<
   HTMLParagraphElement,
   React.HTMLAttributes<HTMLParagraphElement>
 >(({ className, ...props }, ref) => (
-  <p ref={ref} className={cn('text-sm text-muted-foreground', className)} {...props} />
+  <p ref={ref} data-slot="card-description" className={cn('text-sm text-muted-foreground', className)} {...props} />
 ))
 CardDescription.displayName = 'CardDescription'
 
@@ -48,7 +50,7 @@ const CardContent = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
 >(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn('p-5 pt-0', className)} {...props} />
+  <div ref={ref} data-slot="card-content" className={cn('p-5 pt-0', className)} {...props} />
 ))
 CardContent.displayName = 'CardContent'
 
@@ -56,7 +58,7 @@ const CardFooter = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
 >(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn('flex items-center p-5 pt-0', className)} {...props} />
+  <div ref={ref} data-slot="card-footer" className={cn('flex items-center p-5 pt-0', className)} {...props} />
 ))
 CardFooter.displayName = 'CardFooter'
 
