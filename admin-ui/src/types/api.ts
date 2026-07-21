@@ -125,14 +125,18 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: string
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   clientId?: string
   clientSecret?: string
   startUrl?: string
+  /** 企业 SSO (external_idp) 的 OAuth2 Token 端点（external_idp 必填） */
   tokenEndpoint?: string
+  /** 企业 SSO 的 OIDC Issuer URL（可选） */
   issuerUrl?: string
+  /** 企业 SSO 授予的 scopes（空格分隔，可选） */
   scopes?: string
+  /** KAM 账号级 userId（承载 Azure 租户，后端据此派生 external_idp 端点） */
   userId?: string
   priority?: number
   authRegion?: string
@@ -367,8 +371,6 @@ export interface StartSocialLoginRequest {
   email?: string
   proxyUrl?: string
   authEndpoint?: string
-  /** OAuth 回调公网地址（远程模式），由 API 客户端按当前访问地址自动派生，调用方一般无需填写 */
-  callbackBaseUrl?: string
 }
 
 /** 远程访问时手动完成 Social 登录：从浏览器地址栏粘贴的回调 URL 中提取参数 */
@@ -383,9 +385,6 @@ export interface StartSocialLoginResponse {
   sessionId: string
   portalUrl: string
   expiresAt: string
-  /** 是否处于远程回调模式（服务端已配置 callbackBaseUrl）。
-   *  true 时 OAuth 回调指向公网路由，前端可自动轮询完成。 */
-  remote: boolean
 }
 
 export type PollSocialLoginResponse = PollIdcLoginResponse
@@ -426,7 +425,7 @@ export interface ClientKeyItem {
   cacheCreationRatio?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
-  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
 }
 

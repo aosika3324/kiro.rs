@@ -18,7 +18,7 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -49,6 +49,10 @@ interface CredentialInput {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  // 企业 SSO (external_idp)
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
 }
 
 interface VerificationResult {
@@ -312,37 +316,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
-          const rawAuthMethod = cred.authMethod?.trim()
-          const authMethod = tokenEndpoint
-            ? 'external_idp'
-            : rawAuthMethod
-              ? rawAuthMethod
-              : clientId && clientSecret
-                ? 'idc'
-                : 'social'
-          const normalizedAuthMethod = authMethod.toLowerCase().replace(/[-_]/g, '')
-
-          if (normalizedAuthMethod === 'idc' && (!clientId || !clientSecret)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'idc 模式需要同时提供 clientId 和 clientSecret',
-            })
+          const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
+            tokenEndpoint,
+            clientId,
+            clientSecret,
+          })
+          if (authError) {
+            updateResult(i, { status: 'failed', error: authError })
             continue
           }
-          if (normalizedAuthMethod === 'externalidp' && (!clientId || !tokenEndpoint)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint',
-            })
-            continue
-          }
-          if (normalizedAuthMethod !== 'idc' && normalizedAuthMethod !== 'externalidp' && (clientId || clientSecret)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'social 模式不应携带 clientId/clientSecret；企业 SSO 请提供 tokenEndpoint',
-            })
-            continue
-          }
+          const isExternalIdp = authMethod === 'external_idp'
 
           toImport.push({
             index: i,
@@ -352,7 +335,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               profileArn: cred.profileArn?.trim() || undefined,
               expiresAt: normalizeExpiresAt(cred.expiresAt),
               authMethod,
-              provider: cred.provider?.trim() || undefined,
+              provider: cred.provider?.trim() || (isExternalIdp ? 'AzureAD' : undefined),
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               startUrl: cred.startUrl?.trim() || undefined,
@@ -360,7 +343,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               issuerUrl: cred.issuerUrl?.trim() || undefined,
               scopes: cred.scopes?.trim() || undefined,
               clientId,
-              clientSecret,
+              // external_idp 为公共客户端，不携带 clientSecret
+              clientSecret: isExternalIdp ? undefined : clientSecret,
+              tokenEndpoint,
+              issuerUrl: cred.issuerUrl?.trim() || undefined,
+              scopes: cred.scopes?.trim() || undefined,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
@@ -536,7 +523,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 { "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n企业 SSO external_idp: [{"refreshToken":"...","accessToken":"...","authMethod":"external_idp","clientId":"...","tokenEndpoint":"...","issuerUrl":"...","scopes":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion；字段支持 camelCase / snake_case'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 { "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n企业 SSO external_idp: [{"refreshToken":"...","accessToken":"...","authMethod":"external_idp","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","issuerUrl":"...","scopes":"...","region":"eu-central-1"}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion；字段支持 camelCase / snake_case'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

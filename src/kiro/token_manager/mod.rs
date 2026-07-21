@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
@@ -146,6 +147,13 @@ pub(crate) async fn refresh_token(
 
     validate_refresh_token(credentials)?;
 
+    // 企业 SSO (external_idp) 走 IdP token 端点刷新（refresh_token grant，public client），
+    // 而非 AWS SSO OIDC / Social 端点。必须在下面的 idc/social 自动判断之前分流：
+    // external_idp 有 clientId 但无 clientSecret，落到自动判断会被误判为 social。
+    if credentials.is_external_idp_credential() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
+
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
@@ -205,8 +213,14 @@ async fn refresh_social_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -301,8 +315,14 @@ async fn refresh_idc_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -404,8 +424,16 @@ async fn refresh_external_idp_token(
         .await?;
 
     let status = response.status();
+    // rate-limit 全链路透传：上游 429 携带 Retry-After 时直接把限流信号返回给调用方。
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
+
         if status.as_u16() == 400
             && (body_text.contains("\"invalid_grant\"")
                 || body_text.contains("Invalid refresh token provided"))
@@ -505,6 +533,19 @@ fn rest_api_region_candidates_with(sso_region: &str, fallback_csv: Option<&str>)
     candidates
 }
 
+fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
+    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
+    // only for the streaming endpoint and makes this legacy request malformed.
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    )
+}
+
+fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
+    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -534,12 +575,6 @@ pub(crate) async fn get_usage_limits(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -552,15 +587,15 @@ pub(crate) async fn get_usage_limits(
     let mut last_error: Option<String> = None;
     let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
+        // 区域路由（fork 特性）：external_idp 走 Microsoft/Entra 主机族，其余走 q.{region}。
         let host = if is_external_idp {
             crate::kiro::model::credentials::external_idp_host(region)
         } else {
             format!("q.{}.amazonaws.com", region)
         };
-        let url = format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
-            host, profile_arn_query
-        );
+        // URL 构造采用上游修复：这些 REST 调用不再附带 profileArn（Kiro 0.9.2 上会被判为
+        // malformed request），profileArn 仅用于流式端点。
+        let url = usage_limits_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -597,12 +632,17 @@ pub(crate) async fn get_usage_limits(
         };
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403（权限/区域）或 400（区域与 profileArn 不匹配时上游报 "Improperly formed
         // request"）且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC/external_idp 跨区兼容）。
@@ -656,12 +696,6 @@ pub(crate) async fn get_available_models(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -674,15 +708,14 @@ pub(crate) async fn get_available_models(
     let mut last_error: Option<String> = None;
     let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
+        // 区域路由（fork 特性）：external_idp 走 Microsoft/Entra 主机族，其余走 q.{region}。
         let host = if is_external_idp {
             crate::kiro::model::credentials::external_idp_host(region)
         } else {
             format!("q.{}.amazonaws.com", region)
         };
-        let url = format!(
-            "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
-            host, profile_arn_query
-        );
+        // URL 构造采用上游修复：不再附带 profileArn（避免 Kiro 0.9.2 判为 malformed）。
+        let url = available_models_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -719,12 +752,17 @@ pub(crate) async fn get_available_models(
         };
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: ListAvailableModelsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -841,6 +879,8 @@ pub(crate) async fn list_available_profiles(
             }
         };
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
         if status.is_success() {
             let data: ListAvailableProfilesResponse = response.json().await?;
@@ -853,6 +893,9 @@ pub(crate) async fn list_available_profiles(
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -958,11 +1001,16 @@ pub(crate) async fn set_user_preference(
         };
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             return Ok(());
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -1733,7 +1781,7 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
-    /// 获取指定分组的凭据总数（group=None 时等于 total_count）
+    /// 获取指定分组的凭据总数（group=None 时等于 total_count，即返回全部凭据数）
     ///
     /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
     pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
@@ -2191,17 +2239,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
-                        if self.try_reload_credential_from_file(id) {
-                            // 找到新 Token，不计入失败次数，直接重试
-                            continue;
-                        }
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
-                    } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                        self.report_refresh_failure(id)
+                    let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
+                        // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
+                        continue;
                     };
                     attempt_count += 1;
                     if !has_available {
@@ -2209,6 +2249,34 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 分类并记录一次 Token 刷新错误。
+    ///
+    /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
+    /// `refresh_failure_count`。`Ok(None)` 表示已从源文件加载到轮换后的 Token，调用方
+    /// 应使用同一凭据立即重试；`Ok(Some(_))` 返回记录失败后是否仍有可用凭据。
+    fn handle_token_refresh_error(
+        &self,
+        id: u64,
+        error: anyhow::Error,
+    ) -> anyhow::Result<Option<bool>> {
+        if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
+            tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
+            return Err(error);
+        }
+
+        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）。
+            if self.try_reload_credential_from_file(id) {
+                return Ok(None);
+            }
+            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, error);
+            Ok(Some(self.report_refresh_token_invalid(id)))
+        } else {
+            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
+            Ok(Some(self.report_refresh_failure(id)))
         }
     }
 
@@ -2365,7 +2433,13 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
+        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
+        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
+        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+        // 注：persist_lock 全仓仅此一处获取，且顺序恒为 persist_lock → entries.lock，无死锁。
+        let _write_guard = self.persist_lock.lock();
+
+        // 收集所有凭据（在 persist_lock 保护下拍快照，保证与随后的写盘原子）
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -2389,14 +2463,20 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
-        let _write_guard = self.persist_lock.lock();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+        // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
+        let tmp = path.with_extension("json.tmp");
+        let write_atomic = || -> std::io::Result<()> {
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, path)
+        };
+        let write_result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(write_atomic)
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_atomic()
+        };
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp); // 清理可能残留的临时文件
+            return Err(e).with_context(|| format!("回写凭据文件失败: {:?}", path));
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -3099,8 +3179,14 @@ impl MultiTokenManager {
     /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
     /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
     ///
-    /// 返回剩余可用凭据数（已排除冷却中的）。
-    pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
+    /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
+    pub fn report_account_throttled_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
         let now = Instant::now();
         {
             let mut entries = self.entries.lock();
@@ -3125,10 +3211,8 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e
-                            .throttled_until
-                            .map(|t| t > throttled_now)
-                            .unwrap_or(false)
+                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
                 })
                 .count()
         }
@@ -3136,7 +3220,7 @@ impl MultiTokenManager {
 
     /// 报告指定凭据触发"单账号请求速率超限"（429 USER_REQUEST_RATE_EXCEEDED）。
     ///
-    /// 与 [`Self::report_account_throttled`] 共用 `throttled_until` 排除通路（被冷却的凭据
+    /// 与 [`Self::report_account_throttled_for_request`] 共用 `throttled_until` 排除通路（被冷却的凭据
     /// 不再参与 `ranked_available_credentials` 调度），但用**短冷却**、且**不计入失败统计**：
     /// 速率超限是调度路由问题（对同一账号发太快），不是账号故障，冷却结束即恢复，
     /// 不应污染 `total_failure_count` 或推动禁用。
@@ -3336,8 +3420,6 @@ impl MultiTokenManager {
         self.save_stats();
         Ok(count)
     }
-
-
 
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
@@ -3624,7 +3706,7 @@ mod tests {
         assert!(result.is_ok());
         let id = result.unwrap();
         assert!(id > 0);
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -3708,7 +3790,7 @@ mod tests {
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -3724,7 +3806,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -3765,7 +3847,7 @@ mod tests {
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
         let manager = result.unwrap();
-        assert_eq!(manager.total_count(), 0);
+        assert_eq!(manager.snapshot().total, 0);
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -3801,7 +3883,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
 
@@ -3815,7 +3897,7 @@ mod tests {
         cred.kiro_api_key = Some("ksk_test123".to_string());
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -3923,6 +4005,30 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn refresh_rate_limit_does_not_disable_or_increment_failure_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
+        let returned = manager
+            .handle_token_refresh_error(1, error)
+            .expect_err("429 应立即返回给调用方");
+
+        assert!(returned.downcast_ref::<UpstreamRateLimitError>().is_some());
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.disabled);
+        assert_eq!(entry.disabled_reason, None);
     }
 
     #[test]
@@ -4479,6 +4585,26 @@ mod tests {
     }
 
     #[test]
+    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+        );
+    }
+
+    #[test]
     fn test_credential_region_empty_string_treated_as_set() {
         // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
         let mut config = Config::default();
@@ -4840,6 +4966,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// issue #23 修复：persist_credentials 原子落盘——写盘成功、内容为合法 JSON、
+    /// 且不残留临时文件（tmp+rename）。
+    #[test]
+    fn persist_credentials_writes_atomically_no_tmp_residue() {
+        let path = tmp_creds_path("persist_atomic");
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("tok_aaaa".repeat(5));
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.persist_credentials().unwrap(), "persist 应写盘成功");
+
+        // 文件为合法 JSON 数组
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_array(), "凭据文件应为 JSON 数组");
+        // 原子落盘后不应残留临时文件
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ===== 账号分组隔离回归测试 =====
 
     /// 构造一个带 token、属于指定分组的可用凭据
@@ -5177,6 +5334,46 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_available_count_for_request_respects_group_throttle() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(1)
+        );
+        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                None,
+                Some("g1"),
+            ),
+            0
+        );
+        assert!(manager.select_next_credential(None, Some("g1")).is_none());
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g2"))
+                .map(|(id, _)| id),
+            Some(2)
+        );
+        assert_eq!(manager.snapshot().available, 1);
     }
 
     #[test]

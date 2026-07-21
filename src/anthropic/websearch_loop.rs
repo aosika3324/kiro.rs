@@ -26,21 +26,39 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
-use super::stream::SseEvent;
+use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
 
+/// A valid assistant turn after a tool result must contain either visible text or
+/// another client tool call. Kiro occasionally closes a successful upstream stream
+/// without either, which used to be serialized as `end_turn` and made Codex mark an
+/// unfinished task complete. Retry once before surfacing an upstream error.
+const MAX_EMPTY_TOOL_RESULT_RETRIES: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyToolResultDisposition {
+    Accept,
+    Retry,
+    Fail,
+}
+
 /// Result of buffer-decoding one round of the upstream response
 struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
+    /// Accumulated thinking / reasoning text (Kiro reasoningContentEvent).
+    /// Surfaced out-of-band via render_json's `kiro_thinking` so Anthropic
+    /// clients never see (and never replay) an unsigned thinking block.
+    thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
-    tool_uses: Vec<DecodedToolUse>,
+    tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
     context_input_tokens: Option<i32>,
     /// Cumulative credits from meteringEvent
@@ -61,30 +79,59 @@ struct RoundOutcome {
     tool_name_map: std::collections::HashMap<String, String>,
 }
 
-/// A fully decoded tool_use
-struct DecodedToolUse {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-impl DecodedToolUse {
-    fn query(&self) -> String {
-        self.input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
+/// 提取工具调用入参里的 `query` 字段（web_search 专用便捷函数）。
+fn tool_query(tu: &CompletedToolUse) -> String {
+    tu.input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Decides whether this round should keep searching (enter the next loop round)
 ///
 /// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
 /// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
-fn should_search_round(round_idx: usize, tool_uses: &[DecodedToolUse]) -> bool {
-    let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
+fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
+    let only_web_search =
+        !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
+}
+
+/// Whether the request is the continuation immediately following a tool result.
+fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
+    let Some(last) = payload.messages.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false;
+    }
+    last.content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    })
+}
+
+/// Decide how to handle a successful upstream round after tool output. Reasoning
+/// by itself is intentionally not enough: Codex needs either assistant text (a
+/// real final answer) or a client tool call to keep the task lifecycle sound.
+fn empty_tool_result_disposition(
+    payload: &MessagesRequest,
+    round: &RoundOutcome,
+    retries: usize,
+) -> EmptyToolResultDisposition {
+    let is_invalid_empty_continuation = last_message_has_tool_result(payload)
+        && round.text.trim().is_empty()
+        && round.tool_uses.is_empty()
+        && round.stop_reason_override.is_none();
+    if !is_invalid_empty_continuation {
+        EmptyToolResultDisposition::Accept
+    } else if retries < MAX_EMPTY_TOOL_RESULT_RETRIES {
+        EmptyToolResultDisposition::Retry
+    } else {
+        EmptyToolResultDisposition::Fail
+    }
 }
 
 /// Buffer-decode one round of the upstream streaming response
@@ -97,11 +144,12 @@ async fn decode_round(
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
+    let mut thinking = String::new();
     // id -> (name, json_buffer), preserving the order of appearance
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<DecodedToolUse> = Vec::new();
+    let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
@@ -133,6 +181,11 @@ async fn decode_round(
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::ReasoningContent(r) => {
+                    if let Some(t) = &r.text {
+                        thinking.push_str(t);
+                    }
+                }
                 Event::ToolUse(tu) => {
                     let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
                         order.push(tu.tool_use_id.clone());
@@ -173,17 +226,17 @@ async fn decode_round(
                     json!({})
                 })
             };
-            let original_name = tool_name_map.get(&name).cloned().unwrap_or(name);
-            tool_uses.push(DecodedToolUse {
-                id,
-                name: original_name,
-                input,
-            });
+            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
+            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
         }
     }
 
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
+    let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
+
     RoundOutcome {
         text,
+        thinking,
         tool_uses,
         context_input_tokens,
         credits,
@@ -205,9 +258,14 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    // 转换 + 整体 payload 字节上限（与 /v1、/cc 同款防线；转换前裁剪，配对清理转换时兜底）。
+    // fork：转换 + 整体 payload 字节上限（与 /v1、/cc 同款防线；转换前裁剪，配对清理转换时兜底）。
     // run_round 以不可变借用持有 payload，这里克隆一份可变本地副本用于裁剪转换。
+    // CONCERN（见文末汇报）：convert_within_limit 内部走 convert_request（ClaudeCode 默认档），
+    // 未透传 tool_compatibility_mode；若要在本路径支持 Raw / Codex 自定义工具桥接，需让
+    // payload_truncate 也接受 mode（属另一文件，超出本次 4 文件范围）。此处保留裁剪防线优先。
+    let _ = tool_compatibility_mode; // 暂未用于裁剪路径（见上）；保留形参以对齐调用方与未来透传。
     let mut local_payload = payload.clone();
     let conversion = match super::payload_truncate::convert_within_limit(
         &mut local_payload,
@@ -222,6 +280,10 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
+                ConversionError::UnsupportedToolMapping(reason) => (
+                    "invalid_request_error",
+                    format!("unsupported tool mapping: {}", reason),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err(
@@ -302,9 +364,7 @@ fn append_search_round(
         assistant_content.push(json!({"type": "text", "text": round.text}));
     }
     for tu in &round.tool_uses {
-        assistant_content.push(json!({
-            "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-        }));
+        assistant_content.push(tu.to_anthropic_block());
     }
     payload.messages.push(Message {
         role: "assistant".to_string(),
@@ -314,7 +374,7 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tu.query();
+        let query = tool_query(tu);
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
@@ -368,8 +428,8 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
 /// as a raw tool_use": every flush path partitions first, then handles each
 /// group differently (web_search -> presentation blocks, client tools -> raw).
 fn partition_tool_uses(
-    tool_uses: &[DecodedToolUse],
-) -> (Vec<&DecodedToolUse>, Vec<&DecodedToolUse>) {
+    tool_uses: &[CompletedToolUse],
+) -> (Vec<&CompletedToolUse>, Vec<&CompletedToolUse>) {
     let mut web = Vec::new();
     let mut client = Vec::new();
     for tu in tool_uses {
@@ -451,7 +511,7 @@ fn canonical_input_key(input: &Value) -> String {
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
-    tool_uses: &[DecodedToolUse],
+    tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
@@ -511,7 +571,7 @@ fn build_flush_content(
         if tu.name == "web_search" {
             // INVARIANT: present as server_tool_use + web_search_tool_result,
             // never as a raw tool_use.
-            let query = tu.query();
+            let query = tool_query(tu);
             let (srv_id, _mcp) = websearch::create_mcp_request(&query);
             content.push(json!({
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
@@ -524,9 +584,7 @@ fn build_flush_content(
             }));
         } else {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
-            content.push(json!({
-                "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-            }));
+            content.push(tu.to_anthropic_block());
         }
     }
     content
@@ -541,6 +599,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         &payload.model,
@@ -553,31 +612,87 @@ pub(super) async fn run_web_search_loop(
     let mut last_credential_id: u64 = 0;
     let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
+    let mut all_thinking = String::new();
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (round, credential_id) = match run_round(
-            &provider,
-            &payload,
-            &hook,
-            fallback_input_tokens,
-            group.as_deref(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(resp) => return resp,
+        let mut empty_retries = 0usize;
+        let round = loop {
+            let (round, credential_id) =
+                match run_round(
+                    &provider,
+                    &payload,
+                    &hook,
+                    fallback_input_tokens,
+                    group.as_deref(),
+                    tool_compatibility_mode,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
+                };
+            last_credential_id = credential_id;
+            last_context_input = round.context_input_tokens.or(last_context_input);
+            total_credits += round.credits;
+
+            match empty_tool_result_disposition(&payload, &round, empty_retries) {
+                EmptyToolResultDisposition::Accept => {}
+                EmptyToolResultDisposition::Retry => {
+                    empty_retries += 1;
+                    tracing::warn!(
+                        round = round_idx,
+                        retry = empty_retries,
+                        "upstream returned an empty assistant turn after tool_result; retrying"
+                    );
+                    continue;
+                }
+                EmptyToolResultDisposition::Fail => {
+                    let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+                    hook.record(
+                        last_credential_id,
+                        final_input,
+                        0,
+                        0,
+                        0,
+                        total_credits,
+                        "error",
+                    );
+                    tracing::error!(
+                        round = round_idx,
+                        "upstream repeated an empty assistant turn after tool_result"
+                    );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new(
+                            "upstream_error",
+                            "Upstream returned no assistant text or tool call after a tool result."
+                                .to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Only surface reasoning from the accepted attempt. An empty attempt is
+            // discarded and retried, so replaying its hidden reasoning would duplicate
+            // or contradict the successful attempt's summary.
+            if !round.thinking.is_empty() {
+                if !all_thinking.is_empty() {
+                    all_thinking.push_str("\n\n");
+                }
+                all_thinking.push_str(&round.thinking);
+            }
+
+            break round;
         };
-        last_credential_id = credential_id;
-        last_context_input = round.context_input_tokens.or(last_context_input);
-        total_credits += round.credits;
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
@@ -615,8 +730,8 @@ pub(super) async fn run_web_search_loop(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
+                match websearch::call_mcp_api(&provider, &mcp_request, group.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         // Same pass-through discipline as the continue branch: a failed
@@ -682,6 +797,7 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                &all_thinking,
             )
         };
     }
@@ -707,14 +823,21 @@ pub(super) async fn run_web_search_loop(
 }
 
 /// Single JSON response (non-streaming)
-fn render_json(
+///
+/// `thinking`: optional out-of-band reasoning text. Emitted as a TOP-LEVEL
+/// `kiro_thinking` field (NOT a content block): Anthropic clients ignore
+/// unknown top-level fields and thus never replay an unsigned thinking block
+/// upstream, while the Responses translator picks it up for codex's
+/// reasoning-summary display.
+pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    thinking: &str,
 ) -> Response {
-    let body = json!({
+    let mut body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -733,11 +856,14 @@ fn render_json(
             }
         }
     });
+    if !thinking.is_empty() {
+        body["kiro_thinking"] = json!(thinking);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
 /// SSE response (streaming): splits the final content into a sequence of Anthropic content_block events
-fn render_sse(
+pub(crate) fn render_sse(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
@@ -889,8 +1015,8 @@ mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
 
-    fn tu(name: &str) -> DecodedToolUse {
-        DecodedToolUse {
+    fn tu(name: &str) -> CompletedToolUse {
+        CompletedToolUse {
             id: format!("toolu_{}", name),
             name: name.to_string(),
             input: json!({"query": "rust 2026"}),
@@ -930,8 +1056,134 @@ mod tests {
     #[test]
     fn round_with_no_tool_use_does_not_enter_loop() {
         // Skip: no tool_use at all (plain-text answer) -> terminate
-        let empty: Vec<DecodedToolUse> = vec![];
+        let empty: Vec<CompletedToolUse> = vec![];
         assert!(!should_search_round(0, &empty));
+    }
+
+    fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
+        RoundOutcome {
+            text: text.to_string(),
+            thinking: String::new(),
+            tool_uses,
+            context_input_tokens: None,
+            credits: 0.0,
+            stop_reason_override: None,
+            stream_error: false,
+            known_tool_names: std::collections::HashSet::new(),
+            tool_name_map: std::collections::HashMap::new(),
+        }
+    }
+
+    fn payload_with_last_block(block: Value) -> MessagesRequest {
+        MessagesRequest {
+            model: "gpt-5.6-terra".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([block]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn empty_round_after_tool_result_retries_once_then_fails() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Retry
+        );
+        assert_eq!(
+            empty_tool_result_disposition(
+                &payload,
+                &round_outcome("", vec![]),
+                MAX_EMPTY_TOOL_RESULT_RETRIES,
+            ),
+            EmptyToolResultDisposition::Fail
+        );
+    }
+
+    #[test]
+    fn text_or_tool_call_after_tool_result_is_not_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("finished", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![tu("exec")]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn empty_initial_round_is_not_misclassified_as_tool_continuation() {
+        let payload = payload_with_last_block(json!({"type": "text", "text": "hello"}));
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn whitespace_and_reasoning_only_after_tool_result_is_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        let mut round = round_outcome(" \n\t", vec![]);
+        round.thinking = "hidden reasoning without a client-visible continuation".to_string();
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round, 0),
+            EmptyToolResultDisposition::Retry
+        );
+    }
+
+    #[test]
+    fn terminal_limit_reason_after_tool_result_is_not_retried() {
+        let payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        let mut round = round_outcome("", vec![]);
+        round.stop_reason_override = Some("max_tokens".to_string());
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round, 0),
+            EmptyToolResultDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn only_the_last_message_determines_tool_continuation() {
+        let mut payload = payload_with_last_block(json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "done"
+        }));
+        payload.messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{"type": "text", "text": "new user turn"}]),
+        });
+        assert_eq!(
+            empty_tool_result_disposition(&payload, &round_outcome("", vec![]), 0),
+            EmptyToolResultDisposition::Accept
+        );
     }
 
     #[test]
@@ -1537,7 +1789,7 @@ mod tests {
         // The reclaimed-from-text tool_use must be suppressed when an identical
         // (name + canonical input) structured tool_use already exists in this round.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf build</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_dup".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "rm -rf build"}),
@@ -1566,7 +1818,7 @@ mod tests {
         // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
         // different input than the structured one is a distinct action and must be kept.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_other".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "pwd"}),

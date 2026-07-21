@@ -27,6 +27,9 @@ mod converter;
 pub use converter::{is_passthrough_upstream_model, map_model};
 pub(crate) mod handlers;
 pub mod middleware;
+// 上游 v0.7.1 引入的 OpenAI / Responses 兼容模块
+mod openai;
+mod responses;
 mod payload_truncate;
 mod prompt_filter;
 pub mod response_cache;

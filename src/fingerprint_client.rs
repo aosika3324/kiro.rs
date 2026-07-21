@@ -106,6 +106,17 @@ impl UpstreamResponse {
         }
     }
 
+    /// 响应头。reqwest 0.12 与 wreq 5 均依赖同一份 `http` 1.x（Cargo.lock 中 http 唯一
+    /// 版本），两侧 `.headers()` 都返回 `&http::HeaderMap`，可直接喂给上游限流传播
+    /// （`UpstreamRateLimitError::from_headers(&http::HeaderMap)`），无需转换。
+    pub fn headers(&self) -> &http::HeaderMap {
+        match self {
+            UpstreamResponse::Reqwest(r) => r.headers(),
+            #[cfg(feature = "tls-fingerprint")]
+            UpstreamResponse::Wreq(r) => r.headers(),
+        }
+    }
+
     /// 读取整个响应体为字符串（错误统一为 `anyhow`）。
     pub async fn text(self) -> anyhow::Result<String> {
         match self {

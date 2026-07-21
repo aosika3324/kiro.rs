@@ -97,9 +97,7 @@ async fn main() {
         "已选定主凭证"
     );
 
-    // apiKey 仅用于首次启动时 bootstrap 第一条客户端 Key；
-    // 后续 /v1 认证全部走客户端 Key 系统。adminApiKey 仍是管理面板登录密钥。
-    let bootstrap_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
+    let configured_api_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -272,12 +270,10 @@ async fn main() {
         });
     }
 
-    // 每次启动幂等确保 config.apiKey 对应的系统 Key 存在（不可删除 / 不可轮换）。
-    // 老部署升级时会把已有的 apiKey 补成系统 Key，保证根密钥始终可用于 /v1 流量。
-    if let Some(initial_key) = bootstrap_key.as_ref() {
-        client_key_manager.ensure_system_key(
+    if let Some(initial_key) = configured_api_key.as_ref() {
+        client_key_manager.sync_system_key(
             "默认密钥".to_string(),
-            Some("由 config.json apiKey 自动导入（系统密钥）".to_string()),
+            Some("由 config.json apiKey 自动同步（系统密钥）".to_string()),
             initial_key.clone(),
         );
     }
@@ -308,6 +304,7 @@ async fn main() {
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
+        config.tool_compatibility_mode,
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
@@ -410,7 +407,7 @@ async fn main() {
 
 /// 文件不存在时初始化配置/凭证文件
 ///
-/// - `config.json`：写入带随机 `apiKey`（首次启动自动导入为第一条客户端 Key）/ `adminApiKey`（管理面板登录密钥）
+/// - `config.json`：写入带随机 `apiKey`（每次启动同步为系统 Key）/ `adminApiKey`（管理面板登录密钥）
 ///   的最小默认配置；`host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
 /// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
 ///

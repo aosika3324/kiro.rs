@@ -4,245 +4,166 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.6.17] - 2026-06-25
+## [0.7.1] - 2026-07-15
 
-主题：**工具调用三连修 —— 参数类型还原 + tool_use/tool_result 邻接校验 + SSE 不压缩（Caddy）**。
+主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。
 
-### 🐛 修复 — Invalid tool parameters（工具参数被全字符串化）
+> 来源：[PR #39](https://github.com/ZyphrZero/kiro.rs/pull/39)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
 
-- `<invoke>` 文本回收路径 `parse_invoke_block` 此前把**每个参数值无条件塞成字符串**：
-  `{"offset":50}` → `{"offset":"50"}`、`true` → `"true"`、`[1,2,3]` → `"[1,2,3]"`。
-  客户端（Claude Code）拿自己的原始 schema 本地校验时类型不符 → "Invalid tool parameters"。
-- 修复：新增 `coerce_param_value` 启发式——值当 JSON 解析，仅当是 number/bool/null/array/object
-  时按类型还原；裸字符串、前导零编号（`007`）、带引号字面量、路径、多行文本一律保留为字符串，
-  保守取舍只在"明确非字符串结构"时改类型，最大还原而不误伤。仅影响文本泄漏回收路径，
-  结构化 `toolUseEvent` 路径本就保真、不受影响。
+### ✨ 新功能 — Codex CLI 完整工具桥接
 
-### 🐛 修复 — TOOL_USE_RESULT_MISMATCH 400（tool_result 结果非邻接）
+- **请求方向收集工具声明**：同时从 `req.tools`（顶层）和 `additional_tools` input item（Codex 0.144 把工具声明放在此处）收集工具定义，合并转换后转发给上游模型，不再忽略 Codex 的真实工具。
+- **区分 `function` 与 `custom` 工具类型**：Codex 要求应答 item 类型与声明严格一致（否则抛出 "tool invoked with incompatible payload" 并终止本轮）。`function` 类型（shell / MCP / view_image 等）→ 应答 `function_call`（JSON arguments）；`custom` 类型（apply_patch / code-mode exec 等自由文本工具）→ 应答 `custom_tool_call`（原始字符串 input）。每请求维护一张 `ToolKindMap`，请求翻译时生成、响应构造时消费，保证出方向 item 类型永远正确。
+- **自由文本工具包装与解包**：Anthropic 侧没有自由文本工具概念，进方向将 custom 工具包装为 `{"input": <string>}` 单字段 schema（grammar / format 附到 description 提示模型输入格式），出方向通过多级回退链解出原始 input 字符串（模型偶尔不守 schema 时也能兜住）。
+- **Namespace 分组支持**：Codex 0.144 的 collaboration 子代理等工具挂在 `namespace` 分组下——对 Anthropic 模型展平为 `ns__name`（`__` 连接，避免与工具名中的 `.` 冲突），应答时还原为原 `name` + `namespace` 字段。
+- **混合工具集的 Agentic Loop**：有 Codex 工具时仍注入原生 `web_search_20250305`（除非客户端已声明同名工具），请求进入 web_search agentic loop——loop 内部消化 web_search、把其它 client 工具的 `tool_use` 原样透传，实现搜索与代码工具无缝共存。
+- **软化 System Prompt**：有 Codex 工具时使用软化 nudge（"Use your other tools normally for all other work"），替代无工具时的严格 nudge（"Do not call any other tool"），让模型自由选择搜索或执行代码工具。
+- **Developer 角色 → System 映射**：Codex 的 `role:developer` message item（AGENTS.md / user_instructions / environment_context）转为 Anthropic system 消息，确保技能文件和环境上下文到达模型。
 
-- Bedrock 要求每个 `tool_use` 的 `tool_result` 必须在**紧邻的下一条 user 消息**里。原
-  `validate_tool_pairing` 用 flat-set 只看"历史里是否存在该结果"，会漏掉"中间夹了纯文本轮
-  等导致结果非邻接"的情况 → 上游报 `tool_use ids were found without tool_result blocks
-  immediately after` 400（生产日志高频成对出现）。
-- 修复：新增 `remove_non_adjacent_tool_uses` 位置校验——遍历 history，移除"结果不在紧邻
-  下一条 user 消息"的 `tool_use`。history 末尾 assistant 的 tool_use 结果通常在**当前消息**
-  里（assistant 调工具→当前 user 返回结果的常规流），故把当前消息的 tool_result id 作为
-  "末尾之后的下一条"参与配对，避免误删合法 tool_use。
+### ✨ 新功能 — 推理摘要与搜索展示（Phase 2）
 
-### 🐛 修复 — ZstdDecompressionError（Caddy 压缩 SSE 流）
+- **推理摘要 `reasoning` item**：从上游 reasoning 事件收集思考文本，通过顶层 `kiro_thinking` 字段（非 content block）出带传递——Anthropic 客户端忽略未知顶层字段，不会回放未签名的 thinking block；Responses 译者则将其渲染为 `reasoning` summary item，供 Codex UI 展示"模型正在思考"。
+- **`web_search_call` 展示项**：内部代答的 web_search 以 `server_tool_use` 块收集，在 Responses 响应中渲染为 `web_search_call` item（含 query 与 status），Codex 界面可展示 "Searched the web"。
+- **SSE 事件序列补齐**：新增 `reasoning`、`custom_tool_call`、`web_search_call` 三类 output item 的完整 SSE 事件序列（added → delta/part → done），每个 item 保证 `output_item.done` 携带完整内容（Codex 仅从 done 构建回合）。
 
-- 生产 Caddy `encode zstd gzip` 把 `text/event-stream` 也压缩，Claude Code 解流式 zstd 帧
-  失败 → 客户端 `ZstdDecompressionError`、流中断重试（生产日志 3084 条 SSE 带
-  `Content-Encoding: zstd`）。属基础设施层，不在 Rust 代码内。
-- 修复方案与应用/回退步骤见 `docs/caddy-sse-no-compress.md`：`encode` 加
-  `match { not header Content-Type text/event-stream* }`，SSE 不压缩、其余仍压缩。
+### 🔧 修复 — 工具结果后空助手响应
 
-## [0.6.16] - 2026-06-25
-
-主题：**账号级临时封锁（403 temporarily suspended）按长冷却处理 + 池空报错说人话**。
-
-### 🐛 修复 — 403 临时封锁被误判为连续失败、被自愈反复复活
-
-- 上游反滥用有两种措辞，都是**临时、会自动恢复**：429 `suspicious activity / temporary limits`
-  （已处理），以及 **403 `temporarily suspended / unusual user activity`**（此前**未识别**）。
-- 此前 403 临时封锁走 `report_failure` → 连续 3 次后标 `TooManyFailures` → 被"全员自愈"
-  反复复活 → 持续调度一个正在被风控的账号 → 触发更多 unusual activity、可能延长封锁。
-- 修复：`default_is_account_throttled` 增加 403 措辞识别；provider 的 401/403 分支在落到
-  `report_failure` 前先判账号级风控，命中则走 `report_account_throttled`（复用既有
-  `account_throttle_cooldown_secs`，默认 30 分钟长冷却），冷却期不调度、到期自动回池，
-  **不计入连续失败、不被自愈复活**。受 `account_throttle_failover` 开关控制。
-- 额度耗尽（`QuotaExceeded`）、refresh token 失效（`InvalidRefreshToken`）维持**永久禁用、
-  不自愈**的现状不变。
-
-### 🐛 修复 — 候选池为空时的误导性报错
-
-- 旧报错 `所有凭据均已禁用（6/6）` 自相矛盾（`6/6` 实为"6 个都未禁用"）。池为空的真实
-  原因有三类：disabled / 风控冷却中 / 不匹配本次请求的 model·group。
-- 改为分类报错：`无可调度凭据（共 N：禁用 X / 风控冷却中 Y / 不匹配本次请求模型或分组 Z）
-  ，最近一个约 Ns 后恢复`，便于一眼判断是封号、风控还是模型不支持。
-
-## [0.6.15] - 2026-06-25
-
-主题：**断流根因修复（流式禁用连接池）+ 调度去 `success_count` 化与 P2C 去羊群 + 监控并入凭据页**。
-
-### 🐛 修复 — 流式响应断流（0.6.12 连接复用的真正根因）
-
-- 0.6.12 移除 `Connection: close` 启用连接池后，长流式响应（SSE）会**概率性中途断流**。
-  0.6.14 把 `pool_idle_timeout` 降到 15s 只挡住了「建连阶段取到陈旧连接」（可重试），
-  但**流已开始（已回 200 + 部分 SSE）后连接被上游 ALB 在长 prefill 静默期掐断**的场景
-  无法重试，对客户端表现为断流——调 pool 参数无法根治。
-- 修复：流式上游请求改用**禁用空闲连接复用**的专用 Client（`pool_max_idle_per_host=0`，
-  见 `build_streaming_client`）。每条流用全新连接，从根上杜绝「取到半死连接」和
-  「复用连接被中途掐断」两类断流。**非流式请求**（MCP / token 刷新 / balance / profile）
-  仍走原连接复用 Client，首 token 优化与握手复用收益不丢。
-
-### ⚡ 优化 — 调度去 `success_count` 化（彻底消除「必须重置成功次数才回池」痛点）
-
-- balanced 模式排序键去掉 `success_count`（单调累计 + 跨重启持久化）作次键——它会让
-  老账号 / 曾被禁账号长期排序垫底，且对生病账号失察（失败不计成功 → 计数最低 → 被判最该用）。
-  两种模式现统一按 `(effective_load, priority, id)` 排序；`effective_load` 已含 0.6.13 的
-  `ewma_error` 软降权，事故恢复后账号随 EWMA 衰减**自动回池，无需手动重置**。
-- `success_count` 降级为纯展示统计（前端卡片仍显示、`reset` 接口仍在），不再参与调度决策。
-
-### ⚡ 优化 — P2C 抢槽去羊群（高并发负载倾斜）
-
-- balanced 模式下，`acquire_idle_permit` 用 **Power-of-Two-Choices** 打散抢槽顺序：
-  从候选池随机抽 2 个、`effective_load` 更优者先试，避免所有并发请求都从全局最优账号
-  开始挤导致的倾斜（数学上把最大负载从 O(log n) 降到 O(log log n)）。priority 模式
-  保持 `effective_load→priority→id` 严格确定序（用户显式要优先级）。
-
-### ✨ 优化 — 监控视图并入凭据管理页
-
-- 移除独立的「监控」视图切换，把每账号实时调度态（在途/上限 + 负载条 + 错误率 + 平均耗时，
-  并发上限仍可内联编辑）直接并入**凭据卡片与列表行**；凭据页顶部常显「实时调度」汇总条。
-- 调度指标轮询统一为 5s 近实时（原监控 3s / 其余 30s）。`CredentialView` 去掉 `monitor`，
-  旧值自动迁移为 `card`。数据全部复用 `/credentials` DTO，零新增后端请求。
-
-## [0.6.14] - 2026-06-25
-
-主题：**修复连接池陈旧连接导致的 `socket closed unexpectedly`(0.6.12 回归)**。
-
-### 🐛 修复 — 连接池陈旧连接(0.6.12 回归)
-
-- 0.6.12 移除上游 `Connection: close` 启用连接池复用后,生产环境**概率性**出现
-  `API Error: The socket connection was closed unexpectedly`。根因:`pool_idle_timeout` 设为
-  **90s,长于上游服务端(AWS ALB)的空闲关闭时间(~60s)**——连接空闲 60~90s 时已被服务端
-  RST/FIN,但 reqwest 仍认为它在有效期内并复用,下一个请求取到这条"半死"连接直接报 socket 关闭。
-- 修复:把 `pool_idle_timeout` 降到 **15s**(远低于 60s),使陈旧连接在被复用前先被池淘汰;
-  取连接瞬间撞上服务端刚关闭的残留竞态由既有重试循环兜底(`execute` 失败即换新连接重试)。
-  新增环境变量 `KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS`(默认 15)可覆盖。
-- 连接复用收益保留:活跃流量(15s 内连续请求)仍复用连接、省握手;只是不再把连接留到陈旧。
-
-## [0.6.13] - 2026-06-25
-
-主题：**原生模式非语义优化(连接/调度/观测)**。在不改 prompt、不删历史、不做代理侧摘要的前提下,做一批保持 Claude 原生一致的优化:质量感知路由、减少代理自身开销、long-context 分级观测,并修正多账号并发下的"活跃"语义。
-
-### ⚡ 优化 — 质量感知路由(EWMA 软降权)
-
-- 把已采集但闲置的近期错误率 EWMA 纳入账号排序:`effective_load = load_per_mille + ewma_error × 1000`(整数千分比)。高错误率账号被软降权排到健康账号之后,但**不硬性排除**——健康账号全忙时它仍会被选中。`ewma_error≈0` 时惩罚≈0,完全不影响健康账号间的纯负载均衡。
-- endpoint fallback:账号级故障转移已存在于重试循环(每次重试重新选账号、用其 endpoint);跨 endpoint 同账号回退因 IDE/CLI 是不同 API 面、无证据可互替,按证据驱动原则**不实现**。
-
-### ⚡ 优化 — 减少代理自身开销
-
-- debug 请求体日志截断:`provider.rs` / `handlers.rs` 的 `debug!("...body")` 加 `enabled!` 守卫 + 2KB 截断,避免 `RUST_LOG=debug` 下 200K 级请求体被完整格式化拖垮代理。
-- `count_all_tokens` 改按引用接收(`&str` / `&[Message]` / `&Option<...>`),消除每请求一次完整 `messages`/`system`/`tools` 克隆(仅为数 token)。大请求收益明显。
-
-### ✨ 新功能 — long-context 分级观测
-
-- 请求按输入 token 分级 small(<32K)/ medium(<100K)/ long(≥100K);long 请求单独打 info 日志,便于在高并发时段判断大上下文请求的占比与分布。仅观测,**不限流**(待真实分布数据后再决定是否做 lane/权重)。
-
-### 🐛 修复 — 多账号并发下的"活跃"语义
-
-- Dashboard "当前活跃 #id" 改为「活跃账号」实时统计:`activeAccounts`(此刻有请求在途的账号数)/ `inFlightTotal`(全部账号在途之和),与「并发监控」页同语义。并发模型下 `currentId`/`isCurrent` 是 last-writer-wins、只指向并发中的随机一个,对"活跃"无意义——已在类型上标注 `@deprecated`,引导改用 `inFlight`。
+- **问题**：上游 Kiro 偶尔在收到 `tool_result` 后返回一个只有思考文本（无可见 assistant text、无 client 工具调用）的回合——旧代码将其序列化为 `end_turn`，导致 Codex 将该回合视为任务完成、在工具尚未执行完时错误标记任务结束。
+- **修复**：新增 `empty_tool_result_disposition` 判别——仅当最后一轮 user 消息含 `tool_result`、且助手回合无可见文本、无工具调用、无终止原因时，判定为"空洞继续"。此时重试一次；重试仍空洞则返回 `502 Bad Gateway`（而非静默标记完成）。纯思考文本本身不足以构成有效继续——Codex 需要真实 assistant 文本或 client tool call 才能保持任务生命周期正确。
+- **kiro_thinking 不重复**：只有被接受的（非空洞）回合的思考文本才累积到 `all_thinking`；被丢弃的空洞回合的思考不被回放，避免与成功回合的总结重复或矛盾。
 
 ### 📝 文档
 
-- 新增 `docs/load-balancer-redesign.md`(基于生产 traces.db 实证的 adaptive 模式负载均衡重设计稿,待评审)、`docs/native-mode-optimization-implementation.md`(原生模式优化实施说明)。
+- **README 更新**：反映项目已支持 OpenAI Chat Completions / Responses 端点与 Codex CLI；补充 GPT-5.6 模型族说明、流式格式说明、部署示例更新到 0.7.0。
 
-### ✅ 测试
+### 🧪 测试
 
-- 新增 `test_acquire_context_demotes_high_error_account`(高错误率账号被软降权)、`classify_input_tier_buckets`(分级边界)。全套 447 测试通过。
+- **20 个纯单元测试**（无网络依赖）覆盖：工具声明收集（additional_tools / 顶层 / 混合）、namespace 展平与还原、custom 工具包装 schema、function 工具 schema 原样映射、noop 回退、nudge 软化、web_search 名字冲突处理、custom_tool_call 回放往返、function_call_output 数组 stringify、developer→system 映射、reasoning/web_search_call/compaction 跳过、custom_input 多级回退链、build_view 输出类型与顺序、SSE 事件完整性。
+- **4 个空响应判别测试**：工具结果后空洞重试一次→失败、有文本/工具调用则不重试、仅思考文本无可见输出仍触发重试、仅最后一条消息决定是否为工具继续场景。
+- E2E 验证（gpt-5.6-sol + claude-sonnet-4-6）：shell 读文件、apply_patch 写文件、多轮循环、实时 web_search、只读 /plan 项目研究、技能发现——均无 incompatible payload 错误。
 
-## [0.6.12] - 2026-06-24
+## [0.7.0] - 2026-07-15
 
-主题：**连接复用修复 + 长上下文耗时可观测性 + 并发监控视图**。修复了一个废掉连接池的遗留头、新增定位"慢在传输/排队/prefill/输出"的 trace 诊断字段,并把账号卡片的实时调度信息独立成专门的「监控」视图。
+主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
 
-### 🐛 修复 — 上游连接无法复用(性能遗留)
+### ✨ 新功能 — GPT-5.6 与 OpenAI 协议兼容
 
-- 移除发往上游所有请求的 `Connection: close` 头(`provider.rs` 主 API/MCP、`token_manager.rs` 的 token 刷新/balance/profile 等 8 处)。此前 `http_client` 已配置连接池(`pool_idle_timeout=90s`、`pool_max_idle_per_host=8`)并按账号缓存 client,但每个请求强制 `Connection: close`,使连接池完全失效——每次请求都重做 TCP+TLS 握手。移除后空闲连接得以复用,降低握手开销与首字节延迟,并解锁潜在 HTTP/2 协商。保留 `social.rs` OAuth 本地回调响应的 `Connection: close`(那是回给浏览器的本地响应,非上游)。
+> 来源：[PR #38](https://github.com/ZyphrZero/kiro.rs/pull/38)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
 
-### ✨ 新功能 — 长上下文耗时可观测性
+- **新增 GPT-5.6 模型族**：支持 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`，模型 ID 原样传递给 Kiro；上下文窗口按 272K 处理，并通过 `GET /v1/models` 对外公布。
+- **新增 Chat Completions 端点**：`POST /v1/chat/completions` 支持 OpenAI 消息、工具调用、`reasoning_effort`、非流式响应与 SSE 响应，内部复用既有 Anthropic 请求管道。
+- **新增 Responses 端点**：`POST /v1/responses` 支持新版 Codex CLI 使用的 Responses API，转换 instructions / input / reasoning / function call，并生成对应的非流式响应或 SSE 事件序列。
+- **复用现有运行时能力**：两个 OpenAI 端点沿用同一套 API Key 鉴权、模型映射、多凭据故障转移、用量统计及 Kiro MCP WebSearch；`/cc/v1` Claude Code 路径保持不变。
 
-- trace 新增 3 个诊断字段:`requestBytes`(实际转发上游的 Kiro wire body 字节数)、`localInputTokens`(本地 `count_all_tokens` 真值)、`contextInputTokens`(上游 contextUsage 折算值)。配合已有的 `firstTokenMs` / `durationMs` / 每跳 endpoint / 重试次数,可定位单请求慢在传输、排队、模型 prefill 还是输出生成。
-- trace_db schema 幂等迁移(老库自动补列)。前端 trace 日志展开行新增「诊断指标」面板。
+### 🔧 修复 — API Key 生成、自定义与轮换语义
 
-### ✨ 新功能 — 并发监控视图 + 凭证卡片精简
+- **生成格式统一为 `sk-`**：服务端创建和轮换的客户端 Key 均为 `sk-` 加 32 位 base62 随机字符串；默认配置的生成值与示例配置值同样以 `sk-` 开头。
+- **鉴权只做完整值匹配**：删除 `csk_` 前缀常量与前缀校验，不增加旧前缀兼容分支；请求携带的 Key 只与未禁用的已存储明文做常量时间精确比较。
+- **允许任意自定义配置值**：`config.json.apiKey` 不要求 `sk-` 前缀。每次启动都将其同步为唯一的系统密钥 `id=0`；修改配置后旧系统密钥立即失效，现有名称、描述、分组与统计保持不变。
+- **Unicode 自定义 Key 安全脱敏**：管理端按 Unicode 字符而非 UTF-8 字节切片，非 ASCII 自定义 Key 不再因切到字符中间而触发运行时 panic。
+- **清理过时说明**：README、示例配置、Rust 注释与 Admin UI 统一为“系统密钥不可删除、可轮换”，移除当前文档中的 `csk_*` 生成规则描述。
 
-- 凭据页新增第三个视图「监控」(卡片/列表之外):紧凑网格,按 活跃(在途多者优先) → 冷却 → 空闲 → 禁用 排序,展示每账号实时在途/上限 + 负载进度条、状态点、近期错误率、平均耗时,顶部汇总总在途/合并容量/整体负载/活跃账号。监控视图下轮询从 30s 缩短到 3s(切走自动恢复),近实时反映调度。
-- 单账号并发上限覆盖控件移到监控视图(点上限数字即可编辑)。
-- 凭证卡片移除 v0.6.10 的「调度」面板(在途/错误率/耗时/总调度/最老在途),回归基础管理职责:身份、优先级、失败/成功计数、最后调用、余额(积分实时变动保留)、操作。监控与管理分离。
+## [0.6.11] - 2026-07-12
 
-### ✅ 测试
+主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
 
-- 新增 `diagnostics_fields_roundtrip`:验证 3 个诊断字段经 schema + insert + read 往返保真。全套 445 测试通过。
+### 🔧 修复 — AWS Enterprise / IdC 余额与模型列表查询
 
-## [0.6.11] - 2026-06-24
+- **旧版 REST GET 不再携带 `profileArn`**：`getUsageLimits` 与 `ListAvailableModels` 继续使用 Kiro 0.9.2 兼容 User-Agent，但 URL 不再拼接首次模型调用解析出的真实 `profileArn`，避免上游将请求判定为格式错误。
+- **保留企业流式调用所需 ARN**：不删除、不回滚凭据中已经解析并持久化的 `profileArn`；`generateAssistantResponse` / `SendMessageStreaming` 等流式模型请求仍正常注入真实 ARN，Enterprise 的 `tokentype: EXTERNAL_IDP`、IdC Token 刷新与区域回退逻辑保持不变。
+- **覆盖状态迁移回归场景**：新增 URL 构造测试，模拟企业凭据从“刚导入、无真实 ARN”进入“首次模型调用后、已有真实 ARN”的状态，确保余额与模型列表请求始终省略 `profileArn`。
 
-主题：**多账号调度热路径重构 + 客户端 auto-compact 修复**。针对凭据级并发上限引入后暴露的调度正确性问题(排序误判、信号量替换导致瞬时超额、在途计数脱节)与高并发下"喂不满所有账号"的性能瓶颈做了一次内聚重构;同时修复经客户端(如 Claude Code)使用时上下文不自动压缩、越用越慢的问题。
+### 🔧 修复 — 上游 429 全链路传播与 WebSearch 一致性
 
-### 🐛 修复 — 调度正确性
+> 合并并扩展 [PR #35](https://github.com/ZyphrZero/kiro.rs/pull/35)：保留类型化上游限流及 `Retry-After`，并补齐 Admin、MCP / WebSearch、Token 刷新和分组隔离链路。
 
-- **按负载率而非绝对在途数排序**:候选凭据排序主键改为负载率 `in_flight * 1000 / cap`(整数千分比),不同账号 cap 不一致时不再误把已打满的小账号排在低负载大账号之前。`balanced` 模式下 `success_count` 退为次级 tiebreaker(它仅在请求完成后 +1,流式请求期间陈旧,不应作主键)。
-- **动态调整并发不再替换信号量**:`set_credential_concurrency` 改为在固定信号量上增量调整——扩容 `add_permits`、缩容 `forget_permits` + `shrink_debt`(不足吞的额度由后续释放/获取逐步 forget)。消除原"整体替换信号量"导致的瞬时突破上限(旧在途仍持旧信号量 permit + 新信号量从满额开始)与在途瞬间被低估。
-- **在途计数单一权威**:在途数改用独立 `AtomicUsize`(获取 permit 即 +1、`CredentialLease` Drop 即 -1),不再用 `cap − available_permits` 反推;登记时机前移到拿到 permit 那一刻(早于 token 刷新),消除刷新窗口内"信号量已占但在途未登记"的脱节。snapshot 的 `inFlight` 与 `oldestInFlightSecs` 统一同源,不再自相矛盾。
-- **凭据删除清理运行时表**:`delete_credential` 现清理 `credential_locks`/`refresh_locks`/`metrics` 三张表,避免长期增删账号导致无界增长。
+- **429 与 `Retry-After` 不再丢失**：模型、MCP、余额、模型列表、超额开关、凭据添加与强制刷新等链路统一返回 HTTP 429；只转发合法的秒数或 HTTP-date，存在明确等待时间时不再在服务端提前重试。
+- **WebSearch 正确传播失败**：纯 WebSearch 不再把 MCP 429 吞成空搜索结果和 HTTP 200；`stream: false` 返回普通 JSON，`stream: true` 保持 SSE。
+- **客户端 Key 分组隔离**：纯 WebSearch 与混合 WebSearch 的 MCP 调用沿用客户端 Key 对应的凭据组，不会越组选择或统计凭据。
+- **并发冷却保留原始 429**：请求已收到类型化 429 后，即使并发冷却使下一次凭据选择失败，也优先返回原始限流，而不是退化为通用 502。
+- **刷新限流不再误伤凭据**：Social、AWS IdC 与 External IdP 刷新端点的 429 不计入 Token 刷新失败次数；自动刷新与 401/403 触发的强制刷新均会立即保留类型化 429，不会重复撞刷新端点或因临时限流永久禁用有效凭据。
+- **Enterprise profile 发现保留限流**：`ListAvailableProfiles` 返回 429 时停止后续模型请求并原样传播合法 `Retry-After`，不再吞掉限流后继续使用缺失或占位 `profileArn`。
+- **隐藏上游敏感错误正文**：通用 502 对客户端使用稳定错误消息，AWS 账号、请求标识等原始响应仅保留在服务端日志中。
 
-### ⚡ 优化 — 高并发调度性能
+## [0.6.10] - 2026-07-10
 
-- **事件驱动唤醒替代 50ms 轮询**:`acquire_idle_permit` 先按 ranked 顺序非阻塞 `try_acquire`,全满时改用 `FuturesUnordered` 对候选信号量各取一个 `acquire_owned().await`、取最先释放者——permit 一释放立即交接,消除最高 50ms 的空窗;复用 tokio Semaphore 自带 FIFO 等待队列,每释放一个 permit 只唤醒一个等待者,消除惊群。
-- **缩短锁临界区 + 去全量克隆**:排序时持 `entries` 锁仅摘取轻量元组 `(id, priority, success_count, cap)` 即释放锁,再排序;仅对最终选中的一份凭据 `clone`,不再每候选克隆完整 `KiroCredentials`(49 字段)。
+主题：**放宽 Admin API 请求体上限，修复批量导入凭据时大 JSON 被拒的 413 问题**。批量导入会一次性提交待导入凭据，包含 `refreshToken`、`clientSecret` 等较长字段；当条目较多时，请求体容易超过 axum 默认 2MB 限制并返回 HTTP 413。本版将 Admin 路由请求体上限统一放宽到 50MB，与 Anthropic 路由保持一致，确保大批量导入请求能进入服务端有界并发处理流程。
 
-### 🐛 修复 — 客户端 auto-compact 不触发
+### 🔧 修复 — Admin 批量导入 413
 
-- 回报给客户端的 `usage.input_tokens` 改为取**上游 contextUsage 折算值与本地真实计数的较大值**(`resolved_usage` / `resolve_usage_input_tokens` 两处),不让上游低估盖过本地真实转发量,使客户端能正确逼近压缩阈值、触发 auto-compact。该改动仅影响上报口径,不影响真实计费(credits 独立来自上游 metering 事件)。
+> 来源：[PR #34](https://github.com/ZyphrZero/kiro.rs/pull/34)。提交人：[@l-spaces](https://github.com/l-spaces)（哈哈先生），感谢贡献。
 
-### ✅ 测试
+- **Admin 路由请求体上限提升至 50MB**：为 Admin router 增加 `DefaultBodyLimit::max(50 * 1024 * 1024)`，覆盖 `POST /credentials/batch-import` 等 Admin API，避免批量导入凭据时因默认 2MB body limit 被 axum 提前拒绝。
+- **保持批量导入处理链路不变**：前端仍一次性 POST 待导入条目，服务端继续按既有并发度处理并通过 SSE 回传逐条结果；本次只调整网关层请求体限制，不改变导入、验活、去重或回滚语义。
 
-- 新增:负载率排序(非绝对在途)断言、缩容期间不替换信号量且不突破上限、单账号占满时等待者被事件唤醒、删除凭据清理运行时表、usage 取 max 三情形。
-- 新增高并发回归守卫 `stress_in_flight_never_exceeds_cap_under_load_and_shrink`:200 并发 + 运行中 cap 2↔4 扩缩竞态下,实测同时在途从不超过历史最大 cap、无计数泄漏、无死锁(连跑 10 次稳定)。
+## [0.6.9] - 2026-07-06
 
-## [0.6.10] - 2026-06-24
+主题：**Tool Call 全链路加固、tool inputSchema 规范化、CCH 缓存计量与 Thinking effort 修复、凭据持久化原子落盘，并回退 v0.6.7 的远程部署 Social 登录**。本版汇总 0.6.8 以来累积的多项 Rust 侧健壮性加固与一处回退：工具调用改为按 `tool_use_id` 缓冲后整体解析并显式暴露非法 JSON、Claude Code 内置工具名双向映射与 `<tool_use>` XML 泄漏过滤；规范化 MCP 工具 schema 以规避 Bedrock `TOOL_SCHEMA_INVALID` 400；修正主 Key 缓存计量口径并放宽原生 Thinking effort 下发范围；凭据回写改为 tmp+rename 原子落盘并锁定整个「快照 + 写盘」临界区（issue #23）；同时因 Kiro 收紧 OAuth 回调白名单，回退 v0.6.7 的远程部署 Social 登录（`redirect_uri` 恢复为本机 `127.0.0.1`，远程访问保留手动粘贴兜底）。多数改动参考 `Kiro-RS-Tool` 定位并移植 / 优化。
 
-主题：**账号卡片调度可观测性 + 单账号并发覆盖**。账号卡片新增"调度"信息面板，实时展示每账号的当前在途并发(N/上限)、近期错误率、耗时 EWMA、最老在途请求年龄、累计调度次数，方便直观判断各账号的调度负载与健康度；并支持给单个账号设置独立于全局的并发上限（点击"当前并发"的上限数字即可编辑，留空回退全局值）。
+### ✨ 增强 — Tool Call 全链路加固
 
-### ✨ 新功能 — 卡片调度展示
+> 参考 [GreyGunG/Kiro-RS-Tool](https://github.com/GreyGunG/Kiro-RS-Tool) 定位并移植 / 优化其 `ToolJsonAccumulator`、统一工具调用管道等基础设施。
 
-- **按凭据运行时指标**：`MultiTokenManager` 新增进程内 `CredMetrics`，跟踪每账号的累计调度次数、耗时 EWMA(α=0.3)、近期错误率 EWMA、在途请求集合(用于最老在途年龄)。通过 `CallContext` 的 Drop 结算耗时、acquire 时登记在途、`report_success/failure` 喂错误率样本。
-- **快照暴露**：`CredentialEntrySnapshot` 新增 `inFlight`、`maxConcurrency`(有效值)、`maxConcurrencyOverride`、`recentErrorRate`、`ewmaDurationMs`、`oldestInFlightSecs`、`totalScheduled`。
-- **前端卡片**：新增"调度"面板展示上述指标；当前并发达到上限时高亮提示。
+- **分片缓冲后整体解析**：新增 `ToolJsonAccumulator`，按 `tool_use_id` 缓冲工具入参分片，`stop` 时整体解析；半截 / 非法 JSON 显式暴露（非流式 / CCH 回 502，实时流补发 `error` 事件），不再把半截 JSON 当完整工具调用转发；非流式移除静默回退 `{}` 与截断静默丢弃。
+- **Claude Code 内置工具双向兼容**：`toolCompatibilityMode`（默认 `claude-code`，`raw` 供排障）下对内置工具名与入参双向映射（`Write`↔`fs_write` 等）、替换内置 schema、隐藏 `fs_append`；入站还原以 Kiro 工具名匹配实现自动门控，`raw` 模式不误伤客户端同名工具。
+- **统一工具调用管道**：收敛到 `CompletedToolUse`（`from_kiro` 唯一还原、`emit_completed_tool_use` 唯一流式发出、`to_anthropic_block` 唯一非流式块），删除重复的 `synthesize_tool_use`。
+- **过滤 `<tool_use>` XML 泄漏**：`strip_tool_use_xml_leaks` + 跨 chunk `ToolUseXmlLeakFilter`（修复闭合标签跨 chunk 的场景）。
 
-### ✨ 新功能 — 单账号并发覆盖
+### 🔧 修复 — tool inputSchema 规范化（规避 Bedrock `TOOL_SCHEMA_INVALID` 400）
 
-- `KiroCredentials` 新增持久化字段 `maxConcurrency`(可选)；调度信号量按"凭据级覆盖 ?? 全局值"创建。
-- 新增 Admin API `POST /credentials/{id}/concurrency`(maxConcurrency=null/0 清除覆盖)与 `set_credential_concurrency`，运行时重建该账号信号量即时生效。
-- 前端卡片支持点击编辑单账号并发上限。
+> 参考 [GreyGunG/Kiro-RS-Tool PR #6](https://github.com/GreyGunG/Kiro-RS-Tool/pull/6)。部分 MCP 工具（尤其 Claude Code workflow 并行子代理携带的）会因 schema 触发 Bedrock 400。
 
-### 🐛 修复
+- **顶层 `type` 强制 `object`**：`normalize_json_schema` 原先仅在 `type` 缺失 / 为空时补 `object`，`type:"array"` 等会漏过；现一律强制为 `object`（非 object 时告警并修正）。
+- **剥离顶层组合关键字**：新增 `strip_top_level_combinators`，剥离顶层 `oneOf` / `anyOf` / `allOf`（Bedrock / Anthropic 不支持顶层组合关键字）；原 schema 无 `properties` 时，从首个 `type:object` 的 variant 恢复 `properties` / `required` / `additionalProperties` / `description`，避免退化成空对象。
+- **命中即终止**：`CLIENT_VALIDATION_REASONS` 新增 `TOOL_SCHEMA_INVALID`——根因在请求体，重试 / 换号无用，命中即立即终止。
 
-- 修复调度热路径潜在重入死锁：`ranked_available_credentials` 持有 `entries` 锁时计算在途数不再二次锁 `entries`（容量改由调用方传入）。
+### 🔧 修复 — CCH 缓存计量
 
-## [0.6.9] - 2026-06-24
+- **主 Key 不再模拟跨用户缓存**：`isolation_seed` 改为 `Option`，主 Key（`id=0`）无 session 时不再模拟跨用户缓存。
+- **分母口径修正**：被跳过的动态 system 前缀计入 `prompt_total` 分母。
 
-主题：**单账号请求速率超限（429 `USER_REQUEST_RATE_EXCEEDED`）快速切换账号**。基于线上 trace 分析发现：高并发下 72% 的失败是 per-user 速率超限 429，而原逻辑把它当作通用瞬态错误重试——重试时 `acquire_context` 按在途数排序、并不排除刚超限的账号，常把同一账号重复选中（实测平均重试 4 次、每次空占并发槽约 26s 后仍失败），白白浪费重试预算与稀缺并发槽，同时其它有速率余量的账号闲置。本版新增对该 429 的精确识别与短冷却切换：命中后对该账号施加 `rateLimitCooldownSecs`（默认 5s）短冷却并立即切换到其它账号，速率窗口恢复后该账号自动重新参与调度。
+### 🔧 修复 — Thinking effort 下发范围
 
-### ⚡ 优化 — 请求速率超限快速切换
+- **放宽原生 effort**：原生 `effort` 下发扩展至 Opus 4.6 / 4.7 / 4.8 + Sonnet 4.6 + 5 系。
+- **从预算推导**：支持从 `thinking.budget_tokens` 推导 `effort`。
 
-- **精确识别 `USER_REQUEST_RATE_EXCEEDED`**：新增 endpoint 层 `is_user_rate_limited` 判定（与账号级 "suspicious activity" 风控区分），在通用瞬态重试分支之前拦截。
-- **短冷却 + 切换**：新增 `MultiTokenManager::report_rate_limited`，复用 `throttled_until` 排除通路对超限账号施加短冷却，使本次重试自然切换到有余量的账号；**不计入失败统计、不推动禁用**（速率超限是调度路由问题，非账号故障）。
-- **全账号冷却兜底**：若所有账号都在速率冷却中，短暂等待最早冷却到期后重试，而非立即失败（速率冷却很短，等待远比放弃划算）。
-- **新增 trace outcome `rate_limited`**：与通用 `transient` 区分，便于在请求日志中单独统计速率超限占比。
-- **新增配置 `rateLimitCooldownSecs`**（默认 5s）。
+### 🔐 修复 — 凭据持久化原子落盘（issue #23）
 
-### 📝 文档
+- **锁定整个临界区**：`persist_lock` 覆盖「快照 + 序列化 + 写盘」整个临界区，最后写盘者必在临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token；`entries.lock` 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+- **tmp+rename 原子落盘**：先写临时文件再同目录 `rename`（原子操作），失败时清理临时文件，避免崩溃 / 并发导致半截凭据文件。
 
-- README 配置表新增 `rateLimitCooldownSecs`，「高并发首 token 调优」一节补充 per-account 速率限制说明与实测阈值（每账号 ≤3-4 请求/分钟几乎无损，加账号横向扩容是根本解）。
+### ⏪ 回退 — 远程部署 Social 登录（撤销 Issue #20）
 
-## [0.6.8] - 2026-06-24
+- **移除公网回调路由**：删除免鉴权 `GET /api/admin/auth/callback/{*tail}` 及其回调投递逻辑（`social_oauth_callback` / `deliver_remote_social_callback` / `RemoteCallbackOutcome`）。
+- **移除回调地址派生**：删除 `config.callbackBaseUrl` 配置项与前端 `deriveCallbackBaseUrl`（按 `location.origin` 自动派生），`start_social_login` / `start_social_relogin` 恢复为始终启动本机临时 TCP 回调端口，`redirect_uri` 固定为 `http://127.0.0.1:{port}`。
+- **移除 `remote` 响应字段**：`StartSocialLoginResponse` 不再返回 `remote`；前端登录 / 重新登录对话框回到「本地访问自动轮询、远程访问手动粘贴」两态。
+- **保留手动完成兜底**：`POST /auth/social/complete/{sessionId}`（及重新登录版本）保留不变——远程访问用户仍可从浏览器地址栏复制 localhost 失败页的完整 URL 粘贴完成登录。
 
-主题：**高并发首 token 延迟优化（token 刷新按凭据分锁 + HTTP 分层超时与连接复用）+ 入站文本字段裁剪兜底 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`**。这一版聚焦高并发下首 token 暴涨问题：将原先一把全局 token 刷新锁改为按凭据分锁，消除 token 临近同时过期时所有请求（含不同账号）堵在同一把锁后串行刷新的排队；HTTP 客户端引入分层超时（connect / read）、TCP keepalive 与连接池复用，避免少数挂死连接长时间霸占稀缺的账号并发槽。同时新增入站文本字段的本地裁剪，在请求发往上游之前把超大字段（最常见为 `tool_result.text`）裁到安全范围，从源头规避 AWS Q 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`（400）。所有改动均不触碰工具定义 / 工具名 / 工具调用入参与对话语义。
+## [0.6.8] - 2026-07-06
 
-### ⚡ 优化 — 高并发首 token 延迟
+主题：**新增 Claude Sonnet 5 / Claude Fable 5 模型映射 + 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证**。这一版把请求模型关键词映射扩展到 5 代 Sonnet / Fable，并让 `/v1/models` 能列出它们；同时新增第四种认证方式 `external_idp`，支持以 JSON 导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入），Token 走 IdP 的 OAuth2 `refresh_token` grant 刷新，并在导入与刷新两处对 IdP 端点做 allow-list 校验，防止 refresh token 外泄。
 
-- **Token 刷新按凭据分锁**：原先 `MultiTokenManager` 使用单一全局 `refresh_lock`，token 临近同时过期时，高并发下所有需刷新的请求（哪怕使用不同账号）全部堵在同一把锁后排队、串行执行网络刷新，导致首 token 集体暴涨。改为 `HashMap<credential_id, Arc<TokioMutex>>` 按凭据分锁：同一凭据的并发刷新仍串行去重（保留双检），不同凭据的刷新并行进行，互不阻塞。
-- **HTTP 分层超时 + 连接复用**：上游 HTTP 客户端从「仅一个 720s 总超时」改为分层超时——`connect_timeout`（默认 15s，建连阶段卡死秒级失败重试）、`read_timeout`（默认 300s，每次成功读后重置，用于探测建连后迟迟不吐字节的挂死连接，首字节一到即重置，长 prefill / 长生成不被误杀）、TCP keepalive（默认 60s）、连接池复用（`pool_max_idle_per_host=8`）。避免少数挂死请求长时间霸占稀缺的账号并发槽拖垮整个池子。均可经 `KIRO_RS_HTTP_*` 环境变量覆盖。
+### ✨ 新功能 — 新增模型映射：Claude Sonnet 5 / Claude Fable 5
 
-### ✨ 新功能 — 入站文本字段裁剪
+- **`claude-sonnet-5`**：`map_model` 的 sonnet 分支新增主版本 5，精确匹配 `sonnet-5` / `sonnet5` / `sonnet.5`（含 `-5-20xxx`、`-5-thinking` 等后缀），排在 4.x 判断之前/相邻并精确到 `sonnet-5`，避免把 `4-5` / `4.5` 误判为 5，也不会命中 legacy 的 `claude-3-5-sonnet`。
+- **`claude-fable-5`**：新增独立 `fable` 分支，映射到上游 `claude-fable-5`（Fable 5 与 Mythos 5 同底座，目前仅 5 代），放在最前以免干扰其它关键词。
+- **上下文窗口**：`claude-sonnet-5` 与 `claude-fable-5` 均按 `1_000_000` 上下文处理。
+- **`/v1/models` 静态列表**：新增 `claude-sonnet-5` / `claude-sonnet-5-thinking`、`claude-fable-5` / `claude-fable-5-thinking` 四个条目，客户端可直接发现。
+- **effort 分级**：两者默认支持 `xhigh`（`fable-5` 显式在允许列表，`sonnet-5` 不在旧模型黑名单），无需额外配置。
 
-- **单字段文本裁剪**：消息正文、`tool_result` 文本、历史 assistant 的 text / thinking 在本地、请求发往上游之前按单字段字节上限裁剪，规避 AWS Q 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`（400）。裁剪在转换阶段完成（获取账号并发槽之前），对并发零影响；超限时保留首尾、中间插入 `…[kiro-rs truncated ~N bytes]…` 标记并打 warn 日志；UTF-8 安全。默认阈值 `680000`（贴近上游约 700KB 红线，正常使用几乎永不触发），可经 `KIRO_RS_TEXT_TRUNCATE` / `KIRO_RS_TEXT_MAX_FIELD_BYTES` 配置。
+### ✨ 新功能 — 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证
 
-### 📝 文档
+> 核心逻辑参考 [Quorinex/Kiro-Go#131](https://github.com/Quorinex/Kiro-Go/pull/131) 移植。本版仅实现凭据导入与刷新，**不含**浏览器门户登录 / 回调监听 / 两段式状态机——按需手动获取 Azure 凭据后以 JSON 导入即可。
 
-- README 新增「文本字段裁剪」「HTTP 传输层调优」「高并发首 token 调优」三节，并补全 `accountMaxConcurrency` / `accountAcquireTimeoutSecs` 配置说明与 `KIRO_RS_TEXT_*` / `KIRO_RS_HTTP_*` 环境变量表。
+- **新增第四种认证方式 `external_idp`**：适用于 Microsoft 365 / Entra ID / Azure AD 企业租户账号。凭据新增三个字段：`tokenEndpoint`（IdP 的 OAuth2 token 端点）、`issuerUrl`（OIDC issuer，纯备注）、`scopes`（空格分隔的已授权 scope，需含 `offline_access` 才能拿到 refresh token）。`authMethod` 可写 `external_idp`，也接受 `azuread` / `azure` / `entra` / `entra-id` / `microsoft` / `m365` / `office365` / `external` 等别名统一归一化；未声明 `authMethod` 但带 `tokenEndpoint` 时自动推断为 `external_idp`。
+- **IdP token 端点刷新**：`external_idp` 账号的刷新走 IdP OAuth2 `refresh_token` grant（公共客户端，`application/x-www-form-urlencoded` 表单，无 `clientSecret`），区别于 Social / IdC 的刷新路径。IdP 未下发新 refresh token 时保留原值（Azure AD 有时不轮换）；`invalid_grant` 复用既有的永久失效检测，自动禁用凭据。IdP 不返回 `profileArn`，真实 ARN 仍由 `ListAvailableProfiles` 懒解析回填（与 IdC 一致）。
+- **`TokenType: EXTERNAL_IDP` 头**：数据面（`generateAssistantResponse` / MCP）与 `getUsageLimits` / `ListAvailableProfiles` / `setUserPreference` 等 REST 请求，对 `external_idp` 账号自动携带该头——否则 CodeWhisperer 静默返回空 profile 列表并拒绝数据面调用。
+- **Admin 导入 / 导出**：`AddCredentialRequest` 与账号导出结构均新增 `tokenEndpoint` / `issuerUrl` / `scopes`；「添加凭据」对话框新增「企业 SSO (Microsoft Entra / Azure AD)」选项与对应输入（Client ID / Token Endpoint / Issuer URL / Scopes），批量导入与嵌套账号（KAM 格式）导入均支持 `external_idp`；凭据卡片展示 `Entra ID` / `企业 SSO` 标签。导出会无损保留新字段与 `external_idp` 认证方式。
+
+### 🔐 安全 — 外部 IdP 端点 allow-list 校验
+
+- **防 SSRF / refresh token 外泄**：`tokenEndpoint` 是外发 refresh token 的目标，属新的信任边界。导入 `external_idp` 凭据时，以及**每次刷新外发前**，都会校验 `tokenEndpoint`（及 `issuerUrl`，若提供）：必须为 `https`、host 非 IP 字面量、且命中允许列表后缀（`*.microsoftonline.com` / `.us` / `.cn`，前导点锚定到真实子域边界）。校验不通过的凭据直接拒绝导入，不会把 refresh token 发往非法主机。新增 IdP 时可扩展该允许列表。
+- **必填校验**：导入 `external_idp` 时若缺少 `clientId` 或 `tokenEndpoint`（刷新的前提），提前返回明确错误而非等到刷新失败。
 
 ## [0.6.7] - 2026-06-17
 
@@ -921,4 +842,3 @@ project adheres to [Semantic Versioning](https://semver.org/).
    - 如需开启每日自动更新，添加 `"updateAutoApply": true` 与 `"updateAutoApplyTime": "03:00"`。
 4. **首次发布**
    - 维护者需在仓库 Settings → Secrets 添加 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`，否则 CI 推送会失败。
-

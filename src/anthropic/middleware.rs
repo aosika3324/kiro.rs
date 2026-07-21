@@ -56,6 +56,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 工具兼容模式（ClaudeCode 内置工具名/入参双向适配 / Raw 透传）
+    pub tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
     /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
     pub client_keys: Option<SharedClientKeyManager>,
     /// 用量日志记录器
@@ -78,10 +80,14 @@ pub struct AppState {
 impl AppState {
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
     #[allow(dead_code)]
-    pub fn new(extract_thinking: bool) -> Self {
+    pub fn new(
+        extract_thinking: bool,
+        tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+    ) -> Self {
         Self {
             kiro_provider: None,
             extract_thinking,
+            tool_compatibility_mode,
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
@@ -151,7 +157,7 @@ impl AppState {
 
 /// API Key 认证中间件
 ///
-/// 鉴权顺序：master apiKey → 客户端 Key（`csk_*`）。命中后向请求扩展注入
+/// 所有入口 Key 统一按已存储的完整值精确匹配，不限制前缀。命中后向请求扩展注入
 /// [`KeyContext`]，供 handler 记录用量时使用。
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -166,7 +172,6 @@ pub async fn auth_middleware(
         }
     };
 
-    // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);

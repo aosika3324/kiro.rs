@@ -16,7 +16,9 @@ use uuid::Uuid;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
@@ -445,6 +447,8 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             || m.eq_ignore_ascii_case("iam")
         {
             "IdC".to_string()
+        } else if cred.is_external_idp_credential() {
+            "external_idp".to_string()
         } else {
             "social".to_string()
         }
@@ -1255,15 +1259,16 @@ impl AdminService {
             }
         }
 
+        // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
+        let auth_method =
+            normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
+        let is_external_idp = auth_method == "external_idp";
+
         // external_idp 端点派生：KAM 导出的企业 SSO（Azure AD / Entra）账号常只带
         // clientId + refreshToken + 账号级 userId，缺 tokenEndpoint/issuerUrl/scopes，
         // 而 external_idp 刷新硬要求 tokenEndpoint。此处从 userId（或 accessToken JWT
         // 的 iss）派生出这三项（对齐 Kiro-Go DeriveExternalIdpEndpoints）。
         // 仅在 external_idp 且 tokenEndpoint 缺失时触发；已带端点的完整导入原样保留。
-        let is_external_idp = {
-            let norm = req.auth_method.replace('-', "_");
-            norm.eq_ignore_ascii_case("external_idp") || norm.eq_ignore_ascii_case("externalidp")
-        };
         let (mut token_endpoint, mut issuer_url, mut scopes) =
             (req.token_endpoint, req.issuer_url, req.scopes);
         if is_external_idp && token_endpoint.as_deref().unwrap_or("").trim().is_empty() {
@@ -1295,6 +1300,43 @@ impl AdminService {
             }
         }
 
+        // 企业 SSO 导入校验（安全边界，对派生后的端点生效）：
+        // - 必须同时具备 clientId 与 tokenEndpoint（refresh_external_idp_token 的前提）；
+        // - tokenEndpoint / issuerUrl 必须过 Microsoft allow-list，防止把 refreshToken
+        //   外发到内网 / 攻击者控制的主机（SSRF / 凭据外泄）。
+        if is_external_idp {
+            let client_id_ok = req
+                .client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let token_endpoint_ck = token_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(token_endpoint_ck) = token_endpoint_ck else {
+                return Err(AdminServiceError::InvalidCredential(
+                    "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
+                ));
+            };
+            if !client_id_ok {
+                return Err(AdminServiceError::InvalidCredential(
+                    "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
+                ));
+            }
+            validate_external_idp_endpoint(token_endpoint_ck).map_err(|e| {
+                AdminServiceError::InvalidCredential(format!("tokenEndpoint 被拒绝: {}", e))
+            })?;
+            if let Some(issuer) = issuer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                validate_external_idp_endpoint(issuer).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!("issuerUrl 被拒绝: {}", e))
+                })?;
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1303,7 +1345,7 @@ impl AdminService {
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
             expires_at: req.expires_at,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(auth_method),
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
@@ -1593,7 +1635,7 @@ impl AdminService {
         self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
-    /// 持久化新的 apiKey（系统密钥轮换后同步 config.json，保证下次启动不重复导入）
+    /// 将系统密钥写回 `config.json`。
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.api_key = Some(key));
@@ -3005,6 +3047,9 @@ impl AdminService {
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
@@ -3015,6 +3060,9 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
 
         // 1. 凭据不存在
@@ -3037,6 +3085,8 @@ impl AdminService {
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error = msg.contains("获取使用额度失败") ||
+            msg.contains("获取可用模型失败") ||
+            msg.contains("设置用户偏好失败") ||
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
             msg.contains("凭证已过期或无效") ||
             msg.contains("权限不足") ||
@@ -3066,6 +3116,9 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(error) = classify_rate_limit(&e) {
+            return error;
+        }
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
@@ -3093,6 +3146,14 @@ impl AdminService {
         }
     }
 
+}
+
+fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
+    error
+        .downcast_ref::<UpstreamRateLimitError>()
+        .map(|rate_limit| AdminServiceError::RateLimited {
+            retry_after: rate_limit.retry_after().map(str::to_string),
+        })
 }
 
 #[cfg(test)]
@@ -3187,6 +3248,19 @@ mod tests {
             decide_quota_action(true, true, true, true, 1200.0, -10500.0, 90.0),
             QuotaAction::None
         );
+    }
+
+    #[test]
+    fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("120".to_string())));
+        let classified = classify_rate_limit(&error).expect("应识别类型化上游 429");
+
+        match classified {
+            AdminServiceError::RateLimited { retry_after } => {
+                assert_eq!(retry_after.as_deref(), Some("120"));
+            }
+            other => panic!("预期 RateLimited，实际为 {other:?}"),
+        }
     }
 
     #[test]

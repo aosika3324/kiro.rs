@@ -47,6 +47,8 @@ pub struct IdcRefreshResponse {
 ///
 /// 企业组织账号导出的 tokenEndpoint 通常返回标准 OAuth snake_case 字段；
 /// 部分中间结构仍可能保留 camelCase，因此这里两种格式都接受。
+/// IdP 通常不返回 profileArn（由 `ListAvailableProfiles` 用 EXTERNAL_IDP
+/// token type 另行解析），故 profile_arn 为可选。
 #[derive(Debug, Deserialize)]
 pub struct ExternalIdpRefreshResponse {
     #[serde(alias = "accessToken")]
@@ -163,4 +165,34 @@ pub struct SocialCreateTokenResponse {
     pub expires_in: Option<i64>,
     #[serde(default)]
     pub profile_arn: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_external_idp_token_response_deserialize() {
+        // 标准 OAuth2 snake_case 响应
+        let json = r#"{
+            "access_token": "eyJ...new",
+            "refresh_token": "rt-rotated",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }"#;
+        let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "eyJ...new");
+        assert_eq!(resp.refresh_token.as_deref(), Some("rt-rotated"));
+        assert_eq!(resp.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn test_external_idp_token_response_without_refresh_token() {
+        // 部分 IdP 刷新时不下发新 refresh_token
+        let json = r#"{"access_token":"a","expires_in":900}"#;
+        let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "a");
+        assert!(resp.refresh_token.is_none());
+        assert_eq!(resp.expires_in, Some(900));
+    }
 }

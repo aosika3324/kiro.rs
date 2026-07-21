@@ -1,7 +1,6 @@
 //! 客户端 API Key 管理
 //!
-//! 中转站对外分发的"客户端 Key"层。客户端调用 `/v1/messages` 时携带 `csk_*`
-//! 格式的 Key，由本模块校验并按 Key 维度记录调用次数与累计 Token。
+//! 管理中转站下发的客户端 Key。生成值以 `sk-` 开头；鉴权不校验前缀，只按完整值匹配。
 //!
 //! 与上游 Kiro 凭据（`KiroCredentials`，`ksk_*`）相互独立：
 //! - 上游凭据池：服务对接 Kiro 的"出口"
@@ -17,9 +16,6 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-
-/// 客户端 Key 前缀（区分上游 `ksk_`）
-pub const CLIENT_KEY_PREFIX: &str = "csk_";
 
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,22 +94,16 @@ pub struct ClientKey {
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
-    /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
+    /// None 表示不绑定分组，可使用全部账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
+    /// 系统 Key（由 config.json apiKey 同步，不可删除、可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
 }
 
-/// 客户端 Key 管理器
-///
-/// 内部双索引：
-/// - `by_key: HashMap<String, u64>` —— 用于 `/v1` 鉴权时 O(1) 查询命中
-/// - `entries: HashMap<u64, ClientKey>` —— 用于按 id 读写明细
-///
-/// 校验比对仍使用 `subtle::ConstantTimeEq` 防止时序攻击。
+/// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
@@ -195,7 +185,7 @@ impl ClientKeyManager {
         list
     }
 
-    /// 创建新 Key（生成明文随机串），返回新建条目
+    /// 生成并保存新 Key。
     pub fn create(
         &self,
         name: String,
@@ -225,7 +215,7 @@ impl ClientKeyManager {
         }
     }
 
-    /// 用指定明文创建 Key（带缓存与提示词过滤设置）。bootstrap 系统密钥走 `ensure_system_key`。
+    /// 用指定明文创建 Key（带缓存与提示词过滤设置）。bootstrap 系统密钥走 `sync_system_key`。
     fn create_with_key_full(
         &self,
         name: String,
@@ -236,7 +226,6 @@ impl ClientKeyManager {
         prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         let mut inner = self.inner.write();
-        // 防止 bootstrap 重复导入同一明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
             return inner
                 .entries
@@ -281,58 +270,28 @@ impl ClientKeyManager {
         entry
     }
 
-    /// 确保 config.json apiKey 对应的系统 Key 存在（幂等，每次启动调用）。
-    ///
-    /// 系统 Key **固定占用 id=0**：历史 master apiKey 的用量数据都记在 keyId=0 桶里，
-    /// 固定 id=0 可让「默认密钥」直接查到升级前的全部用量，保证数据连续。
-    ///
-    /// - 若该明文已在 id=0：确保 is_system=true（no-op）。
-    /// - 若该明文在其它 id（旧版 bootstrap 误建）：迁移到 id=0。
-    /// - 明文不存在：在 id=0 新建（id=0 被占用时回退 next_id，极罕见）。
-    /// 系统 Key 不可删除；可轮换（轮换时同步 config.apiKey）。
-    pub fn ensure_system_key(&self, name: String, description: Option<String>, plaintext: String) {
+    /// 将 `config.apiKey` 同步为唯一的 `id=0` 系统 Key。配置值变化时保留元数据与统计、
+    /// 重新启用新值，并删除与新旧明文冲突的非系统条目，使旧值立即失效。
+    pub fn sync_system_key(&self, name: String, description: Option<String>, plaintext: String) {
         let mut inner = self.inner.write();
-        match inner.by_key.get(&plaintext).copied() {
-            Some(0) => {
-                // 已在 id=0：确保 is_system
-                if let Some(e) = inner.entries.get_mut(&0) {
-                    if !e.is_system {
-                        e.is_system = true;
-                        self.save_locked(&inner);
-                    }
-                }
+        let previous_key = inner.entries.get(&0).map(|entry| entry.key.clone());
+        let mut changed = false;
+
+        if let Some(entry) = inner.entries.get_mut(&0) {
+            if entry.key != plaintext {
+                entry.key = plaintext.clone();
+                entry.disabled = false;
+                changed = true;
             }
-            Some(other) => {
-                // 明文在非 0 id 上：尽量迁移到 id=0（对齐历史 keyId=0 用量）
-                if !inner.entries.contains_key(&0) {
-                    let mut entry = inner
-                        .entries
-                        .remove(&other)
-                        .expect("by_key 与 entries 应一致");
-                    entry.id = 0;
-                    entry.is_system = true;
-                    inner.entries.insert(0, entry);
-                    inner.by_key.insert(plaintext, 0);
-                    self.save_locked(&inner);
-                } else if let Some(e) = inner.entries.get_mut(&other) {
-                    // id=0 被别的 Key 占用：仅在原位标记 system
-                    if !e.is_system {
-                        e.is_system = true;
-                        self.save_locked(&inner);
-                    }
-                }
+            if !entry.is_system {
+                entry.is_system = true;
+                changed = true;
             }
-            None => {
-                // 明文不存在：在 id=0 新建（占用则回退 next_id）
-                let id = if !inner.entries.contains_key(&0) {
-                    0
-                } else {
-                    let id = inner.next_id;
-                    inner.next_id += 1;
-                    id
-                };
-                let entry = ClientKey {
-                    id,
+        } else {
+            inner.entries.insert(
+                0,
+                ClientKey {
+                    id: 0,
                     key: plaintext.clone(),
                     name,
                     description,
@@ -359,11 +318,39 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
-                };
-                inner.by_key.insert(plaintext, id);
-                inner.entries.insert(id, entry);
-                self.save_locked(&inner);
+                },
+            );
+            changed = true;
+        }
+
+        let entries_before = inner.entries.len();
+        inner.entries.retain(|id, entry| {
+            *id == 0
+                || (entry.key != plaintext
+                    && previous_key
+                        .as_deref()
+                        .map(|old_key| entry.key != old_key)
+                        .unwrap_or(true))
+        });
+        changed |= inner.entries.len() != entries_before;
+
+        for (id, entry) in inner.entries.iter_mut() {
+            if *id != 0 && entry.is_system {
+                entry.is_system = false;
+                changed = true;
             }
+        }
+
+        let by_key: HashMap<String, u64> = inner
+            .entries
+            .iter()
+            .map(|(id, entry)| (entry.key.clone(), *id))
+            .collect();
+        changed |= inner.by_key != by_key;
+        inner.by_key = by_key;
+
+        if changed {
+            self.save_locked(&inner);
         }
     }
 
@@ -632,17 +619,13 @@ impl ClientKeyManager {
         affected
     }
 
-    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled/is_system。
-    /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
-    /// 命中且替换成功返回新条目（含新明文）；id 不存在返回 None。
-    /// 注意：系统 Key 轮换后调用方需把新明文同步写回 config.json apiKey，避免下次启动重复导入。
+    /// 生成新明文并保留 id、元数据、分组、统计及状态；旧明文立即失效。
+    /// 系统 Key 的调用方必须同步 `config.apiKey`，否则重启时配置值会覆盖轮换结果。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
         let new_key = generate_client_key();
         let mut inner = self.inner.write();
-        // 取出旧条目并从 by_key 索引摘除
         let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
         inner.by_key.remove(&old_key);
-        // 写入新明文 + 索引（is_system 等其余字段保留不变）
         let entry = inner.entries.get_mut(&id)?;
         entry.key = new_key.clone();
         let snapshot = entry.clone();
@@ -672,16 +655,9 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
-    ///
-    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
+    /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
-        // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
@@ -742,7 +718,6 @@ impl Default for ClientKeyManager {
     }
 }
 
-/// serde 辅助：bool 为 false 时跳过序列化
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -751,28 +726,29 @@ fn default_cache_enabled() -> bool {
     true
 }
 
-/// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
+/// 生成 `sk-` 前缀 + 32 位 URL-safe 随机字符串
 pub fn generate_client_key() -> String {
     // OS CSPRNG（security::secure_token_urlsafe）而非 fastrand——对外分发的凭据须密码学安全。
     // 24 字节 → URL-safe base64 32 字符，熵充足。
     let body = crate::security::secure_token_urlsafe(24);
-    format!("{}{}", CLIENT_KEY_PREFIX, body)
+    format!("sk-{}", body)
 }
 
-/// 脱敏展示：保留前 8 位（含前缀）和后 4 位
+/// 脱敏展示：保留前 8 个字符（含前缀）和后 4 个字符
 pub fn mask_client_key(key: &str) -> String {
-    if key.len() <= 12 {
+    let char_count = key.chars().count();
+    if char_count <= 12 {
         return key.to_string();
     }
-    format!("{}...{}", &key[..8], &key[key.len() - 4..])
+    let start: String = key.chars().take(8).collect();
+    let end: String = key.chars().skip(char_count - 4).collect();
+    format!("{start}...{end}")
 }
 
-/// 默认管理器路径（相对凭据目录）
 pub fn default_path_in(dir: &Path) -> PathBuf {
     dir.join("client_api_keys.json")
 }
 
-/// Arc 包装，便于注入 axum State
 pub type SharedClientKeyManager = Arc<ClientKeyManager>;
 
 #[cfg(test)]
@@ -783,9 +759,8 @@ mod tests {
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
-        assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
+        assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
-        // 不带前缀的拒绝
         assert_eq!(mgr.verify_and_touch("nope"), None);
     }
 
@@ -882,7 +857,9 @@ mod tests {
 
     #[test]
     fn mask_format() {
+        assert_eq!(mask_client_key("sk-abcdefghijklmnop"), "sk-abcde...mnop");
         assert_eq!(mask_client_key("short"), "short");
+        assert_eq!(mask_client_key("密钥🔐测试abcdefgh"), "密钥🔐测试abc...efgh");
     }
 
     #[test]
@@ -899,20 +876,15 @@ mod tests {
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
-        // 新 Key 与旧 Key 不同、且仍带前缀
         assert_ne!(rotated.key, old_key);
-        assert!(rotated.key.starts_with(CLIENT_KEY_PREFIX));
-        // 元数据保留
+        assert!(rotated.key.starts_with("sk-"));
         assert_eq!(rotated.id, entry.id);
         assert_eq!(rotated.name, "kb");
         assert_eq!(rotated.description.as_deref(), Some("desc"));
         assert_eq!(rotated.group.as_deref(), Some("groupA"));
-        // 统计保留
         assert_eq!(rotated.total_input_tokens, 100);
         assert_eq!(rotated.total_output_tokens, 50);
-        // 旧 Key 立即失效
         assert_eq!(mgr.verify_and_touch(&old_key), None);
-        // 新 Key 命中
         assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
     }
 
@@ -923,44 +895,71 @@ mod tests {
     }
 
     #[test]
-    fn ensure_system_key_uses_id_zero() {
+    fn sync_system_key_uses_id_zero() {
         let mgr = ClientKeyManager::new();
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
-        // 系统密钥固定在 id=0，对齐历史 keyId=0 用量桶
+        mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert!(mgr.is_system(0));
         assert_eq!(mgr.list().first().map(|k| k.id), Some(0));
-        // 幂等：再次调用不重复创建
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert_eq!(mgr.verify_and_touch("custom-api-key"), Some(0));
+        mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert_eq!(mgr.list().iter().filter(|k| k.is_system).count(), 1);
     }
 
     #[test]
-    fn ensure_system_key_migrates_misplaced_id_to_zero() {
-        // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
+    fn sync_system_key_replaces_config_value_and_revokes_old_key() {
         let mgr = ClientKeyManager::new();
-        mgr.create_with_key_full(
-            "默认密钥".into(),
+        mgr.sync_system_key("默认密钥".into(), Some("初始描述".into()), "custom-a".into());
+        mgr.update_meta(
+            0,
+            Some("保留名称".into()),
+            Some(Some("保留描述".into())),
+            Some(Some("group-a".into())),
             None,
             None,
-            "sk-kiro-abc".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        mgr.record_usage(0, 100, 50, 5, 10, 1.5);
+        assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
+        mgr.set_disabled(0, true);
+
+        let conflicting = mgr.create_with_key_full(
+            "冲突密钥".into(),
+            None,
+            None,
+            "custom-b".into(),
             true,
             (false, false, false),
         );
-        assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
-        // 修复后启动：应迁移到 id=0
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
-        assert!(mgr.is_system(0));
-        assert!(
-            !mgr.list()
-                .iter()
-                .any(|k| k.id == 1 && k.key == "sk-kiro-abc")
-        );
+        assert_ne!(conflicting.id, 0);
+
+        mgr.sync_system_key("默认密钥".into(), None, "custom-b".into());
+
+        assert_eq!(mgr.verify_and_touch("custom-a"), None);
+        assert_eq!(mgr.verify_and_touch("custom-b"), Some(0));
+        let entries = mgr.list();
+        assert_eq!(entries.len(), 1);
+        let system = &entries[0];
+        assert_eq!(system.id, 0);
+        assert!(system.is_system);
+        assert_eq!(system.name, "保留名称");
+        assert_eq!(system.description.as_deref(), Some("保留描述"));
+        assert_eq!(system.group.as_deref(), Some("group-a"));
+        assert!(!system.disabled);
+        assert_eq!(system.total_input_tokens, 100);
+        assert_eq!(system.total_output_tokens, 50);
     }
 
     #[test]
     fn system_key_cannot_be_deleted() {
         let mgr = ClientKeyManager::new();
-        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
         assert!(mgr.is_system(0));
     }

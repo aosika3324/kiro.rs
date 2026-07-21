@@ -11,12 +11,15 @@ use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     cache_metering::SharedMeterGovernance,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    openai::post_chat_completions,
     response_cache::SharedResponseCache,
+    responses::post_responses,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -29,10 +32,12 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Router {
     create_router(
         kiro_provider,
         extract_thinking,
+        tool_compatibility_mode,
         None,
         None,
         None,
@@ -49,6 +54,7 @@ pub fn create_router_with_provider(
 pub fn create_router(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
@@ -58,7 +64,7 @@ pub fn create_router(
     response_cache: Option<SharedResponseCache>,
     model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
 ) -> Router {
-    let mut state = AppState::new(extract_thinking);
+    let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -74,12 +80,10 @@ pub fn create_router(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
-        // OpenAI 兼容端点：与 /v1/messages 共用同一 AppState 与 auth_middleware。
-        // 入站归一化成 Anthropic MessagesRequest 后复用全部既有管道（见 crate::openai）。
-        .route(
-            "/chat/completions",
-            post(crate::openai::post_chat_completions),
-        )
+        // OpenAI / Responses 兼容端点：与 /v1/messages 共用同一 AppState 与 auth_middleware。
+        // 入站归一化成 Anthropic MessagesRequest 后复用全部既有管道（见 super::openai / super::responses）。
+        .route("/chat/completions", post(post_chat_completions))
+        .route("/responses", post(post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

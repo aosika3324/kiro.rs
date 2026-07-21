@@ -83,7 +83,7 @@ pub async fn set_credential_disabled(
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
         }
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -100,7 +100,7 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -134,7 +134,7 @@ pub async fn reset_failure_count(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -158,7 +158,7 @@ pub async fn get_credential_balance(
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -170,7 +170,7 @@ pub async fn get_credential_models(
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -195,7 +195,7 @@ pub async fn set_credential_overage(
             if payload.enabled { "开启" } else { "关闭" }
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -214,7 +214,7 @@ pub async fn add_credential(
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -377,7 +377,7 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -1241,8 +1241,7 @@ pub async fn rotate_client_key(
     use axum::http::StatusCode;
     match state.client_keys.rotate(id) {
         Some(entry) => {
-            // 系统密钥轮换后明文变了，需同步写回 config.json apiKey，
-            // 否则下次启动 ensure_system_key 会因旧 apiKey 不在列表而重复导入。
+            // 避免重启时被 config.apiKey 中的旧值覆盖。
             if entry.is_system {
                 state.service.persist_api_key(&entry.key);
             }
