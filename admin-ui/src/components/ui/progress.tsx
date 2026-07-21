@@ -19,10 +19,12 @@ const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
     return (
       <div
         ref={ref}
+        data-slot="progress"
         className={cn('relative h-1.5 w-full overflow-hidden rounded-full bg-secondary/80', className)}
         {...props}
       >
         <div
+          data-slot="progress-indicator"
           className={cn('h-full transition-all duration-500 ease-apple rounded-full', tone)}
           style={{ width: `${percentage}%` }}
         />
