@@ -119,7 +119,12 @@ fn strip_env_noise(prompt: &str) -> String {
 /// simplify_cc collapses the whole `system` into a single message; the line-based filters operate
 /// per `SystemMessage` (preserving the multi-block shape and each block's `cache_control`).
 pub fn apply(system: &mut Option<Vec<SystemMessage>>, ctx: &KeyContext) {
-    if !(ctx.simplify_cc_prompt || ctx.strip_boundary_markers || ctx.strip_env_noise) {
+    // fast_mode 一键强制三个过滤全开（覆盖各自单独设置）；默认（fast_mode=false）行为不变。
+    let simplify_cc = ctx.simplify_cc_prompt || ctx.fast_mode;
+    let strip_boundary = ctx.strip_boundary_markers || ctx.fast_mode;
+    let strip_env = ctx.strip_env_noise || ctx.fast_mode;
+
+    if !(simplify_cc || strip_boundary || strip_env) {
         return;
     }
     let Some(blocks) = system.as_mut() else {
@@ -130,7 +135,7 @@ pub fn apply(system: &mut Option<Vec<SystemMessage>>, ctx: &KeyContext) {
     }
 
     // simplify_cc: detect against the combined text, then replace the entire system if it matches.
-    if ctx.simplify_cc_prompt {
+    if simplify_cc {
         let combined = blocks
             .iter()
             .map(|b| b.text.as_str())
@@ -148,10 +153,10 @@ pub fn apply(system: &mut Option<Vec<SystemMessage>>, ctx: &KeyContext) {
 
     // Line-based filters: apply per block, then drop blocks emptied by filtering.
     for b in blocks.iter_mut() {
-        if ctx.strip_boundary_markers {
+        if strip_boundary {
             b.text = strip_boundary_markers(&b.text);
         }
-        if ctx.strip_env_noise {
+        if strip_env {
             b.text = strip_env_noise(&b.text);
         }
     }
@@ -164,6 +169,9 @@ mod tests {
     use crate::admin::trace_db::TraceKeySource;
 
     fn ctx(cc: bool, boundary: bool, env: bool) -> KeyContext {
+        ctx_full(cc, boundary, env, false)
+    }
+    fn ctx_full(cc: bool, boundary: bool, env: bool, fast_mode: bool) -> KeyContext {
         KeyContext {
             key_id: 1,
             group: None,
@@ -171,6 +179,7 @@ mod tests {
             simplify_cc_prompt: cc,
             strip_boundary_markers: boundary,
             strip_env_noise: env,
+            fast_mode,
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
@@ -262,6 +271,41 @@ mod tests {
         assert!(!t.contains("SYSTEM PROMPT"));
         assert!(!t.contains("gitStatus"));
         assert!(!t.contains("# Environment"));
+    }
+
+    #[test]
+    fn fast_mode_forces_all_filters_even_when_individually_off() {
+        // 三个过滤单独都关，但 fast_mode=true → 强制全开：CC 检测命中则整段替换。
+        let mut s = sys(
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\
+             # Doing tasks\nlots of CC instructions here...\ngitStatus: clean",
+        );
+        apply(&mut s, &ctx_full(false, false, false, true));
+        assert_eq!(text_of(&s), CLAUDE_CODE_BACKEND_PROMPT);
+    }
+
+    #[test]
+    fn fast_mode_forces_line_filters_when_not_cc() {
+        // 非 CC 提示词，fast_mode 仍强制 strip_boundary + strip_env（虽单独都关）。
+        let mut s = sys(
+            "--- SYSTEM PROMPT ---\nUseful guidance.\n# Environment\nnoise\ngitStatus: x\n--- END SYSTEM PROMPT ---",
+        );
+        apply(&mut s, &ctx_full(false, false, false, true));
+        let t = text_of(&s);
+        assert!(t.contains("Useful guidance"));
+        assert!(!t.contains("SYSTEM PROMPT"));
+        assert!(!t.contains("gitStatus"));
+        assert!(!t.contains("# Environment"));
+    }
+
+    #[test]
+    fn fast_mode_off_is_still_noop_when_filters_off() {
+        // fast_mode=false 且三过滤都关 → 与既有 all_off_is_noop 行为一致（默认路径不变）。
+        let mut s =
+            sys("You are Claude Code, anthropic's official CLI. # Doing tasks\ngitStatus: clean");
+        let before = text_of(&s);
+        apply(&mut s, &ctx_full(false, false, false, false));
+        assert_eq!(text_of(&s), before);
     }
 
     #[test]

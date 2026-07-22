@@ -1053,6 +1053,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         simplify_cc_prompt: k.simplify_cc_prompt,
         strip_boundary_markers: k.strip_boundary_markers,
         strip_env_noise: k.strip_env_noise,
+        fast_mode: k.fast_mode,
         response_cache_enabled: k.response_cache_enabled,
         response_cache_ttl_secs: k.response_cache_ttl_secs,
         cache_read_ratio: k.cache_read_ratio,
@@ -1174,6 +1175,7 @@ pub async fn update_client_key(
         payload.cache_multiplier_cap,
         payload.anthropic_billing_mode,
         payload.cache_creation_ratio,
+        payload.fast_mode,
     ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

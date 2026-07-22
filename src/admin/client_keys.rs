@@ -57,6 +57,12 @@ pub struct ClientKey {
     /// 提示词过滤（per-key，默认关）：去环境噪音（删 # Environment 段、gitStatus 等行）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_env_noise: bool,
+    /// 快速模式（per-key，默认关，首字延迟优先）。开启后对该 Key 的请求：
+    /// 1) payload 截断用更小的字节上限（全局 `fastModeMaxPayloadBytes`，默认 400KB）→ 丢更多旧历史；
+    /// 2) 强制开启三个提示词过滤（simplify_cc / strip_boundary / strip_env_noise），覆盖各自单独设置。
+    /// 不动 web_search / usage-gated streaming / 计费。老数据无此字段时默认 false（行为不变）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast_mode: bool,
     /// 响应缓存 per-key 覆盖（None = 跟随全局 `responseCacheEnabled`；Some(true/false) = 强制开/关）。
     /// 老数据无此字段时为 None（跟随全局，行为不变）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +258,7 @@ impl ClientKeyManager {
             simplify_cc_prompt: prompt_filters.0,
             strip_boundary_markers: prompt_filters.1,
             strip_env_noise: prompt_filters.2,
+            fast_mode: false,
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
@@ -307,6 +314,7 @@ impl ClientKeyManager {
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
+                    fast_mode: false,
                     response_cache_enabled: None,
                     response_cache_ttl_secs: None,
                     cache_read_ratio: None,
@@ -404,6 +412,7 @@ impl ClientKeyManager {
         cache_multiplier_cap: Option<Option<f64>>,
         anthropic_billing_mode: Option<bool>,
         cache_creation_ratio: Option<Option<f64>>,
+        fast_mode: Option<bool>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -457,6 +466,9 @@ impl ClientKeyManager {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随默认 3%
                     e.cache_creation_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
+                if let Some(v) = fast_mode {
+                    e.fast_mode = v;
+                }
                 true
             }
             None => false,
@@ -483,6 +495,16 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .map(|e| e.cache_enabled)
+            .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 是否启用快速模式（首字延迟优先）。不存在时保守关闭。
+    pub fn fast_mode_of(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.fast_mode)
             .unwrap_or(false)
     }
 
@@ -807,8 +829,57 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         assert!(mgr.cache_enabled_of(entry.id));
+    }
+
+    #[test]
+    fn fast_mode_defaults_off_and_can_be_updated() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        // 默认关
+        assert!(!mgr.fast_mode_of(entry.id));
+        // 开启 fast_mode（最后一个参数）
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        ));
+        assert!(mgr.fast_mode_of(entry.id));
+        // 关回去
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+        ));
+        assert!(!mgr.fast_mode_of(entry.id));
+        // 不存在的 key
+        assert!(!mgr.fast_mode_of(999));
     }
 
     #[test]
@@ -833,6 +904,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -847,6 +919,7 @@ mod tests {
             None,
             None,
             Some(Some(0)),
+            None,
             None,
             None,
             None,
@@ -914,6 +987,7 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
+            None,
             None,
             None,
             None,

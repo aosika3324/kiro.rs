@@ -884,6 +884,9 @@ pub struct ClientKeyItem {
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
     pub strip_env_noise: bool,
+    /// 快速模式（per-key，默认关，首字延迟优先）。开启后降低 payload 截断阈值 + 强制三过滤全开。
+    #[serde(default)]
+    pub fast_mode: bool,
     /// 响应缓存开关覆盖（None = 跟随全局 `responseCacheEnabled`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_cache_enabled: Option<bool>,
@@ -985,6 +988,9 @@ pub struct UpdateClientKeyRequest {
     /// 字段缺省=不变更；`null`=复位跟随默认 3%；数值=强制（clamp [0,1]）。
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub cache_creation_ratio: Option<Option<f64>>,
+    /// 快速模式开关更新（字段缺省=不变更；true/false=开/关）。
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
 }
 
 /// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。
