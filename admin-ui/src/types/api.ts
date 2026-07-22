@@ -423,6 +423,8 @@ export interface ClientKeyItem {
   anthropicBillingMode?: boolean
   /** 标准模式 creation 占比覆盖 ∈ [0,1]（undefined = 跟随默认 3%；仅标准模式生效） */
   cacheCreationRatio?: number
+  /** 快速模式（默认 false，首字延迟优先）：降低 payload 截断阈值 + 强制三过滤全开 */
+  fastMode?: boolean
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
@@ -470,6 +472,8 @@ export interface UpdateClientKeyRequest {
   anthropicBillingMode?: boolean
   /** 标准模式 creation 占比覆盖更新 ∈ [0,1]（省略=不变更；null=复位跟随默认 3%；数值=强制） */
   cacheCreationRatio?: number | null
+  /** 快速模式开关更新（省略=不变更；true/false=开/关） */
+  fastMode?: boolean
 }
 
 // ============ 用量统计 ============

@@ -81,6 +81,8 @@ export function ClientKeysPage() {
   // Anthropic 标准计费模式开关（默认关）+ creation 占比（空串=跟随默认 3%）
   const [editBillingMode, setEditBillingMode] = useState(false)
   const [editCreationRatio, setEditCreationRatio] = useState('')
+  // 快速模式开关（默认关，首字延迟优先）
+  const [editFastMode, setEditFastMode] = useState(false)
   // 编辑弹窗当前分类 tab
   const [editTab, setEditTab] = useState<'basic' | 'metering' | 'filter' | 'respcache'>('basic')
 
@@ -197,6 +199,7 @@ export function ClientKeysPage() {
     setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
     setEditBillingMode(item.anthropicBillingMode ?? false)
     setEditCreationRatio(item.cacheCreationRatio != null ? String(item.cacheCreationRatio) : '')
+    setEditFastMode(item.fastMode ?? false)
     setEditTab('basic')
     setEditOpen(true)
   }
@@ -251,6 +254,7 @@ export function ClientKeysPage() {
           cacheMultiplierCap,
           anthropicBillingMode: editBillingMode,
           cacheCreationRatio,
+          fastMode: editFastMode,
         },
       })
       toast.success('已更新')
@@ -734,6 +738,19 @@ export function ClientKeysPage() {
 
             {editTab === 'filter' && (
             <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-amber-600">快速模式</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    首字延迟优先：用更小的 payload 截断阈值（全局 fastModeMaxPayloadBytes，默认 400KB，丢更多旧历史）+ 强制下面三项提示词过滤全开。牺牲部分上下文换更快首 token。
+                  </p>
+                </div>
+                <Switch
+                  checked={editFastMode}
+                  onCheckedChange={setEditFastMode}
+                  disabled={updateKey.isPending}
+                />
+              </div>
               <div className="mb-2 text-sm font-medium text-pink-600">提示词过滤</div>
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-3">
