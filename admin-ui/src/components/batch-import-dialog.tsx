@@ -153,7 +153,28 @@ function normalizeCredentialInput(item: unknown): CredentialInput {
   }
 }
 
+// 纯文本 API Key 批量导入:一行一个 ksk_ 密钥(容忍空行/前后空白/行内其它文本)。
+// 每个密钥包成 api_key 凭据(等价 {"kiroApiKey":"ksk_..."})。返回空数组表示没识别到。
+function parseApiKeyLines(raw: string): CredentialInput[] {
+  const keys = raw
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    // 从每行里抓 ksk_ 开头的 token(容忍行首有引号/逗号/减号等粘贴噪音)
+    .map((line) => line.match(/ksk_[A-Za-z0-9]+/)?.[0])
+    .filter((k): k is string => !!k)
+  // 去重(同一密钥多次粘贴)
+  const unique = Array.from(new Set(keys))
+  return unique.map((kiroApiKey) => ({ kiroApiKey, authMethod: 'api_key' }))
+}
+
 function parseCredentialJson(raw: string): CredentialInput[] {
+  const trimmed = raw.trim()
+  // 非 JSON 起始({ 或 [)时,直接按纯文本 ksk_ 行解析(批量粘贴 API Key 场景)。
+  if (trimmed && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    const keys = parseApiKeyLines(trimmed)
+    if (keys.length > 0) return keys
+    // 落空则继续走 JSON.parse,给出标准 JSON 错误提示
+  }
   const parsed = JSON.parse(raw)
   const rawItems =
     parsed && typeof parsed === 'object' && Array.isArray(parsed.accounts)
@@ -516,7 +537,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 { "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n企业 SSO external_idp: [{"refreshToken":"...","accessToken":"...","authMethod":"external_idp","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","issuerUrl":"...","scopes":"...","region":"eu-central-1"}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion；字段支持 camelCase / snake_case'}
+              placeholder={'方式一（API Key 批量）：直接一行一个 ksk_ 密钥粘贴即可\nksk_xxxxxxxx\nksk_yyyyyyyy\n\n方式二（JSON）：支持单个对象、数组，或 { "accounts": [...] }\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n企业 SSO external_idp: [{"refreshToken":"...","accessToken":"...","authMethod":"external_idp","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","issuerUrl":"...","scopes":"...","region":"eu-central-1"}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion；字段支持 camelCase / snake_case'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
