@@ -285,6 +285,14 @@ async fn main() {
         config.cache_meter_ttl_secs,
     ));
 
+    // CchCacheMeter：Anthropic 标准计费模式（per-key anthropic_billing_mode）专用的有状态
+    // 内容指纹缓存计量。持久化到 cache_dir/cch_cache.json，启动时自动加载未过期条目。
+    // 默认检测安全 delta 支路不使用它（走上面的 MeterGovernance）。
+    let cch_cache_meter = std::sync::Arc::new(anthropic::cache_metering::CchCacheMeter::new(Some(
+        cache_dir.join("cch_cache.json"),
+    )));
+    cch_cache_meter.clone().spawn_background();
+
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
     // 这样可经 Admin API 运行时开启而无需重启；全局开关 + TTL 作为运行时原子值存于缓存内，
     // 关闭时表为空、几乎零内存开销。
@@ -313,6 +321,8 @@ async fn main() {
         config.usage_gated_streaming_enabled,
         Some(response_cache.clone()),
         Some(model_mappings.clone()),
+        Some(cch_cache_meter.clone()),
+        config.fast_mode_max_payload_bytes,
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

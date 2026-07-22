@@ -16,7 +16,7 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::cache_metering::SharedMeterGovernance;
+use super::cache_metering::{SharedCchCacheMeter, SharedMeterGovernance};
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -32,6 +32,9 @@ pub struct KeyContext {
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
     pub strip_env_noise: bool,
+    /// 快速模式（per-key，默认关，首字延迟优先）。开启后：payload 截断阈值降到全局
+    /// `fast_mode_max_payload_bytes`（默认 400KB）+ 强制三个提示词过滤全开。
+    pub fast_mode: bool,
     /// 响应缓存 per-key 覆盖（None = 跟随全局配置）。
     pub response_cache_enabled: Option<bool>,
     pub response_cache_ttl_secs: Option<u32>,
@@ -64,8 +67,11 @@ pub struct AppState {
     pub usage_recorder: Option<SharedRecorder>,
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
-    /// 中转层缓存计量运行时治理（全局命中率 R 旋钮，per-key 可覆盖）
+    /// 中转层缓存计量运行时治理（全局命中率 R 旋钮，per-key 可覆盖）。仅 delta 支路使用。
     pub meter_governance: Option<SharedMeterGovernance>,
+    /// CCH 内容指纹缓存计量（有状态）。仅 Anthropic 标准计费模式（per-key
+    /// `anthropic_billing_mode`）支路使用；default None 时该支路回退全 input。
+    pub cch_cache_meter: Option<SharedCchCacheMeter>,
     /// 响应体缓存（真实响应回放；全局开关 + TTL 作为运行时原子值存于缓存内部）
     pub response_cache: Option<super::response_cache::SharedResponseCache>,
     /// OpenAI 端点可配置模型映射表（全局，运行时热编辑）
@@ -75,6 +81,9 @@ pub struct AppState {
     /// `/cc/v1` usage-gated streaming 开关（来自 config.usage_gated_streaming_enabled）。
     /// true（默认）= 首包优化；false = 回退全缓冲。
     pub usage_gated_streaming: bool,
+    /// 快速模式（per-key `fast_mode`）下的 payload 字节上限（来自
+    /// config.fast_mode_max_payload_bytes，默认 400KB）。仅对开启 fast_mode 的 Key 生效。
+    pub fast_mode_max_payload_bytes: usize,
 }
 
 impl AppState {
@@ -92,10 +101,12 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             meter_governance: None,
+            cch_cache_meter: None,
             response_cache: None,
             model_mappings: None,
             trace_store: None,
             usage_gated_streaming: true,
+            fast_mode_max_payload_bytes: 400_000,
         }
     }
 
@@ -108,6 +119,12 @@ impl AppState {
     /// 注入 `/cc/v1` usage-gated streaming 开关
     pub fn with_usage_gated_streaming(mut self, enabled: bool) -> Self {
         self.usage_gated_streaming = enabled;
+        self
+    }
+
+    /// 注入快速模式 payload 字节上限（config.fast_mode_max_payload_bytes）
+    pub fn with_fast_mode_max_payload_bytes(mut self, bytes: usize) -> Self {
+        self.fast_mode_max_payload_bytes = bytes;
         self
     }
 
@@ -124,9 +141,15 @@ impl AppState {
         self
     }
 
-    /// 注入缓存计量运行时治理
+    /// 注入缓存计量运行时治理（delta 支路）
     pub fn with_meter_governance(mut self, governance: Option<SharedMeterGovernance>) -> Self {
         self.meter_governance = governance;
+        self
+    }
+
+    /// 注入 CCH 内容指纹缓存计量（Anthropic 标准计费模式支路）
+    pub fn with_cch_cache_meter(mut self, cache: Option<SharedCchCacheMeter>) -> Self {
+        self.cch_cache_meter = cache;
         self
     }
 
@@ -178,6 +201,7 @@ pub async fn auth_middleware(
             let cache_enabled = mgr.cache_enabled_of(id);
             let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
                 mgr.prompt_filters_of(id);
+            let fast_mode = mgr.fast_mode_of(id);
             let (response_cache_enabled, response_cache_ttl_secs) = mgr.response_cache_cfg_of(id);
             let cache_read_ratio = mgr.cache_read_ratio_of(id);
             let cache_multiplier_cap = mgr.cache_multiplier_cap_of(id);
@@ -190,6 +214,7 @@ pub async fn auth_middleware(
                 simplify_cc_prompt,
                 strip_boundary_markers,
                 strip_env_noise,
+                fast_mode,
                 response_cache_enabled,
                 response_cache_ttl_secs,
                 cache_multiplier_cap,

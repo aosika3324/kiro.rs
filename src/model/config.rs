@@ -267,6 +267,16 @@ pub struct Config {
     #[serde(default = "default_cache_meter_ttl_secs")]
     pub cache_meter_ttl_secs: u64,
 
+    /// CCH（Anthropic 标准计费模式，per-key `anthropicBillingMode`）内容指纹缓存的**兜底默认
+    /// TTL**（秒，默认 300 = 5min）。**独立**于 delta 支路的 `cache_meter_ttl_secs`（两套计量
+    /// 模型互不影响，见 `crate::anthropic::cache_metering`）。
+    ///
+    /// 注意：CCH 的实际写入 TTL 由每次请求的 `cache_control.ttl` 探测决定（`cch_detect_max_ttl`
+    /// clip 到 [60,3600]），本项仅作为未探测到任何 cache_control 时的全局兜底默认值占位，
+    /// 供将来接入 CchCacheMeter 的可配置默认 TTL；当前 CCH 保留其自带的 5m 默认，本字段不强接。
+    #[serde(default = "default_cch_cache_ttl_secs")]
+    pub cch_cache_ttl_secs: u64,
+
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
     /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
@@ -348,6 +358,52 @@ pub struct Config {
     #[serde(default = "default_large_request_rank_penalty")]
     pub large_request_rank_penalty: usize,
 
+    /// 快速模式（per-key `fastMode`）下的 payload 字节上限（默认 400_000 = 400KB）。
+    ///
+    /// 当某入口 Key 开启 fast_mode 时，其请求用此更小的字节上限（而非普通的
+    /// `KIRO_RS_MAX_PAYLOAD_BYTES`，通常 640KB）裁剪历史 → 丢更多旧历史 → prefill
+    /// token 更少 → 首字更快。仅影响开启 fast_mode 的 Key，默认（关）行为不变。
+    #[serde(default = "default_fast_mode_max_payload_bytes")]
+    pub fast_mode_max_payload_bytes: usize,
+
+    /// 会话粘性 TTL（秒，默认 300 = 5 分钟）。
+    ///
+    /// 同一会话（session_seed，见 `isolation_seed`）在此窗口内的后续请求，优先复用上次成功
+    /// 命中的凭据（同 quality_tier 内 sticky_rank=0 排前），以提升上游前缀缓存命中率、降低
+    /// 首字节延迟。仅在同 quality_tier 内生效（不会为粘性去打更差档的号）；命中账号满载时
+    /// acquire 的逐候选非阻塞回落天然试下一个，不硬锁、不拖速度。无 session_seed 时整体退化
+    /// 回纯负载均衡。设为 0 即关闭粘性。
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub sticky_ttl_secs: u64,
+
+    /// 质量分级：成功率（`ewma_error`）"好档"上限（默认 0.02）。
+    ///
+    /// `ewma_error < quality_error_good` 的凭据进入 tier0（好号，优先打满）；
+    /// `< quality_error_bad` 进 tier1（普通）；`>=` 进 tier2（垃圾号，兜底）。
+    #[serde(default = "default_quality_error_good")]
+    pub quality_error_good: f64,
+
+    /// 质量分级：成功率（`ewma_error`）"垃圾档"下限（默认 0.15）。见 [`Self::quality_error_good`]。
+    #[serde(default = "default_quality_error_bad")]
+    pub quality_error_bad: f64,
+
+    /// 质量分级：是否启用延迟（`ewma_duration_ms`）作为次信号（默认 false）。
+    ///
+    /// **坑（务必知悉）**：`ewma_duration_ms` 是整请求耗时，受请求大小（prefill）污染——
+    /// 大上下文请求天然慢，不代表号差。所以延迟判据默认**关闭**，且即便开启，阈值也设得很
+    /// 宽松（见 `quality_latency_ms`），宁可不按延迟分级，也绝不把"接大请求的好号"误判成垃圾。
+    /// 建议先只按成功率分级；确有需要再开此开关。
+    #[serde(default)]
+    pub quality_latency_enabled: bool,
+
+    /// 质量分级：延迟次信号阈值（毫秒，默认 60000 = 60s，很宽松）。
+    ///
+    /// 仅当 `quality_latency_enabled=true` 时生效：在成功率允许的 tier 内，若
+    /// `ewma_duration_ms > quality_latency_ms` 则把该 tier 降一档（tier0→tier1，tier1 保持）。
+    /// 默认阈值故意设得很大（60s），避免误伤接大请求（prefill 慢）的健康好号。见上方污染坑说明。
+    #[serde(default = "default_quality_latency_ms")]
+    pub quality_latency_ms: f64,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -371,8 +427,33 @@ fn default_circuit_breaker_threshold() -> f64 {
 }
 
 /// serde 默认值：大请求调度排序惩罚（整数千分比，按在途数缩放）。
+/// serde 默认值：fast_mode 下的 payload 字节上限（400KB）。
+fn default_fast_mode_max_payload_bytes() -> usize {
+    400_000
+}
+
 fn default_large_request_rank_penalty() -> usize {
     500
+}
+
+/// serde 默认值：会话粘性 TTL（秒），5 分钟。
+fn default_sticky_ttl_secs() -> u64 {
+    300
+}
+
+/// serde 默认值：质量分级"好档"成功率上限（ewma_error < 0.02 → tier0）。
+fn default_quality_error_good() -> f64 {
+    0.02
+}
+
+/// serde 默认值：质量分级"垃圾档"成功率下限（ewma_error >= 0.15 → tier2）。
+fn default_quality_error_bad() -> f64 {
+    0.15
+}
+
+/// serde 默认值：延迟次信号阈值（毫秒），故意很宽松以避开 prefill 污染坑。
+fn default_quality_latency_ms() -> f64 {
+    60_000.0
 }
 
 fn default_host() -> String {
@@ -479,6 +560,10 @@ fn default_cache_meter_ttl_secs() -> u64 {
     300
 }
 
+fn default_cch_cache_ttl_secs() -> u64 {
+    300
+}
+
 fn default_response_cache_ttl_secs() -> u64 {
     crate::anthropic::response_cache::DEFAULT_TTL_SECS
 }
@@ -540,6 +625,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_read_ratio: default_cache_read_ratio(),
             cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
+            cch_cache_ttl_secs: default_cch_cache_ttl_secs(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
@@ -553,6 +639,12 @@ impl Default for Config {
             stream_conn_reuse_enabled: false,
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             large_request_rank_penalty: default_large_request_rank_penalty(),
+            fast_mode_max_payload_bytes: default_fast_mode_max_payload_bytes(),
+            sticky_ttl_secs: default_sticky_ttl_secs(),
+            quality_error_good: default_quality_error_good(),
+            quality_error_bad: default_quality_error_bad(),
+            quality_latency_enabled: false,
+            quality_latency_ms: default_quality_latency_ms(),
             endpoints: HashMap::new(),
             config_path: None,
         }

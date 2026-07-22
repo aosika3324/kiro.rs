@@ -482,6 +482,22 @@ pub(crate) fn compute_cache_usage_for_key(
     if !key_ctx.cache_enabled {
         return super::cache_metering::CacheUsage::default();
     }
+
+    // ---- CCH 支路（Anthropic 标准计费模式，per-key `anthropic_billing_mode` 开启）--------
+    // 内部实现为上游 CCH 内容指纹计量（有状态最长公共前缀命中），与默认 delta 支路完全隔离。
+    // 无 CchCacheMeter 实例时回退全 input（default = Delta，split 全计 input）。
+    // 无 session 的主 Key（key_id==0）经 cch_isolation_seed 返回 None → cch_compute_cache_usage
+    // 内部返回全 input（不模拟跨用户缓存）。read_ratio / creation_ratio / multiplier_cap 在此模式失效。
+    if key_ctx.anthropic_billing_mode {
+        return match state.cch_cache_meter.as_ref() {
+            Some(cache) => super::cache_metering::CacheUsage::Cch(
+                super::cache_metering::cch_compute_cache_usage(cache, payload, key_ctx.key_id),
+            ),
+            None => super::cache_metering::CacheUsage::default(),
+        };
+    }
+
+    // ---- 默认检测安全支路（delta，billing_mode=false）：完全不变 ----------------------------
     let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
         state
             .meter_governance
@@ -509,17 +525,9 @@ pub(crate) fn compute_cache_usage_for_key(
     usage.multiplier_cap = key_ctx
         .cache_multiplier_cap
         .unwrap_or(super::cache_metering::DEFAULT_MULTIPLIER_CAP);
-    // Anthropic 标准计费模式（per-key，默认关）：开启则 split_final 走真实互斥三桶口径
-    // （不超报、不双重收费，且不施加 multiplier_cap 护栏）；利润来自 R 挪桶。关闭时走
-    // 检测安全的 split_against_total（受护栏）。
-    usage.billing_mode = key_ctx.anthropic_billing_mode;
-    if usage.billing_mode {
-        // creation 占比：per-key 覆盖优先，否则默认 3%（DEFAULT_CREATION_RATIO）。定 creation 形状。
-        usage.creation_ratio = key_ctx
-            .cache_creation_ratio
-            .unwrap_or(super::cache_metering::DEFAULT_CREATION_RATIO);
-    }
-    usage
+    // billing_mode 关（默认）→ split_final 走检测安全的 split_against_total（受护栏）。
+    usage.billing_mode = false;
+    super::cache_metering::CacheUsage::Delta(usage)
 }
 
 /// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。
@@ -567,10 +575,19 @@ pub(crate) fn prepare_kiro_request(
     // 1. per-key 提示词过滤（只作用于客户端原始 system，转换器自注入的 prefix 不受影响）
     super::prompt_filter::apply(&mut payload.system, key_ctx);
 
-    // 2. 转换 + payload 字节上限裁剪
+    // 2. 转换 + payload 字节上限裁剪（透传 tool_compatibility_mode，使全局 Raw 档生效）。
+    //    fast_mode Key 用更小的字节上限（config.fast_mode_max_payload_bytes，默认 400KB）多丢历史。
+    let payload_cfg = if key_ctx.fast_mode {
+        super::payload_truncate::PayloadLimitConfig {
+            max_bytes: state.fast_mode_max_payload_bytes,
+        }
+    } else {
+        super::payload_truncate::PayloadLimitConfig::from_env()
+    };
     let conversion_result = match super::payload_truncate::convert_within_limit(
         payload,
-        &super::payload_truncate::PayloadLimitConfig::from_env(),
+        &payload_cfg,
+        state.tool_compatibility_mode,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -1051,8 +1068,7 @@ pub async fn post_messages(
 
     // 转换请求（提示词过滤 + 裁剪 + 转换 + 序列化 + token 估算 + cache 计量）。
     // 与 OpenAI `/v1/chat/completions` 共用同一份 `prepare_kiro_request` 真相源。
-    // 注：prepare_kiro_request 内部经 convert_within_limit → convert_request（ClaudeCode 默认档），
-    // 详见文末 CONCERN——裁剪路径当前未透传 state.tool_compatibility_mode。
+    // prepare_kiro_request 内部经 convert_within_limit 透传 state.tool_compatibility_mode。
     let prepared = match prepare_kiro_request(&state, &mut payload, &key_ctx) {
         Ok(p) => p,
         Err(resp) => {
@@ -1093,6 +1109,11 @@ pub async fn post_messages(
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
     let cache_usage = prepared.cache_usage;
 
+    // 会话粘性 seed:同会话优先复用上次命中的凭据(提升上游前缀缓存命中/降首字节)。
+    // 与计费同口径 isolation_seed(优先 metadata session,否则 key:{id}:root:{首条哈希});
+    // 恒 Some——调度粘性即便 key_id==0 也按会话根哈希粘同号(与计费不同,此处无跨用户串号顾虑)。
+    let session_seed = Some(super::cache_metering::isolation_seed(&payload, key_ctx.key_id));
+
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1119,6 +1140,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            session_seed,
         )
         .await
     } else {
@@ -1149,6 +1171,7 @@ pub async fn post_messages(
             tracer,
             key_ctx.group.clone(),
             response_cache_store,
+            session_seed,
         )
         .await
     }
@@ -1167,10 +1190,11 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    session_seed: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_seed.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -1416,10 +1440,11 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
+    session_seed: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref(), session_seed.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -1927,8 +1952,7 @@ pub async fn post_messages_cc(
     // `prepare_kiro_request` 是后来提炼的，post_messages 非流式分支已走它，但 /cc/v1 的流式分支
     // 因需要在中途插入 GatedStreamContext 相关逻辑仍保留了这段内联副本。修改请求侧转换逻辑时
     // 两处需同步；后续可考虑把这段也收敛进 prepare_kiro_request。
-    // 注：与 prepare_kiro_request 一样，convert_within_limit 内部经 convert_request 走 ClaudeCode
-    // 默认档，未透传 state.tool_compatibility_mode（见文件顶部 /v1 路径的同类 CONCERN）。
+    // 注：与 prepare_kiro_request 一样，convert_within_limit 透传 state.tool_compatibility_mode。
     let conversion_started = Instant::now();
     // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
     // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
@@ -1936,9 +1960,18 @@ pub async fn post_messages_cc(
     super::prompt_filter::apply(&mut payload.system, &key_ctx);
     // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
     // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
+    // fast_mode Key 用更小的字节上限（config.fast_mode_max_payload_bytes，默认 400KB）多丢历史。
+    let payload_cfg = if key_ctx.fast_mode {
+        super::payload_truncate::PayloadLimitConfig {
+            max_bytes: state.fast_mode_max_payload_bytes,
+        }
+    } else {
+        super::payload_truncate::PayloadLimitConfig::from_env()
+    };
     let conversion_result = match super::payload_truncate::convert_within_limit(
         &mut payload,
-        &super::payload_truncate::PayloadLimitConfig::from_env(),
+        &payload_cfg,
+        state.tool_compatibility_mode,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2030,6 +2063,9 @@ pub async fn post_messages_cc(
     // Key 开启时使用中转层增强缓存；关闭时回退到标准 cache_control 口径。
     let cache_usage = compute_cache_usage_for_key(&state, &payload, &key_ctx);
 
+    // 会话粘性 seed(同 post_messages,见那里注释)。恒 Some,含 key_id==0。
+    let session_seed = Some(super::cache_metering::isolation_seed(&payload, key_ctx.key_id));
+
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -2059,6 +2095,7 @@ pub async fn post_messages_cc(
                 tracer,
                 key_ctx.group.clone(),
                 response_cache_store,
+                session_seed,
             )
             .await
         } else {
@@ -2076,6 +2113,7 @@ pub async fn post_messages_cc(
                 tracer,
                 key_ctx.group.clone(),
                 response_cache_store,
+                session_seed,
             )
             .await
         }
@@ -2107,6 +2145,7 @@ pub async fn post_messages_cc(
             tracer,
             key_ctx.group.clone(),
             response_cache_store,
+            session_seed,
         )
         .await
     }
@@ -2129,10 +2168,11 @@ async fn handle_stream_request_buffered(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
+    session_seed: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_seed.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -2364,9 +2404,10 @@ async fn handle_stream_request_gated(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
+    session_seed: Option<String>,
 ) -> Response {
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_seed.as_deref())
         .await
     {
         Ok(resp) => resp,

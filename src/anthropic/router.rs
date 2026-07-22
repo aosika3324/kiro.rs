@@ -14,7 +14,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
 
 use super::{
-    cache_metering::SharedMeterGovernance,
+    cache_metering::{SharedCchCacheMeter, SharedMeterGovernance},
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
@@ -46,6 +46,8 @@ pub fn create_router_with_provider(
         true,
         None,
         None,
+        None,
+        400_000,
     )
 }
 
@@ -63,6 +65,8 @@ pub fn create_router(
     usage_gated_streaming: bool,
     response_cache: Option<SharedResponseCache>,
     model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    cch_cache_meter: Option<SharedCchCacheMeter>,
+    fast_mode_max_payload_bytes: usize,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -70,9 +74,11 @@ pub fn create_router(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_meter_governance(meter_governance);
+    state = state.with_cch_cache_meter(cch_cache_meter);
     state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);
+    state = state.with_fast_mode_max_payload_bytes(fast_mode_max_payload_bytes);
     state = state.with_model_mappings(model_mappings);
 
     // 需要认证的 /v1 路由

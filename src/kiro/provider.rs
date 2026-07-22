@@ -387,8 +387,8 @@ pub struct KiroProvider {
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
     client_cache: Mutex<ClientCache>,
-    /// 流式专用 Client 缓存（禁用空闲连接复用，见 [`build_streaming_client`]）。
-    /// 与 `client_cache` 同构、同样按 effective proxy 缓存，但每条流用全新连接，
+    /// 流式专用 Client 缓存（小连接池 + H2 keepalive，见 [`build_streaming_client`]）。
+    /// 与 `client_cache` 同构、同样按 effective proxy 缓存；连接池复用省 TLS 握手,
     /// 避免长流被上游中途掐断导致的"断流"。
     streaming_client_cache: Mutex<ClientCache>,
     /// TLS 指纹 (wreq) 客户端缓存。仅当 `config.tls_fingerprint_enabled` 开启时才会建/用。
@@ -624,11 +624,14 @@ impl KiroProvider {
             .as_deref()
             .or(preferred.as_deref())
             .unwrap_or(&self.default_endpoint);
+        // 自动模式 fallback 顺序:Runtime → IDE → CodeWhisperer → Amazon Q。
+        // Runtime 优先(首字最快的端点打头),失败依次回落;此数组同时决定 auto 全序
+        // 与 primary 指定时的补序。cli 不在链内(独立路由,不参与 auto fallback)。
         const FALLBACK_ORDER: [&str; 4] = [
+            RUNTIME_ENDPOINT_NAME,
             IDE_ENDPOINT_NAME,
             CODEWHISPERER_ENDPOINT_NAME,
             AMAZONQ_ENDPOINT_NAME,
-            RUNTIME_ENDPOINT_NAME,
         ];
         if Self::is_auto_endpoint(configured) {
             return FALLBACK_ORDER
@@ -756,19 +759,24 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_seed: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group)
+        self.call_api_with_retry(request_body, false, sink, group, session_seed)
             .await
     }
 
     /// 发送流式 API 请求
+    ///
+    /// `session_seed`（见 `cache_metering::isolation_seed`）用于会话粘性调度：同会话优先复用
+    /// 上次成功命中的凭据以提升上游前缀缓存命中率；`None` 时粘性不生效。
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_seed: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group)
+        self.call_api_with_retry(request_body, true, sink, group, session_seed)
             .await
     }
 
@@ -974,6 +982,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_seed: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -1000,7 +1009,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_sized(model.as_deref(), group, large_penalty)
+                .acquire_context_sized(model.as_deref(), group, large_penalty, session_seed)
                 .await
             {
                 Ok(c) => {
