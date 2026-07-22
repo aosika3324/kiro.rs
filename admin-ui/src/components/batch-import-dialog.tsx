@@ -49,10 +49,6 @@ interface CredentialInput {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
-  // 企业 SSO (external_idp)
-  tokenEndpoint?: string
-  issuerUrl?: string
-  scopes?: string
 }
 
 interface VerificationResult {
@@ -345,9 +341,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               clientId,
               // external_idp 为公共客户端，不携带 clientSecret
               clientSecret: isExternalIdp ? undefined : clientSecret,
-              tokenEndpoint,
-              issuerUrl: cred.issuerUrl?.trim() || undefined,
-              scopes: cred.scopes?.trim() || undefined,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,

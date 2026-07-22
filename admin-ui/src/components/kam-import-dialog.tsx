@@ -409,13 +409,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         // authMethod 归一化：显式 authMethod 优先（KAM 企业 SSO 导出即便缺 tokenEndpoint
         // 也标 external_idp）；否则有 tokenEndpoint 视为 external_idp；再否则按 clientId+secret
         // 判 idc；兜底 social。
-        const authMethod = rawAuthMethod
+        const authMethod: 'social' | 'idc' | 'api_key' | 'external_idp' = (rawAuthMethod
           ? rawAuthMethod
           : tokenEndpoint
             ? 'external_idp'
             : clientId && clientSecret
               ? 'idc'
-              : 'social'
+              : 'social') as 'social' | 'idc' | 'api_key' | 'external_idp'
         const provider = cred.provider?.trim() || account.idp?.trim() || undefined
 
         // idc 模式下必须同时提供 clientId 和 clientSecret
