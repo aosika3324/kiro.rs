@@ -1636,7 +1636,16 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
 }
 
 /// 入站还原工具名 + 入参给客户端。名字从 `tool_name_map`（kiro名→客户端名）还原；
-/// 入参按 kiro_name 反向重写（对非内置 / 长名缩短是 no-op）。
+/// 入参**仅在该 kiro 工具确由 ClaudeCode 内置别名映射而来时**才反向重写，否则原样透传。
+///
+/// 这道闸与出站 [`map_tool_input_to_kiro`] 对称（后者用 `is_claude_code_mode(mode)` +
+/// `claude_code_tool_name_to_kiro(client_name)` 双闸放行）。缺了它会产生一类回归：
+/// 透传客户端（Roo Code / Cline 等）自带的工具若**名字恰好撞上 Kiro 内置名**
+/// （如 Roo 的 `read_file`，入参用 `path`/`start_line`），`map_tool_input_from_kiro`
+/// 会无条件把它改写成 Kiro 口径（`file_path`/`offset`/`limit`），客户端遂报
+/// “参数名写错了 / 无法正确使用工具”。判据：`tool_name_map` 里存在 kiro_name→client_name
+/// 且 `claude_code_tool_name_to_kiro(client_name) == Some(kiro_name)`（即出站确实按 CC
+/// 别名改过名）。长名缩短（client 长名→短名）与透传工具都不满足此判据，一律不改入参。
 pub fn restore_tool_use_for_client(
     kiro_name: &str,
     input: serde_json::Value,
@@ -1646,7 +1655,15 @@ pub fn restore_tool_use_for_client(
         .get(kiro_name)
         .cloned()
         .unwrap_or_else(|| kiro_name.to_string());
-    let client_input = map_tool_input_from_kiro(kiro_name, input);
+    // 仅当出站确由 ClaudeCode 内置别名映射（client_name 是 CC 别名且反查命中本 kiro_name）
+    // 才反向重写入参；透传工具 / 长名缩短一律原样，避免撞名污染。
+    let mapped_via_cc_alias =
+        claude_code_tool_name_to_kiro(&client_name) == Some(kiro_name);
+    let client_input = if mapped_via_cc_alias {
+        map_tool_input_from_kiro(kiro_name, input)
+    } else {
+        input
+    };
     (client_name, client_input)
 }
 
@@ -3285,6 +3302,42 @@ mod tests {
         assert_eq!(
             restored, input,
             "客户端自带 Read 工具在 Raw 下入参必须原样保留（不被误映射）"
+        );
+    }
+
+    /// 回归（v0.7.1 合并引入）：透传客户端（Roo Code / Cline 等）自带的工具若名字
+    /// **恰好等于某个 Kiro 内置名**（如 Roo 的 `read_file`，入参用 `path`/`start_line`/
+    /// `end_line`），入站还原**绝不能**把它改写成 Kiro 口径（`file_path`/`offset`/`limit`）。
+    /// 判据是“出站确经 CC 别名映射”，故 tool_name_map 无该条目时必须原样透传。
+    /// 缺这道闸时客户端会报“参数名写错了 / 无法正确使用工具”。
+    #[test]
+    fn passthrough_client_tool_colliding_with_kiro_name_not_rewritten() {
+        // Roo 自带 read_file 工具，透传（未经 CC 别名映射），map 无条目。
+        let map = HashMap::new();
+        let input = serde_json::json!({"path": "/x.rs", "start_line": 1, "end_line": 40});
+        let (name, restored) = restore_tool_use_for_client("read_file", input.clone(), &map);
+        assert_eq!(name, "read_file", "透传工具名不变");
+        assert_eq!(
+            restored, input,
+            "撞名的透传工具入参必须原样保留（path 不得被改成 file_path）"
+        );
+    }
+
+    /// 对照：同名 `read_file` 但**确经 CC 别名 Read 映射而来**（map 有 read_file→Read），
+    /// 此时入参才应被反向重写为 Kiro 口径。确保修复没误伤 CC 正常还原。
+    #[test]
+    fn cc_mapped_read_file_still_rewrites_input() {
+        let mut map = HashMap::new();
+        map.insert("read_file".to_string(), "Read".to_string());
+        let input = serde_json::json!({"path": "/x.rs", "start_line": 1, "end_line": 40});
+        let (name, restored) = restore_tool_use_for_client("read_file", input, &map);
+        assert_eq!(name, "Read");
+        assert_eq!(restored["file_path"], serde_json::json!("/x.rs"));
+        assert_eq!(restored["offset"], serde_json::json!(1));
+        assert_eq!(restored["limit"], serde_json::json!(40)); // 40 - 1 + 1
+        assert!(
+            restored.get("path").is_none() && restored.get("start_line").is_none(),
+            "CC 映射来源应完成键位重写"
         );
     }
 

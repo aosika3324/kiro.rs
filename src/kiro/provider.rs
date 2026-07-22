@@ -624,14 +624,21 @@ impl KiroProvider {
             .as_deref()
             .or(preferred.as_deref())
             .unwrap_or(&self.default_endpoint);
-        // 自动模式 fallback 顺序:Runtime → IDE → CodeWhisperer → Amazon Q。
-        // Runtime 优先(首字最快的端点打头),失败依次回落;此数组同时决定 auto 全序
-        // 与 primary 指定时的补序。cli 不在链内(独立路由,不参与 auto fallback)。
+        // 自动模式 fallback 顺序:IDE → CodeWhisperer → Amazon Q → Runtime。
+        // 此数组同时决定 auto 全序与 primary 指定时的补序。cli 不在链内(独立路由,不参与
+        // auto fallback)。
+        //
+        // 为何 IDE 打头、Runtime 垫底(而非按首字延迟把 Runtime 提前):
+        // 1. IDE 端点对 external_idp(企业/Entra)凭据会切到 codewhisperer host,Runtime
+        //    不做此切换——Runtime 当主端点会让企业账号路由到错误 host。
+        // 2. Runtime 走 runtime.*.kiro.dev,其后端模型/调优与 q.*.amazonaws.com 未必一致,
+        //    实测把 Runtime 提前会引发工具调用类异常;保持 IDE 主端点是已验证的稳妥序。
+        // 首字优化应走连接池/握手层(见 build_streaming_client),不靠切换主端点。
         const FALLBACK_ORDER: [&str; 4] = [
-            RUNTIME_ENDPOINT_NAME,
             IDE_ENDPOINT_NAME,
             CODEWHISPERER_ENDPOINT_NAME,
             AMAZONQ_ENDPOINT_NAME,
+            RUNTIME_ENDPOINT_NAME,
         ];
         if Self::is_auto_endpoint(configured) {
             return FALLBACK_ORDER
