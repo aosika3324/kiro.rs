@@ -29,7 +29,7 @@ pub struct HttpTimeouts {
 /// 解析分层超时（见各字段在 [`build_client_inner`] 的语义说明）。
 pub fn resolve_http_timeouts() -> HttpTimeouts {
     HttpTimeouts {
-        connect: env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 15),
+        connect: env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 10),
         read: env_secs("KIRO_RS_HTTP_READ_TIMEOUT_SECS", 300),
         keepalive: env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60),
         pool_idle: env_secs("KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS", 15),
@@ -91,21 +91,28 @@ pub fn build_client(
     build_client_inner(proxy, timeout_secs, tls_backend, 8)
 }
 
-/// 构建**禁用空闲连接复用**的 HTTP Client（专用于流式上游请求）。
+/// 构建流式上游专用 HTTP Client（**启用小连接池 + H2 keepalive 探活**）。
 ///
-/// 流式响应体的生命周期很长（整条 SSE 流），期间上游 AWS ALB 可能在长 prefill
-/// 静默期把空闲/复用连接掐断；而流一旦开始（已回 200 + 部分 SSE），中途断连
-/// **无法重试**，对客户端表现为"断流"。把 `pool_max_idle_per_host` 设为 0 后，
-/// reqwest 不再复用空闲连接、也不把流式连接还池——每条流都用全新连接，从根上
-/// 杜绝"取到半死连接"和"复用连接被中途掐断"两类断流。代价是每次多一次 TCP+TLS
-/// 握手，对长流可忽略；非流式请求（MCP/刷新/balance/profile）仍走 [`build_client`]
-/// 保留连接复用与首 token 优化。
+/// 历史上此路径曾用 `pool_max_idle_per_host = 0`（禁用复用），理由是"AWS ALB 在长
+/// prefill 静默期掐断空闲/复用连接导致断流"。**2026-07-21 对上游 `codewhisperer.
+/// us-east-1.amazonaws.com` 实测推翻了这个归因**：H2 空闲连接晾到 130s（远超所谓
+/// 60s ALB timeout）AWS 未掐断（无 GOAWAY/FIN/RST，30s 还回 SETTINGS 保活）。而池=0
+/// 的实测代价是**每条流多付 ~128ms TLS 握手**（冷连首字 163ms vs 复用 35ms），直接
+/// 拖首字。故改为小池（默认 4）复用连接省握手；配合 [`build_client_inner`] 里
+/// pool>0 时启用的 H2 keepalive PING，在**复用前**淘汰真死连接。万一仍取到中途被掐
+/// 的连接，由上层重试循环 + 断流 `error` 信号兜底（活跃流中途断连本就与池设置无关，
+/// 单个长请求独占一条连，池大小不影响它）。可经 `KIRO_RS_HTTP_STREAM_POOL_MAX_IDLE`
+/// 覆盖；设 0 可回退到旧的禁用复用行为。
 pub fn build_streaming_client(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_inner(proxy, timeout_secs, tls_backend, 0)
+    let stream_pool = std::env::var("KIRO_RS_HTTP_STREAM_POOL_MAX_IDLE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
+    build_client_inner(proxy, timeout_secs, tls_backend, stream_pool)
 }
 
 /// 构建 HTTP Client（内部实现）
@@ -146,6 +153,19 @@ fn build_client_inner(
         // pool_max_idle_per_host=0 时 reqwest 禁用空闲连接复用(流式专用,见 build_streaming_client)。
         .pool_idle_timeout(Duration::from_secs(pool_idle))
         .pool_max_idle_per_host(pool_max_idle_per_host);
+
+    // H2 keepalive：仅对**复用连接**的非流式路径（pool_max_idle_per_host > 0）启用。
+    // 上游走 ALPN 协商的 HTTP/2；主动 PING 探测让被 AWS ALB 静默掐断的僵尸连接在**复用前**
+    // 被发现并淘汰，避免辅助请求（MCP/刷新/balance/profile）取到死连接后干等到超时——这类
+    // 尾部延迟毛刺会拖慢首 token 前的准备阶段。流式路径 pool=0（无空闲复用，见
+    // build_streaming_client 的断流防线），本就每条新连接，加 keepalive 无意义，故跳过。
+    if pool_max_idle_per_host > 0 {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .http2_keep_alive_while_idle(true)
+            .http2_adaptive_window(true);
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {
