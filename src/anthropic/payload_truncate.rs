@@ -22,7 +22,8 @@
 use serde_json::Value;
 use tracing::warn;
 
-use super::converter::{ConversionError, ConversionResult, convert_request};
+use super::converter::{ConversionError, ConversionResult, convert_request_with_mode};
+use crate::model::config::ToolCompatibilityMode;
 use super::types::{Message, MessagesRequest};
 use crate::kiro::model::requests::kiro::KiroRequest;
 
@@ -128,8 +129,9 @@ fn drop_oldest_turns(messages: &mut Vec<Message>, drop_count: usize) -> bool {
 pub fn convert_within_limit(
     payload: &mut MessagesRequest,
     cfg: &PayloadLimitConfig,
+    mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    convert_within_limit_counted(payload, cfg).map(|(result, _)| result)
+    convert_within_limit_counted(payload, cfg, mode).map(|(result, _)| result)
 }
 
 /// Inner impl exposing the number of `convert_request` calls made, for the "≤ 2 conversions" test
@@ -137,9 +139,10 @@ pub fn convert_within_limit(
 fn convert_within_limit_counted(
     payload: &mut MessagesRequest,
     cfg: &PayloadLimitConfig,
+    mode: ToolCompatibilityMode,
 ) -> Result<(ConversionResult, usize), ConversionError> {
     let mut conversions = 1;
-    let mut result = convert_request(payload)?;
+    let mut result = convert_request_with_mode(payload, mode)?;
     if cfg.max_bytes == 0 {
         return Ok((result, conversions));
     }
@@ -175,7 +178,7 @@ fn convert_within_limit_counted(
     est = est.max(1);
 
     if drop_oldest_turns(&mut payload.messages, est) {
-        result = convert_request(payload)?;
+        result = convert_request_with_mode(payload, mode)?;
         conversions += 1;
     }
 
@@ -189,7 +192,7 @@ fn convert_within_limit_counted(
         if !drop_oldest_turns(&mut payload.messages, 1) {
             break;
         }
-        result = convert_request(payload)?;
+        result = convert_request_with_mode(payload, mode)?;
         conversions += 1;
         iters += 1;
     }
@@ -309,7 +312,7 @@ mod tests {
             assistant_text("hello"),
             user_text("now"),
         ]);
-        let r = convert_within_limit(&mut p, &cfg(0)).unwrap();
+        let r = convert_within_limit(&mut p, &cfg(0), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
         // disabled → messages untouched (3 in, last is current → 2 history turns kept).
         assert_eq!(p.messages.len(), 3);
@@ -323,7 +326,7 @@ mod tests {
             user_text("q"),
         ]);
         let n = p.messages.len();
-        let r = convert_within_limit(&mut p, &cfg(640_000)).unwrap();
+        let r = convert_within_limit(&mut p, &cfg(640_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
         assert_eq!(p.messages.len(), n, "under budget must not trim");
     }
@@ -341,7 +344,7 @@ mod tests {
         msgs.push(user_text("what is the final status?")); // current message
         let mut p = req(msgs);
         let cap = 120_000;
-        let r = convert_within_limit(&mut p, &cfg(cap)).unwrap();
+        let r = convert_within_limit(&mut p, &cfg(cap), ToolCompatibilityMode::ClaudeCode).unwrap();
         // The whole point: no orphan tool_use/tool_result after trimming + conversion.
         assert_pairing_valid(&r);
         // And it actually shrank the payload.
@@ -368,7 +371,7 @@ mod tests {
         }
         msgs.push(user_text("done?"));
         let mut p = req(msgs);
-        let r = convert_within_limit(&mut p, &cfg(100_000)).unwrap();
+        let r = convert_within_limit(&mut p, &cfg(100_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
     }
 
@@ -384,7 +387,7 @@ mod tests {
         msgs.push(user_text("final question"));
         let mut p = req(msgs);
         let cap = 200_000;
-        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(cap)).unwrap();
+        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(cap), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
         assert!(
             converted_payload_bytes(&r) <= cap || p.messages.len() <= MIN_RECENT_TURNS,
@@ -406,7 +409,7 @@ mod tests {
         }
         msgs.push(user_text("status?"));
         let mut p = req(msgs);
-        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(120_000)).unwrap();
+        let (r, conversions) = convert_within_limit_counted(&mut p, &cfg(120_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
         assert!(
             conversions <= 4,
@@ -417,7 +420,7 @@ mod tests {
     #[test]
     fn under_budget_single_conversion() {
         let mut p = req(vec![user_text("short"), assistant_text("ok"), user_text("q")]);
-        let (_r, conversions) = convert_within_limit_counted(&mut p, &cfg(640_000)).unwrap();
+        let (_r, conversions) = convert_within_limit_counted(&mut p, &cfg(640_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_eq!(conversions, 1, "under budget = exactly one convert");
     }
 
@@ -430,7 +433,7 @@ mod tests {
             assistant_text("y"),
             user_text(&"z".repeat(800_000)),
         ]);
-        let r = convert_within_limit(&mut p, &cfg(300_000)).unwrap();
+        let r = convert_within_limit(&mut p, &cfg(300_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_pairing_valid(&r);
     }
 }

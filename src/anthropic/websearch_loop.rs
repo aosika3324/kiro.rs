@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, get_context_window_size};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
@@ -262,14 +262,13 @@ async fn run_round(
 ) -> Result<(RoundOutcome, u64), Response> {
     // fork：转换 + 整体 payload 字节上限（与 /v1、/cc 同款防线；转换前裁剪，配对清理转换时兜底）。
     // run_round 以不可变借用持有 payload，这里克隆一份可变本地副本用于裁剪转换。
-    // CONCERN（见文末汇报）：convert_within_limit 内部走 convert_request（ClaudeCode 默认档），
-    // 未透传 tool_compatibility_mode；若要在本路径支持 Raw / Codex 自定义工具桥接，需让
-    // payload_truncate 也接受 mode（属另一文件，超出本次 4 文件范围）。此处保留裁剪防线优先。
-    let _ = tool_compatibility_mode; // 暂未用于裁剪路径（见上）；保留形参以对齐调用方与未来透传。
+    // tool_compatibility_mode 透传给裁剪路径的转换，使全局 Raw 档在 web_search 混合工具场景
+    // 下也按预期直通客户端工具 schema（默认 ClaudeCode 档行为不变）。
     let mut local_payload = payload.clone();
     let conversion = match super::payload_truncate::convert_within_limit(
         &mut local_payload,
         &super::payload_truncate::PayloadLimitConfig::from_env(),
+        tool_compatibility_mode,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -312,7 +311,7 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider.call_api_stream(&request_body, None, group, None).await {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
