@@ -37,12 +37,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `compute_structural_cache_usage` 的结果：按 estimate 口径算出的三桶基准 + read 留存
-/// 阻尼，最终由 [`CacheUsage::split_against_total`] 对真实 total 做互斥分摊。
+/// 阻尼，最终由 [`DeltaCacheUsage::split_against_total`] 对真实 total 做互斥分摊。
 ///
 /// 三个 estimate 是比例基准（不是最终值）——真正的 token 数要在拿到真实 total（contextUsage
 /// 真值或 count_tokens 估算）后才按比例算出，因为流式响应直到末尾才知道真实 total。
 #[derive(Debug, Clone, Copy)]
-pub struct CacheUsage {
+pub struct DeltaCacheUsage {
     /// 本轮新输入（最后一条 message）的 estimate token——这部分永不计入缓存。
     pub input_est: i32,
     /// 本轮新写入缓存的 delta（倒数第二条 message；首轮为 system+tools）的 estimate token。
@@ -53,13 +53,13 @@ pub struct CacheUsage {
     /// R 越低 → 越多 read 挪 input → 加权收入越高、命中率越低。可全局设也可 per-key 覆盖。
     pub read_ratio: f64,
     /// multiplier 护栏上限（C，仅**检测安全默认模式**生效）：`weighted/baseline` 超此值时把
-    /// input→read 压回（见 [`CacheUsage::apply_multiplier_cap`]）。默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25。
+    /// input→read 压回（见 [`DeltaCacheUsage::apply_multiplier_cap`]）。默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25。
     /// `billing_mode` 开启（标准计费）时**不施加**此护栏（标准模式故意超报，护栏会抵消利润）。
     pub multiplier_cap: f64,
-    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`CacheUsage::split_final`] 走
-    /// [`CacheUsage::split_anthropic_standard`]：**真实互斥三桶口径**（`input + creation + read
+    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`DeltaCacheUsage::split_final`] 走
+    /// [`DeltaCacheUsage::split_anthropic_standard`]：**真实互斥三桶口径**（`input + creation + read
     /// == total_real`，绝不超报、不双重收费），利润来自 R 把便宜的 read（0.1×）挪回 input（1.0×）。
-    /// 与默认模式 [`CacheUsage::split_against_total`] 的唯一区别：**标准模式不施加 multiplier_cap
+    /// 与默认模式 [`DeltaCacheUsage::split_against_total`] 的唯一区别：**标准模式不施加 multiplier_cap
     /// 护栏**（接受更高检测风险换 margin），且 creation 由 `creation_ratio` 旋钮决定形状。
     pub billing_mode: bool,
     /// read 膨胀系数 p（**已废弃**：标准模式改互斥口径后不再超报，此字段被忽略）。
@@ -106,7 +106,7 @@ pub const DEFAULT_READ_INFLATION: f64 = 0.2;
 /// 标准模式 creation 占比默认值（cacheable 的 3%，自然的小值）。
 pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
 
-impl Default for CacheUsage {
+impl Default for DeltaCacheUsage {
     /// 默认 = 不模拟缓存：`prompt_total_est == 0` 使 `split_against_total` 全量计入 input。
     fn default() -> Self {
         Self {
@@ -124,7 +124,7 @@ impl Default for CacheUsage {
     }
 }
 
-impl CacheUsage {
+impl DeltaCacheUsage {
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`，
     /// 三者满足 `input + creation + read == total_real`。
     ///
@@ -265,6 +265,57 @@ impl CacheUsage {
     }
 }
 
+/// 计量口径分派枚举：把两套互不兼容的缓存计量模型收敛到一个统一的类型，供
+/// [`crate::anthropic::stream::StreamContext`] / 非流式 handler 无差别持有。
+///
+/// - [`CacheUsage::Delta`]：**默认检测安全模式**（`billing_mode=false`）——无状态、确定性的
+///   delta-based 结构化拆分（见 [`DeltaCacheUsage`] 与 [`compute_structural_cache_usage`]）。
+/// - [`CacheUsage::Cch`]：**Anthropic 标准计费模式**（`billing_mode=true`）——上游 CCH 内容
+///   指纹计量（有状态最长公共前缀命中，见 [`CchResult`] 与 [`cch_compute_cache_usage`]）。
+///
+/// 两个变体都实现 `split_final` / `creation_split`，消费端（handlers / stream）调用形式完全一致。
+#[derive(Debug, Clone, Copy)]
+pub enum CacheUsage {
+    /// 默认检测安全模式：delta-based 结构化拆分（不动）。
+    Delta(DeltaCacheUsage),
+    /// Anthropic 标准计费模式：CCH 内容指纹计量。
+    Cch(CchResult),
+}
+
+impl Default for CacheUsage {
+    /// 默认 = 检测安全的 delta 模式（`billing_mode=false` 支路）。
+    fn default() -> Self {
+        CacheUsage::Delta(DeltaCacheUsage::default())
+    }
+}
+
+impl CacheUsage {
+    /// 最终三桶分摊，返回 `(input, cache_creation, cache_read)`，恒满足 `sum == total_real`。
+    /// - Delta → [`DeltaCacheUsage::split_final`]（默认走 split_against_total，billing_mode 走标准口径）。
+    /// - Cch → [`CchResult::split_against_total`]（内容指纹命中的互斥分摊）。
+    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
+        match self {
+            CacheUsage::Delta(d) => d.split_final(total_real),
+            CacheUsage::Cch(c) => c.split_against_total(total_real),
+        }
+    }
+
+    /// creation 归 `(ephemeral_5m, ephemeral_1h)` 桶：按 `creation_is_1h` 整段归桶（另一个为 0）。
+    /// 两个变体口径一致：1h → `(0, creation)`，否则 5m → `(creation, 0)`。
+    pub fn creation_split(&self, creation: i32) -> (i32, i32) {
+        match self {
+            CacheUsage::Delta(d) => d.creation_split(creation),
+            CacheUsage::Cch(c) => {
+                if c.creation_is_1h {
+                    (0, creation)
+                } else {
+                    (creation, 0)
+                }
+            }
+        }
+    }
+}
+
 /// 计量运行时治理：持有全局 read 留存阻尼 R + 缓存热度 TTL + 按会话的 last_seen 表
 /// （运行时可经 Admin API 调整 R 与 TTL）。
 ///
@@ -372,7 +423,7 @@ use super::stream::estimate_tokens;
 use super::types::{MessagesRequest, SystemMessage, Tool};
 
 /// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构、R、上轮消息条数，
-/// 不依赖时间或负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// 不依赖时间或负载。返回 [`DeltaCacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
 ///
 /// 桶划分（见模块文档）：input = 最后一条 message；read = 其余前缀。`read_ratio` 是该请求
 /// 生效的 R（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
@@ -388,7 +439,7 @@ pub fn compute_structural_cache_usage(
     req: &MessagesRequest,
     read_ratio: f64,
     prev_msg_count: Option<usize>,
-) -> CacheUsage {
+) -> DeltaCacheUsage {
     // system + tools 开销（首轮即首次写入缓存的那段）。
     let mut overhead: i32 = 0;
     if let Some(tools) = req.tools.as_ref() {
@@ -408,13 +459,13 @@ pub fn compute_structural_cache_usage(
     let n = req.messages.len();
     if n == 0 {
         // 无 message：无可缓存内容，全入 input（prompt_total_est=0 触发默认分摊）。
-        return CacheUsage {
+        return DeltaCacheUsage {
             input_est: 0,
             creation_est: 0,
             prompt_total_est: 0,
             read_ratio: read_ratio.clamp(0.0, 1.0),
             creation_is_1h,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
     }
 
@@ -438,13 +489,13 @@ pub fn compute_structural_cache_usage(
         }
     };
 
-    CacheUsage {
+    DeltaCacheUsage {
         input_est,
         creation_est,
         prompt_total_est,
         read_ratio: read_ratio.clamp(0.0, 1.0),
         creation_is_1h,
-        ..CacheUsage::default()
+        ..DeltaCacheUsage::default()
     }
 }
 
@@ -668,6 +719,525 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ============================================================================
+// CCH（Content-fingerprint Cache metering）：Anthropic 标准计费模式（billing_mode=true）专用。
+//
+// 移植自上游 v0.7.1 src/anthropic/cache_metering.rs（合并时被丢弃那版），全部类型 / 函数加
+// `Cch` / `cch_` 前缀，与本文件既有 delta 模型（DeltaCacheUsage / MeterGovernance /
+// compute_structural_cache_usage / isolation_seed）**完全隔离、互不影响**。
+//
+// 有状态最长公共前缀命中：把 prompt 稳定前缀按 message 边界切成递增前缀段链，跨轮命中即
+// cache_read，其后到末段即 cache_creation。内存 + JSON 落盘（cache_dir/cch_cache.json）。
+// ============================================================================
+
+use parking_lot::Mutex as CchMutex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap as CchHashMap;
+use std::path::PathBuf;
+
+use super::types::CacheControl;
+
+/// CCH 默认条目上限（防止内存无限增长）
+const CCH_DEFAULT_CAPACITY: usize = 4096;
+/// CCH 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
+const CCH_MAX_TTL_SECS: i64 = 3600;
+/// CCH 默认 TTL（5min，ephemeral 默认值）
+const CCH_DEFAULT_TTL_SECS: i64 = 5 * 60;
+
+/// CCH 单个缓存条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CchCacheEntry {
+    /// 该前缀段累计的估算 token 数
+    pub tokens: u32,
+    /// 过期时间戳（unix 秒）
+    pub expires_at: i64,
+    /// 上次命中时间（用于 LRU 淘汰）
+    pub last_hit_at: i64,
+}
+
+/// CCH 一次查询的结果（每段一份）
+#[derive(Debug, Clone, Copy)]
+pub struct CchSegmentResult {
+    /// 该段是否命中
+    pub hit: bool,
+    /// 该段累计 tokens（保留供调试 / 调用方扩展）
+    #[allow(dead_code)]
+    pub tokens: u32,
+}
+
+/// `cch_compute_cache_usage` 的结果：缓存计费量 + 比例分摊所需的 estimate 口径基准。
+///
+/// `cache_read` / `cache_covered_est` 是按 estimate 口径算出的「被缓存覆盖前缀」拆分；
+/// 最终上报按 [`Self::split_against_total`] 换算到真实 total 口径（互斥三桶 sum==total）。
+/// `creation_is_1h` 为 fork 新增字段（CCH 原版无）：由入站请求 cache_control.ttl 决定 creation
+/// 归 5m / 1h 桶（见 [`CacheUsage::creation_split`]），不改三桶 token 总数。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CchResult {
+    /// 缓存读取 token（estimate 口径，最深命中段累计）。
+    pub cache_read: i32,
+    /// 被缓存覆盖前缀的 estimate token 总量（read + creation）。
+    pub cache_covered_est: i32,
+    /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
+    pub prompt_total_est: i32,
+    /// 本轮 creation 是否记入 1h ephemeral 桶（默认 false = 5m）。fork 新增。
+    pub creation_is_1h: bool,
+}
+
+impl CchResult {
+    /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
+    ///
+    /// `total_real` 是最终上报口径的全量 prompt token。三者满足 `input + creation + read == total_real`。
+    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回 `(total_real, 0, 0)`——全部
+    /// 计入 input，不凭空造缓存计数。
+    pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
+            return (total, 0, 0);
+        }
+        // 比例无量纲，跨估算器成立；clamp 到 [0, total] 防止 estimate 偏差越界。
+        let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
+        let cache_total = ((total as f64) * ratio).round() as i32;
+        let cache_total = cache_total.min(total);
+        // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
+        let read = if self.cache_covered_est > 0 {
+            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
+                as i32
+        } else {
+            0
+        };
+        let read = read.clamp(0, cache_total);
+        let creation = cache_total - read;
+        let input = total - cache_total;
+        (input, creation, read)
+    }
+}
+
+/// CCH 进程内提示词缓存（有状态，内存 + JSON 落盘）。
+pub struct CchCacheMeter {
+    inner: CchMutex<CchInner>,
+    persist_path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct CchInner {
+    entries: CchHashMap<u64, CchCacheEntry>,
+    /// 自上次落盘后是否有变化
+    dirty: bool,
+}
+
+impl CchCacheMeter {
+    /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    pub fn new(persist_path: Option<PathBuf>) -> Self {
+        let mut inner = CchInner::default();
+        if let Some(path) = persist_path.as_ref() {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(entries) = serde_json::from_slice::<CchHashMap<u64, CchCacheEntry>>(&bytes)
+                {
+                    let now = cch_now_secs();
+                    for (k, v) in entries {
+                        if v.expires_at > now {
+                            inner.entries.insert(k, v);
+                        }
+                    }
+                    tracing::info!(
+                        "CchCacheMeter 重建：从 {} 加载 {} 条有效记录",
+                        path.display(),
+                        inner.entries.len()
+                    );
+                }
+            }
+        }
+        Self {
+            inner: CchMutex::new(inner),
+            persist_path,
+        }
+    }
+
+    /// 查询一组前缀段哈希，返回每段命中情况；命中段会刷新 last_hit_at。
+    pub fn lookup(&self, segment_hashes: &[u64], segment_tokens: &[u32]) -> Vec<CchSegmentResult> {
+        debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
+        let now = cch_now_secs();
+        let mut inner = self.inner.lock();
+        let mut out = Vec::with_capacity(segment_hashes.len());
+        for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
+            let hit = match inner.entries.get_mut(h) {
+                Some(entry) if entry.expires_at > now => {
+                    entry.last_hit_at = now;
+                    true
+                }
+                _ => false,
+            };
+            out.push(CchSegmentResult { hit, tokens: *t });
+        }
+        out
+    }
+
+    /// 把一组前缀段写入缓存（用于 miss 后登记 / 续期）。`ttl_secs` clip 到 [60, CCH_MAX_TTL_SECS]。
+    pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
+        debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
+        let ttl = ttl_secs.clamp(60, CCH_MAX_TTL_SECS);
+        let now = cch_now_secs();
+        let expires_at = now + ttl;
+        let mut inner = self.inner.lock();
+        for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
+            inner.entries.insert(
+                *h,
+                CchCacheEntry {
+                    tokens: *t,
+                    expires_at,
+                    last_hit_at: now,
+                },
+            );
+        }
+        inner.dirty = true;
+        // 容量超限：按 last_hit_at 淘汰最旧的若干条
+        if inner.entries.len() > CCH_DEFAULT_CAPACITY {
+            let drop_n = inner.entries.len() - CCH_DEFAULT_CAPACITY;
+            let mut victims: Vec<(u64, i64)> = inner
+                .entries
+                .iter()
+                .map(|(k, v)| (*k, v.last_hit_at))
+                .collect();
+            victims.sort_by_key(|x| x.1);
+            for (k, _) in victims.into_iter().take(drop_n) {
+                inner.entries.remove(&k);
+            }
+        }
+    }
+
+    /// 把当前快照写到 persist_path（仅在 dirty 时实际落盘）
+    pub fn flush_to_disk(&self) {
+        let path = match self.persist_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let snapshot = {
+            let mut inner = self.inner.lock();
+            if !inner.dirty {
+                return;
+            }
+            inner.dirty = false;
+            inner.entries.clone()
+        };
+        let json = match serde_json::to_vec(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("CchCacheMeter 序列化失败: {}", e);
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::warn!("CchCacheMeter 落盘失败 {}: {}", path.display(), e);
+        }
+    }
+
+    /// 启动后台周期任务：定期 flush + 清理过期条目
+    pub fn spawn_background(self: Arc<Self>) {
+        let weak = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(cache) = weak.upgrade() else { return };
+                cache.evict_expired();
+                cache.flush_to_disk();
+            }
+        });
+    }
+
+    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理；
+    /// 这里在后台周期里清一次，避免内存膨胀）。
+    pub fn evict_expired(&self) {
+        let now = cch_now_secs();
+        let mut inner = self.inner.lock();
+        let before = inner.entries.len();
+        inner.entries.retain(|_, v| v.expires_at > now);
+        if inner.entries.len() != before {
+            inner.dirty = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().entries.len()
+    }
+}
+
+fn cch_now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒
+pub fn cch_parse_ttl(ttl: Option<&str>) -> i64 {
+    match ttl {
+        Some(s) if s.eq_ignore_ascii_case("1h") => 3600,
+        Some(s) if s.eq_ignore_ascii_case("5m") => 300,
+        _ => CCH_DEFAULT_TTL_SECS,
+    }
+}
+
+/// `Arc<CchCacheMeter>` 别名
+pub type SharedCchCacheMeter = Arc<CchCacheMeter>;
+
+/// 协议层提取出来的一个"段"（segment）：从请求开头累计到本断点的所有内容。
+#[derive(Debug, Clone, Copy)]
+struct CchSegment {
+    hash: u64,
+    cumulative_tokens: u32,
+    /// 该段单独的 ttl（秒）
+    ttl_secs: i64,
+}
+
+/// 调用 CchCacheMeter 计算本次请求的缓存覆盖情况，并把所有断点（含命中段）记录回
+/// cache、刷新 TTL。返回 [`CchResult`]，由调用方在拿到真实 total 后做互斥分摊。
+///
+/// 取最深命中的段索引 i*：`cache_read = segments[i*].cumulative_tokens`、
+/// `cache_creation = segments.last().cumulative_tokens − segments[i*].cumulative_tokens`。
+/// 全部 miss 时 cache_read = 0。没有任何可缓存前缀（空段）时返回全零 `CchResult`
+/// （`split_against_total` 会把 total 全部计入 input）且不写入。
+///
+/// `creation_is_1h` 由入站请求 cache_control.ttl 决定（复用 delta 模型的 `request_marks_1h_cache`），
+/// 仅影响 creation 5m/1h 归桶与计价权重，不改三桶 token 总数。
+pub fn cch_compute_cache_usage(
+    cache: &CchCacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> CchResult {
+    let creation_is_1h = request_marks_1h_cache(req);
+    let (segments, prompt_total_est) = cch_extract_segments(req, key_id);
+    if segments.is_empty() {
+        // 无断点：仍带出 prompt_total_est，但 covered=0 → 全入 input。
+        return CchResult {
+            prompt_total_est: prompt_total_est as i32,
+            creation_is_1h,
+            ..Default::default()
+        };
+    }
+
+    let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
+    let cum_tokens: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
+    let results = cache.lookup(&hashes, &cum_tokens);
+
+    let deepest_hit = results.iter().rposition(|r| r.hit);
+    let covered = *cum_tokens.last().unwrap();
+    let cache_read = match deepest_hit {
+        Some(i) => cum_tokens[i],
+        None => 0u32,
+    };
+
+    // 把所有段一次性写回（命中段刷新 last_hit_at；未命中段插入）。所有段共用同一 ttl。
+    cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+
+    CchResult {
+        cache_read: cache_read as i32,
+        cache_covered_est: covered as i32,
+        prompt_total_est: prompt_total_est as i32,
+        creation_is_1h,
+    }
+}
+
+/// 从请求体里按顺序提取断点段：tools → system → messages（对齐 Anthropic 拼接顺序）。
+/// 返回 `(segments, prompt_total_est)`。`key_id` 用于会话隔离（哈希以隔离种子起头）。
+fn cch_extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<CchSegment>, u32) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut cum_tokens: u32 = 0;
+    let mut segments: Vec<CchSegment> = Vec::new();
+    // 被跳过的动态 system 头部 token：只计入 prompt_total 分母，不进哈希 / 缓存段。
+    let mut dynamic_prefix_tokens: u32 = 0;
+
+    // 会话隔离种子：为 None（主 Key 无 session，被多用户共享）时不模拟缓存，直接返回空段。
+    let Some(seed) = cch_isolation_seed(req, key_id) else {
+        return (Vec::new(), 0);
+    };
+    hasher.update(seed.as_bytes());
+
+    // feed 解耦哈希与 token 估算：`hash_text` 进哈希链，`token_text` 进 token 累计。
+    let feed = |hasher: &mut Sha256, hash_text: &str, token_text: &str, cum: &mut u32| {
+        hasher.update(hash_text.as_bytes());
+        if !token_text.is_empty() {
+            *cum = cum.saturating_add(estimate_tokens(token_text).max(0) as u32);
+        }
+    };
+
+    let commit = |hasher: &Sha256, cum: u32, segments: &mut Vec<CchSegment>, ttl_secs: i64| {
+        let digest = hasher.clone().finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest[..8]);
+        let hash = u64::from_be_bytes(buf);
+        segments.push(CchSegment {
+            hash,
+            cumulative_tokens: cum,
+            ttl_secs,
+        });
+    };
+
+    // 统一 ttl：探测整个请求里出现过的最大 cache_control.ttl，否则默认 5m。
+    let ttl = cch_detect_max_ttl(req);
+
+    // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            feed(&mut hasher, &cch_tool_signature(t), &cch_tool_token_text(t), &mut cum_tokens);
+        }
+    }
+
+    // 2. system —— 跳过「首个带 cache_control 的 block 之前」的动态头部（Claude Code 每轮变化
+    //    的小 block 故意不打 cache_control）。若无任何 cache_control 则全部纳入。
+    if let Some(systems) = req.system.as_ref() {
+        let skip_until = systems
+            .iter()
+            .position(|s| s.cache_control.is_some())
+            .unwrap_or(0);
+        for sys in systems.iter().take(skip_until) {
+            dynamic_prefix_tokens =
+                dynamic_prefix_tokens.saturating_add(estimate_tokens(&sys.text).max(0) as u32);
+        }
+        for sys in systems.iter().skip(skip_until) {
+            feed(&mut hasher, &cch_system_signature(sys), &sys.text, &mut cum_tokens);
+        }
+    }
+
+    // tools+system 前缀作为链的第一个段（仅当确实有内容时）。
+    if cum_tokens > 0 {
+        commit(&hasher, cum_tokens, &mut segments, ttl);
+    }
+
+    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段。
+    let last_idx = req.messages.len().saturating_sub(1);
+    for (idx, msg) in req.messages.iter().enumerate() {
+        // role 进哈希（区分 user/assistant 边界），但不计入 token。
+        feed(&mut hasher, &msg.role, "", &mut cum_tokens);
+        match &msg.content {
+            serde_json::Value::String(s) => {
+                feed(&mut hasher, s, s, &mut cum_tokens);
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("image") {
+                        let (media_type, data) = image_source_parts(v);
+                        hasher.update(b"block:image|");
+                        hasher.update(media_type.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(data.as_bytes());
+                        let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
+                        cum_tokens = cum_tokens.saturating_add(img_tokens);
+                    } else {
+                        feed(
+                            &mut hasher,
+                            &cch_block_signature_value(v),
+                            &cch_block_token_text(v),
+                            &mut cum_tokens,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
+        if idx != last_idx {
+            commit(&hasher, cum_tokens, &mut segments, ttl);
+        }
+    }
+
+    // prompt_total 分母 = 可缓存前缀累计 + 被跳过的动态头部。
+    (segments, cum_tokens.saturating_add(dynamic_prefix_tokens))
+}
+
+/// 生成 CCH 会话隔离种子。优先 metadata session；主 Key（key_id==0）无 session → None
+/// （被多用户共享，不模拟缓存以免跨用户虚假命中）；其余客户端 Key 按 key 隔离。
+/// 复用 delta 模型的 [`extract_session_id`]（同一 user_id 解析口径）。
+fn cch_isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
+    if let Some(session) = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id)
+    {
+        return Some(format!("sess:{session}"));
+    }
+    if key_id == 0 {
+        return None;
+    }
+    Some(format!("key:{key_id}"))
+}
+
+/// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；无任何 cache_control 时默认 5m。
+fn cch_detect_max_ttl(req: &MessagesRequest) -> i64 {
+    let mut ttl = CCH_DEFAULT_TTL_SECS;
+    let mut bump = |cc: Option<&CacheControl>| {
+        if let Some(cc) = cc {
+            ttl = ttl.max(cch_parse_ttl(cc.ttl.as_deref()));
+        }
+    };
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            bump(t.cache_control.as_ref());
+        }
+    }
+    if let Some(systems) = req.system.as_ref() {
+        for sys in systems {
+            bump(sys.cache_control.as_ref());
+        }
+    }
+    for msg in &req.messages {
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for v in arr {
+                if let Some(t) = v
+                    .get("cache_control")
+                    .and_then(|cc| cc.get("ttl"))
+                    .and_then(|t| t.as_str())
+                {
+                    ttl = ttl.max(cch_parse_ttl(Some(t)));
+                }
+            }
+        }
+    }
+    ttl
+}
+
+fn cch_tool_signature(t: &Tool) -> String {
+    let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
+    format!("tool:{}|{}|{}", t.name, t.description, schema)
+}
+
+/// 工具的 token 估算原文：name + description + schema 拼接，不含签名前缀 / 分隔符。
+fn cch_tool_token_text(t: &Tool) -> String {
+    let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
+    format!("{} {} {}", t.name, t.description, schema)
+}
+
+fn cch_system_signature(s: &SystemMessage) -> String {
+    format!("sys:{}", s.text)
+}
+
+/// 直接从 content block 的 JSON 值算签名，只取 type/text/thinking 三个字段。
+fn cch_block_signature_value(v: &serde_json::Value) -> String {
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
+    format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"))
+}
+
+/// content block 的 token 估算原文：仅 text + thinking 的纯文本，不含签名结构标记。
+fn cch_block_token_text(v: &serde_json::Value) -> String {
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
+    let text = s("text");
+    let thinking = s("thinking");
+    if thinking.is_empty() {
+        text.to_string()
+    } else if text.is_empty() {
+        thinking.to_string()
+    } else {
+        format!("{text} {thinking}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,19 +1270,19 @@ mod tests {
     #[test]
     fn split_no_prefix_all_input() {
         // prompt_total_est == 0（默认）→ 全量计入 input。
-        let u = CacheUsage::default();
+        let u = DeltaCacheUsage::default();
         assert_eq!(u.split_against_total(500), (500, 0, 0));
     }
 
     #[test]
     fn split_three_buckets_by_share() {
         // input 占比 10%、creation 占比 5%，剩余 85% 为 read（R=1 全留存）。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 5,
             prompt_total_est: 100,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input, 100);
@@ -725,20 +1295,20 @@ mod tests {
     fn split_creation_bounded_independent_of_history() {
         // creation 只随 creation_est 占比走，不随 read 基数（历史规模）变化——贵桶有界。
         // 短历史：total 小
-        let short = CacheUsage {
+        let short = DeltaCacheUsage {
             input_est: 10,
             creation_est: 20,
             prompt_total_est: 100,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         // 长历史：同样的 input/creation 占比，但 prompt_total 大得多（read 基数暴涨）
-        let long = CacheUsage {
+        let long = DeltaCacheUsage {
             input_est: 10,
             creation_est: 20,
             prompt_total_est: 1000,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let (_, c_short, _) = short.split_against_total(300);
         let (_, c_long, r_long) = long.split_against_total(3000);
@@ -751,12 +1321,12 @@ mod tests {
     #[test]
     fn split_read_retention_pushes_to_input_not_creation() {
         // R<1：read 被砍的部分推回 input，creation 纹丝不动（贵桶经济正确）。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.5,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         // base: input=100, creation=100, read_base=800
@@ -770,12 +1340,12 @@ mod tests {
     #[test]
     fn split_ratio_zero_no_read() {
         // R=0：完全不给缓存折扣，read 全部推回 input；creation 仍按其占比保留。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(creation, 100);
@@ -789,12 +1359,12 @@ mod tests {
         //   R=1.0 → read≈total、input≈0 → 命中率 100%(贴近真实 Anthropic 稳态);
         //   R=0.8 → read=total×0.8、input=total×0.2 → 命中率精确 80%(实证里所有高命中样本卡 80.0% 的成因)。
         // 这是「配置能到多少」与「改码能到多少」归因的数学基准，不能悄悄漂移。
-        let replay = |r: f64| CacheUsage {
+        let replay = |r: f64| DeltaCacheUsage {
             input_est: 0,
             creation_est: 0,
             prompt_total_est: 1000, // >0 触发分摊；input/creation 占比为 0 → read_base=total
             read_ratio: r,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let hit = |(_i, _c, rd): (i32, i32, i32), tot: i32| rd as f64 / tot as f64;
 
@@ -809,12 +1379,12 @@ mod tests {
 
     #[test]
     fn split_is_deterministic() {
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 33,
             creation_est: 41,
             prompt_total_est: 207,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let a = u.split_against_total(4096);
         let b = u.split_against_total(4096);
@@ -824,12 +1394,12 @@ mod tests {
 
     #[test]
     fn split_zero_total_safe() {
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         assert_eq!(u.split_against_total(0), (0, 0, 0));
     }
@@ -847,12 +1417,12 @@ mod tests {
             (0, 0, 1000, 0.8),
             (500, 100, 1000, 1.0),
         ] {
-            let u = CacheUsage {
+            let u = DeltaCacheUsage {
                 input_est: ie,
                 creation_est: ce,
                 prompt_total_est: pe,
                 read_ratio: r,
-                ..CacheUsage::default()
+                ..DeltaCacheUsage::default()
             };
             for total in [1, 500, 4096, 10_000, 140_210] {
                 let (i, c, rd) = u.split_against_total(total);
@@ -871,12 +1441,12 @@ mod tests {
     #[test]
     fn cap_default_1_25_is_noop_for_normal_shapes() {
         // 默认 cap=1.25 对正常形状不触发：三桶不被改写，multiplier 本就 ≤1.25。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.5,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let out = u.split_against_total(1000); // (500,100,400)，weighted=665 → 0.665x
         assert_eq!(out, (500, 100, 400), "默认 cap 不改写正常形状");
@@ -887,13 +1457,13 @@ mod tests {
     fn cap_pushes_input_to_read_not_creation() {
         // 低 R（利润档拉高）使 input 变大、multiplier 逼近 1.0；收紧 cap=0.5 → 护栏把 input 挪回 read。
         // R=0：input=900,creation=100,read=0 → weighted=1025 → 1.025x。cap=0.5 → 须压到 ≤500。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.0,
             multiplier_cap: 0.5,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         let (i, c, r) = u.split_against_total(1000);
         assert_eq!(c, 100, "creation 绝不被护栏改动（诚实，不伪造暖轮 read）");
@@ -905,13 +1475,13 @@ mod tests {
     #[test]
     fn cap_zero_disables_guardrail() {
         // cap<=0 → 不设护栏，形状原样返回。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 10,
             creation_est: 10,
             prompt_total_est: 100,
             read_ratio: 0.0,
             multiplier_cap: 0.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         assert_eq!(u.split_against_total(1000), (900, 100, 0), "cap=0 关闭护栏");
     }
@@ -920,15 +1490,15 @@ mod tests {
 
     /// 标准模式构造：input 按结构占比折算，creation = cacheable×creation_ratio，read 经 R 挪桶。
     /// `input_share_est` / `total_est` 定 input 占比;`cr` 定 creation 形状;`r` 定 read↔input 利润。
-    fn std_usage_cr(total_est: i32, r: f64, cr: f64) -> CacheUsage {
-        CacheUsage {
+    fn std_usage_cr(total_est: i32, r: f64, cr: f64) -> DeltaCacheUsage {
+        DeltaCacheUsage {
             input_est: 0, // input 占比 0 → 全量前缀可缓存,便于单验 creation/read 形状
             creation_est: 0,
             prompt_total_est: total_est,
             read_ratio: r,
             billing_mode: true,
             creation_ratio: cr,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         }
     }
 
@@ -979,7 +1549,7 @@ mod tests {
     #[test]
     fn std_no_cacheable_all_input_std() {
         // 无可缓存内容（prompt_total_est<=0）→ 全计 input。
-        let u = CacheUsage { billing_mode: true, ..CacheUsage::default() };
+        let u = DeltaCacheUsage { billing_mode: true, ..DeltaCacheUsage::default() };
         assert_eq!(u.split_final(2), (2, 0, 0));
     }
 
@@ -987,14 +1557,14 @@ mod tests {
     fn std_no_guardrail_unlike_default() {
         // 标准模式不施加 multiplier_cap 护栏（与默认模式的唯一区别）。
         // 即便 multiplier_cap 设得很低,标准模式也不压 input→read。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 0,
             prompt_total_est: 1000,
             read_ratio: 0.0, // 全 read 挪回 input,加权最高
             creation_ratio: 0.1,
             multiplier_cap: 0.5, // 激进护栏
             billing_mode: true,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         // R=0 → input=900, creation=100, read=0。护栏本会把 input 挪 read,但标准模式忽略护栏。
         assert_eq!(u.split_final(1000), (900, 100, 0), "标准模式无视护栏");
@@ -1003,12 +1573,12 @@ mod tests {
     #[test]
     fn std_billing_mode_off_uses_safe_default() {
         // billing_mode 关（默认）→ split_final 走 split_against_total（检测安全，受护栏）。
-        let u = CacheUsage {
+        let u = DeltaCacheUsage {
             input_est: 0,
             creation_est: 0,
             prompt_total_est: 1000,
             read_ratio: 1.0,
-            ..CacheUsage::default()
+            ..DeltaCacheUsage::default()
         };
         assert!(!u.billing_mode, "默认关");
         assert_eq!(u.split_final(1000), (0, 0, 1000), "默认模式全 read");
@@ -1017,22 +1587,22 @@ mod tests {
     #[test]
     fn creation_split_routes_by_ttl_flag() {
         // creation_is_1h=false → 全归 5m；true → 全归 1h。
-        let u5 = CacheUsage { creation_is_1h: false, ..CacheUsage::default() };
+        let u5 = DeltaCacheUsage { creation_is_1h: false, ..DeltaCacheUsage::default() };
         assert_eq!(u5.creation_split(300), (300, 0), "默认 5m");
-        let u1 = CacheUsage { creation_is_1h: true, ..CacheUsage::default() };
+        let u1 = DeltaCacheUsage { creation_is_1h: true, ..DeltaCacheUsage::default() };
         assert_eq!(u1.creation_split(300), (0, 300), "1h 标记 → 全归 1h");
     }
 
     #[test]
     fn creation_weight_by_ttl() {
         // 1h creation 计价权重 2.0，5m 为 1.25。
-        assert_eq!(CacheUsage { creation_is_1h: false, ..CacheUsage::default() }.creation_weight(), WEIGHT_CREATION);
-        assert_eq!(CacheUsage { creation_is_1h: true, ..CacheUsage::default() }.creation_weight(), WEIGHT_CREATION_1H);
+        assert_eq!(DeltaCacheUsage { creation_is_1h: false, ..DeltaCacheUsage::default() }.creation_weight(), WEIGHT_CREATION);
+        assert_eq!(DeltaCacheUsage { creation_is_1h: true, ..DeltaCacheUsage::default() }.creation_weight(), WEIGHT_CREATION_1H);
     }
 
     #[test]
     fn request_1h_ttl_detected_in_system() {
-        // system 断点标 ttl=1h → compute 出的 CacheUsage.creation_is_1h = true。
+        // system 断点标 ttl=1h → compute 出的 DeltaCacheUsage.creation_is_1h = true。
         let req = req_with(
             vec![msg("user", "hi")],
             Some(vec![SystemMessage {
@@ -1610,5 +2180,620 @@ mod tests {
             correct.creation_est > 0,
             "正确隔离下 B 的新增应计入 creation（当前实现因 seed 碰撞算成 0）"
         );
+    }
+}
+
+#[cfg(test)]
+mod cch_tests {
+    //! CCH（Anthropic 标准计费模式）有状态计量单元测试。移植自上游 v0.7.1，测试名 / 类型 /
+    //! 函数全部加 `cch_` 前缀，与上方 delta 模型测试（`mod tests`）隔离。
+    use super::*;
+
+    #[test]
+    fn cch_lookup_miss_then_record_then_hit() {
+        let cache = CchCacheMeter::new(None);
+        let hashes = [1u64, 2u64];
+        let tokens = [10u32, 25u32];
+        let r1 = cache.lookup(&hashes, &tokens);
+        assert!(r1.iter().all(|s| !s.hit));
+
+        cache.record(&hashes, &tokens, 300);
+        let r2 = cache.lookup(&hashes, &tokens);
+        assert!(r2.iter().all(|s| s.hit));
+    }
+
+    #[test]
+    fn cch_ttl_expiry_makes_entry_miss() {
+        let cache = CchCacheMeter::new(None);
+        cache.record(&[42], &[100], 60);
+        {
+            let mut inner = cache.inner.lock();
+            if let Some(e) = inner.entries.get_mut(&42) {
+                e.expires_at = cch_now_secs() - 1;
+            }
+        }
+        let r = cache.lookup(&[42], &[100]);
+        assert!(!r[0].hit);
+    }
+
+    #[test]
+    fn cch_evict_expired_removes_dead_entries() {
+        let cache = CchCacheMeter::new(None);
+        cache.record(&[1, 2], &[5, 5], 60);
+        {
+            let mut inner = cache.inner.lock();
+            for (_, v) in inner.entries.iter_mut() {
+                v.expires_at = cch_now_secs() - 1;
+            }
+        }
+        cache.evict_expired();
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn cch_parse_ttl_handles_known_values() {
+        assert_eq!(cch_parse_ttl(Some("1h")), 3600);
+        assert_eq!(cch_parse_ttl(Some("5m")), 300);
+        assert_eq!(cch_parse_ttl(None), 300);
+        assert_eq!(cch_parse_ttl(Some("garbage")), 300);
+    }
+
+    #[test]
+    fn cch_flush_and_reload_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("kiro-cch-{}.json", cch_now_secs()));
+        let cache = CchCacheMeter::new(Some(tmp.clone()));
+        cache.record(&[7], &[42], 600);
+        cache.flush_to_disk();
+
+        let cache2 = CchCacheMeter::new(Some(tmp.clone()));
+        let r = cache2.lookup(&[7], &[42]);
+        assert!(r[0].hit);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    use super::super::types::{CacheControl, Message, MessagesRequest, Metadata, SystemMessage, Tool};
+
+    fn build_request_with_system_breakpoint() -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful assistant. ".repeat(100),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn cch_compute_cache_usage_first_miss_then_hit() {
+        let cache = CchCacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+
+        let u1 = cch_compute_cache_usage(&cache, &req, 1);
+        assert!(u1.cache_covered_est > 0, "first call should cover prefix");
+        assert_eq!(u1.cache_read, 0, "first call has nothing cached to read");
+        let total = u1.prompt_total_est;
+        let (in1, cc1, cr1) = u1.split_against_total(total);
+        assert!(cc1 > 0, "first call creation>0, cc={cc1}");
+        assert_eq!(cr1, 0);
+        assert_eq!(in1 + cc1 + cr1, total, "互斥口径必须自洽");
+
+        let u2 = cch_compute_cache_usage(&cache, &req, 1);
+        assert!(u2.cache_read > 0, "second call should hit");
+        let (in2, cc2, cr2) = u2.split_against_total(total);
+        assert_eq!(cc2, 0, "second call creation should be 0, got {cc2}");
+        assert!(cr2 > 0, "second call read>0, cr={cr2}");
+        assert_eq!(in2 + cc2 + cr2, total, "互斥口径必须自洽");
+        assert_eq!(cc1, cr2);
+    }
+
+    #[test]
+    fn cch_split_against_total_is_mutually_exclusive() {
+        let u = CchResult {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            creation_is_1h: false,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(input + creation + read, 1000);
+        assert_eq!(input, 200, "尾部 20% 是未缓存 input");
+        assert_eq!(read, 300);
+        assert_eq!(creation, 500);
+    }
+
+    #[test]
+    fn cch_split_against_total_no_cache_all_input() {
+        let u = CchResult {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 100,
+            creation_is_1h: false,
+        };
+        assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    #[test]
+    fn cch_compute_cache_usage_single_message_no_prefix() {
+        let cache = CchCacheMeter::new(None);
+        let req = MessagesRequest {
+            model: "x".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u = cch_compute_cache_usage(&cache, &req, 1);
+        assert_eq!(u.cache_covered_est, 0);
+        assert_eq!(u.split_against_total(123), (123, 0, 0));
+    }
+
+    fn build_tool_with_schema_order(insert_required_first: bool) -> Tool {
+        let mut schema = std::collections::BTreeMap::new();
+        if insert_required_first {
+            schema.insert("required".to_string(), serde_json::json!([]));
+            schema.insert("properties".to_string(), serde_json::json!({}));
+            schema.insert("type".to_string(), serde_json::json!("object"));
+        } else {
+            schema.insert("type".to_string(), serde_json::json!("object"));
+            schema.insert("properties".to_string(), serde_json::json!({}));
+            schema.insert("required".to_string(), serde_json::json!([]));
+        }
+        Tool {
+            tool_type: None,
+            name: "my_tool".to_string(),
+            description: "desc".to_string(),
+            input_schema: schema,
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn cch_tool_signature_stable_across_insert_order() {
+        let a = build_tool_with_schema_order(true);
+        let b = build_tool_with_schema_order(false);
+        assert_eq!(cch_tool_signature(&a), cch_tool_signature(&b));
+    }
+
+    #[test]
+    fn cch_compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        let make_req = |insert_required_first: bool| {
+            let mut tool = build_tool_with_schema_order(insert_required_first);
+            tool.cache_control = Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            });
+            MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 32,
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("Hello".to_string()),
+                }],
+                stream: false,
+                system: None,
+                tools: Some(vec![tool]),
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            }
+        };
+
+        let cache = CchCacheMeter::new(None);
+        let u1 = cch_compute_cache_usage(&cache, &make_req(false), 1);
+        assert!(u1.cache_covered_est > 0, "first call should cover prefix");
+        assert_eq!(u1.cache_read, 0);
+
+        let u2 = cch_compute_cache_usage(&cache, &make_req(true), 1);
+        assert_eq!(
+            u2.cache_read, u1.cache_covered_est,
+            "schema 顺序不应影响命中：second read 应等于 first covered"
+        );
+    }
+
+    fn msg_with_cc(role: &str, text: &str, with_cc: bool) -> Message {
+        let block = if with_cc {
+            serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"}
+            })
+        } else {
+            serde_json::json!({"type": "text", "text": text})
+        };
+        Message {
+            role: role.to_string(),
+            content: serde_json::Value::Array(vec![block]),
+        }
+    }
+
+    fn req_with_messages(messages: Vec<Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn cch_tool_call_history_still_hits_despite_id_drift() {
+        let body = "analyze the repository structure carefully ".repeat(15);
+        let assistant_tool = |id: &str| Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": body},
+                {"type": "tool_use", "id": id, "name": "bash", "input": {"cmd": "ls"}}
+            ]),
+        };
+        let user_result = |id: &str| Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_result", "tool_use_id": id, "content": body}
+            ]),
+        };
+        let user_text = |t: &str| msg_with_cc("user", t, false);
+
+        let cache = CchCacheMeter::new(None);
+        let turn1 = req_with_messages(vec![
+            user_text(&body),
+            assistant_tool("toolu_aaa"),
+            user_result("toolu_aaa"),
+            msg_with_cc("assistant", &body, false),
+            user_text("next question one"),
+        ]);
+        let u1 = cch_compute_cache_usage(&cache, &turn1, 1);
+        assert!(u1.cache_covered_est > 0);
+        assert_eq!(u1.cache_read, 0, "turn1 无历史可命中");
+
+        let turn2 = req_with_messages(vec![
+            user_text(&body),
+            assistant_tool("toolu_aaa"),
+            user_result("toolu_aaa"),
+            msg_with_cc("assistant", &body, false),
+            user_text("next question one"),
+            msg_with_cc("assistant", &body, false),
+            user_text("next question two"),
+        ]);
+        let u2 = cch_compute_cache_usage(&cache, &turn2, 1);
+        assert!(u2.cache_read > 0, "turn2 应命中 turn1 的历史前缀（即便工具块带 id）");
+        assert_eq!(
+            u2.cache_read, u1.cache_covered_est,
+            "命中的最深前缀应等于上一轮 covered"
+        );
+    }
+
+    #[test]
+    fn cch_multi_turn_prefix_chain_produces_read_hit() {
+        let cache = CchCacheMeter::new(None);
+        let body = "the quick brown fox jumps over the lazy dog ".repeat(20);
+
+        let turn3 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, true),
+        ]);
+        let u3 = cch_compute_cache_usage(&cache, &turn3, 1);
+        assert!(u3.cache_covered_est > 0, "turn3 should create cache");
+        assert_eq!(u3.cache_read, 0, "turn3 has no prior cache to read");
+
+        let turn4 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, true),
+        ]);
+        let u4 = cch_compute_cache_usage(&cache, &turn4, 1);
+        assert!(u4.cache_read > 0, "turn4 should hit a prior-turn prefix");
+        assert_eq!(
+            u4.cache_read, u3.cache_covered_est,
+            "read 应等于上一轮写入的最深历史前缀"
+        );
+        assert!(
+            u4.cache_covered_est > u4.cache_read,
+            "turn4 仍会为新增的历史前缀创建缓存"
+        );
+    }
+
+    #[test]
+    fn cch_prefix_chain_works_without_any_cache_control() {
+        let cache = CchCacheMeter::new(None);
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        let turn1 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+        ]);
+        let u1 = cch_compute_cache_usage(&cache, &turn1, 1);
+        assert!(u1.cache_covered_est > 0, "应为历史前缀创建缓存段");
+        assert_eq!(u1.cache_read, 0);
+
+        let turn2 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+        ]);
+        let u2 = cch_compute_cache_usage(&cache, &turn2, 1);
+        assert!(u2.cache_read > 0, "无 cache_control 也应跨轮命中历史前缀");
+    }
+
+    #[test]
+    fn cch_dynamic_system_header_does_not_break_cache_hit() {
+        let stable_sys = "You are a coding assistant. ".repeat(200);
+        let body = "implement the feature step by step ".repeat(15);
+
+        let make_req = |dyn_header: &str, msgs: Vec<Message>| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: msgs,
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: dyn_header.to_string(),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    text: stable_sys.clone(),
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CchCacheMeter::new(None);
+        let u1 = cch_compute_cache_usage(
+            &cache,
+            &make_req(
+                "now=1001",
+                vec![
+                    msg_with_cc("user", &body, false),
+                    msg_with_cc("assistant", &body, false),
+                    msg_with_cc("user", &body, false),
+                ],
+            ),
+            1,
+        );
+        assert!(u1.cache_covered_est > 0);
+        assert_eq!(u1.cache_read, 0, "turn1 无历史可命中");
+
+        let u2 = cch_compute_cache_usage(
+            &cache,
+            &make_req(
+                "now=2002",
+                vec![
+                    msg_with_cc("user", &body, false),
+                    msg_with_cc("assistant", &body, false),
+                    msg_with_cc("user", &body, false),
+                    msg_with_cc("assistant", &body, false),
+                    msg_with_cc("user", &body, false),
+                ],
+            ),
+            1,
+        );
+        assert!(
+            u2.cache_read > 0,
+            "动态 system 头变化不应破坏稳定前缀命中（实测根因）"
+        );
+    }
+
+    #[test]
+    fn cch_different_key_id_does_not_cross_hit() {
+        let cache = CchCacheMeter::new(None);
+        let body = "shared system prompt and history ".repeat(20);
+        let msgs = || {
+            vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ]
+        };
+        let a = cch_compute_cache_usage(&cache, &req_with_messages(msgs()), 1);
+        assert!(a.cache_covered_est > 0);
+        assert_eq!(a.cache_read, 0);
+        let b = cch_compute_cache_usage(&cache, &req_with_messages(msgs()), 2);
+        assert_eq!(b.cache_read, 0, "不同 key_id 不应命中彼此的前缀");
+        let c = cch_compute_cache_usage(&cache, &req_with_messages(msgs()), 1);
+        assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
+    }
+
+    #[test]
+    fn cch_metadata_session_scopes_cache() {
+        let body = "conversation prefix that stays stable ".repeat(20);
+        let make = |session: &str| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_abc_account__session_{session}")),
+            }),
+        };
+        let cache = CchCacheMeter::new(None);
+        let s1a = cch_compute_cache_usage(&cache, &make("aaa"), 0);
+        assert_eq!(s1a.cache_read, 0);
+        let s2 = cch_compute_cache_usage(&cache, &make("bbb"), 0);
+        assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
+        let s1b = cch_compute_cache_usage(&cache, &make("aaa"), 0);
+        assert!(s1b.cache_read > 0, "相同 session 应命中");
+    }
+
+    #[test]
+    fn cch_master_key_without_session_does_not_simulate_cross_user_cache_hit() {
+        let cache = CchCacheMeter::new(None);
+        let body = "shared master-key prompt without any session ".repeat(20);
+        let msgs = || {
+            vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ]
+        };
+        let a = cch_compute_cache_usage(&cache, &req_with_messages(msgs()), 0);
+        assert_eq!(a.cache_read, 0);
+        assert_eq!(a.cache_covered_est, 0, "主 Key 无 session 不应产生缓存覆盖");
+        let b = cch_compute_cache_usage(&cache, &req_with_messages(msgs()), 0);
+        assert_eq!(b.cache_read, 0, "共享主 Key 无 session 时不得复用全局模拟缓存");
+        assert_eq!(b.cache_covered_est, 0);
+    }
+
+    #[test]
+    fn cch_skipped_dynamic_system_prefix_counts_toward_prompt_total() {
+        let dynamic = "runtime clock and cwd marker ".repeat(40);
+        let stable_sys = "You are a coding assistant. ".repeat(200);
+        let body = "conversation body ".repeat(15);
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ],
+            stream: false,
+            system: Some(vec![
+                SystemMessage { text: dynamic.clone(), cache_control: None },
+                SystemMessage {
+                    text: stable_sys,
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u = cch_compute_cache_usage(&CchCacheMeter::new(None), &req, 1);
+        assert!(u.cache_covered_est > 0, "稳定前缀应可缓存");
+        assert!(
+            u.prompt_total_est >= u.cache_covered_est + estimate_tokens(&dynamic),
+            "被跳过的动态 system 前缀必须计入 prompt_total 分母：total={} covered={} dyn={}",
+            u.prompt_total_est,
+            u.cache_covered_est,
+            estimate_tokens(&dynamic)
+        );
+    }
+
+    #[test]
+    fn cch_extract_session_id_parses_claude_code_format() {
+        assert_eq!(
+            extract_session_id("user_xxx_account__session_0b4445e1-uuid"),
+            Some("0b4445e1-uuid".to_string())
+        );
+        assert_eq!(extract_session_id("no-session-here"), None);
+    }
+
+    #[test]
+    fn cch_token_count_excludes_signature_noise() {
+        let history_text = "the quick brown fox jumps over the lazy dog";
+        let req = MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": history_text}]),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("ok".to_string()),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u = cch_compute_cache_usage(&CchCacheMeter::new(None), &req, 1);
+        let pure = estimate_tokens(history_text) as i32;
+        assert_eq!(u.cache_covered_est, pure, "covered 应只算原文 token");
+    }
+
+    #[test]
+    fn cch_creation_is_1h_detected_from_request() {
+        // fork 新增字段：入站 1h cache_control → CchResult.creation_is_1h = true。
+        let req = MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "text", "text": "big context",
+                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                }]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let u = cch_compute_cache_usage(&CchCacheMeter::new(None), &req, 1);
+        assert!(u.creation_is_1h, "1h ttl 应被识别");
+        // 无 1h 标记 → 默认 5m。
+        let req5m = req_with_messages(vec![msg_with_cc("user", "hi", false)]);
+        let u5 = cch_compute_cache_usage(&CchCacheMeter::new(None), &req5m, 1);
+        assert!(!u5.creation_is_1h, "无 1h 标记默认 5m");
     }
 }
