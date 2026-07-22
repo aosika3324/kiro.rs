@@ -1098,7 +1098,32 @@ struct CredentialCandidate {
     in_flight: usize,
     /// 近期错误率 EWMA(0.0~1.0),用于把高错误率账号软降权。
     ewma_error: f64,
+    /// 请求耗时 EWMA(毫秒)。质量分级的**次信号**(默认不参与,见 `quality_tier`)。
+    ewma_duration_ms: f64,
+    /// 会话粘性排名：0=本次会话上次命中的凭据(优先),1=其余(仅在同 quality_tier 内生效)。
+    /// 由 `ranked_available_credentials` 在排序前按 sticky_map 命中情况填充;无 session 时全 1。
+    sticky_rank: u8,
     runtime: Arc<CredentialRuntime>,
+}
+
+/// 质量分级阈值(来自 config,避免在排序热路径反复读 Config)。
+#[derive(Clone, Copy)]
+struct QualityThresholds {
+    error_good: f64,
+    error_bad: f64,
+    latency_enabled: bool,
+    latency_ms: f64,
+}
+
+impl QualityThresholds {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            error_good: config.quality_error_good,
+            error_bad: config.quality_error_bad,
+            latency_enabled: config.quality_latency_enabled,
+            latency_ms: config.quality_latency_ms,
+        }
+    }
 }
 
 impl CredentialCandidate {
@@ -1122,6 +1147,39 @@ impl CredentialCandidate {
     fn biased_load(&self, large_penalty: usize) -> usize {
         self.effective_load()
             .saturating_add(self.in_flight.saturating_mul(large_penalty))
+    }
+
+    /// 质量分级(0=好 / 1=普通 / 2=垃圾),用作分层排序主键。
+    ///
+    /// **主判据 = 成功率(`ewma_error`)**：
+    /// - `< error_good`（默认 0.02）→ tier0（好号，优先被填满 → 好号多打）
+    /// - `< error_bad`（默认 0.15）→ tier1（普通）
+    /// - `>= error_bad` → tier2（垃圾号，兜底，仅在好号/普通号全忙时才被 acquire 选中）
+    ///
+    /// **次判据 = 延迟(`ewma_duration_ms`)**：默认**关闭**(`latency_enabled=false`)。
+    ///
+    /// # 延迟污染坑（务必知悉）
+    /// `ewma_duration_ms` 是整请求耗时，**受请求大小(prefill)污染**——大上下文请求天然慢，
+    /// 不代表号差。若把"接大请求因而慢"的健康好号按延迟降到垃圾档，会把好号赶去兜底、拖垮
+    /// 整体。因此这里延迟判据非常**保守**：
+    /// 1. 默认整个关掉（`latency_enabled=false`），先只按成功率分级；
+    /// 2. 即便开启，阈值(`latency_ms`)默认 60s 很宽松，只在成功率允许的 tier 内**降一档**
+    ///    （tier0→tier1；绝不把一个成功率达标的号打成垃圾 tier2）；
+    /// 3. tier2 已是成功率判定的垃圾号，延迟不再叠加。
+    fn quality_tier(&self, t: QualityThresholds) -> u8 {
+        // 主：成功率。
+        let mut tier = if self.ewma_error < t.error_good {
+            0u8
+        } else if self.ewma_error < t.error_bad {
+            1u8
+        } else {
+            2u8
+        };
+        // 次：延迟（默认关；开启也只在 tier0/tier1 内保守降一档，绝不制造新的 tier2）。
+        if t.latency_enabled && tier == 0 && self.ewma_duration_ms > t.latency_ms {
+            tier = 1;
+        }
+        tier
     }
 }
 
@@ -1467,6 +1525,8 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 按凭据运行时调度指标（进程内，不持久化）
     metrics: MetricsStore,
+    /// 会话粘性表（进程内，不持久化）。session_seed → 上次成功命中的凭据 id。
+    sticky_map: Mutex<StickyMap>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1529,6 +1589,68 @@ impl CredMetrics {
 
 /// 共享的按凭据指标表
 type MetricsStore = Arc<Mutex<HashMap<u64, CredMetrics>>>;
+
+/// 会话粘性表容量上限（session_seed 数量）。超过后按写入时刻淘汰最旧项。
+const STICKY_MAP_CAPACITY: usize = 4096;
+
+/// 会话粘性表：`session_seed -> (上次成功命中的凭据 id, 写入时刻)`。
+///
+/// 进程内、不持久化。用轻量 `HashMap` + 手动 TTL/容量清理（无 lru 依赖）：
+/// - 读：`ranked_available_credentials` 查 seed，命中且未过期(now-写入 < sticky_ttl)时把该
+///   候选 `sticky_rank=0`（同 quality_tier 内优先），提升上游前缀缓存命中率。
+/// - 写：`acquire_idle_permit` 成功抢到槽后记录 `(seed -> id)`；写入时顺带清理过期项、
+///   超容量时淘汰最旧。
+///
+/// 无 session_seed 时不写不读，粘性整体不生效（退化回纯负载均衡）。
+struct StickyMap {
+    map: HashMap<String, (u64, Instant)>,
+}
+
+impl StickyMap {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// 查询命中且未过期的凭据 id。`ttl` 为 0 时视为关闭粘性（恒 None）。
+    fn get_fresh(&self, seed: &str, ttl: StdDuration, now: Instant) -> Option<u64> {
+        if ttl.is_zero() {
+            return None;
+        }
+        self.map.get(seed).and_then(|(id, at)| {
+            if now.saturating_duration_since(*at) < ttl {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 记录会话→凭据映射；顺带清过期、超容量淘汰最旧。`ttl` 为 0 时不记录（粘性关闭）。
+    fn record(&mut self, seed: String, id: u64, ttl: StdDuration, now: Instant) {
+        if ttl.is_zero() {
+            return;
+        }
+        // 先清理过期项（顺带控住内存），再插入。
+        self.map
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < ttl);
+        self.map.insert(seed, (id, now));
+        // 仍超容量：淘汰最旧一项（按写入时刻），避免无界增长。
+        while self.map.len() > STICKY_MAP_CAPACITY {
+            if let Some(oldest_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+    }
+}
 
 /// API 调用上下文
 ///
@@ -1718,6 +1840,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             metrics: Arc::new(Mutex::new(HashMap::new())),
+            sticky_map: Mutex::new(StickyMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1922,9 +2045,15 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         large_penalty: usize,
+        session_seed: Option<&str>,
     ) -> Vec<CredentialCandidate> {
         let now = Instant::now();
         let recovery_secs = self.config.auto_disable_recovery_secs;
+        // 会话粘性目标：查 sticky_map 命中且未过期的凭据 id（无 session/关闭/过期 → None）。
+        // 单独作用域取锁，读完即释放，不与 entries/metrics 锁嵌套（避免锁序问题）。
+        let sticky_ttl = StdDuration::from_secs(self.config.sticky_ttl_secs);
+        let sticky_target: Option<u64> = session_seed
+            .and_then(|seed| self.sticky_map.lock().get_fresh(seed, sticky_ttl, now));
         let available_entries: Vec<_> = {
             let mut entries = self.entries.lock();
             // 半开恢复：自动禁用（TooManyFailures）超过恢复窗口的账号在此就地"半开"，
@@ -1970,19 +2099,24 @@ impl MultiTokenManager {
             .map(|(id, priority, cap)| {
                 let runtime = self.runtime_for_credential(id, cap);
                 runtime.set_capacity(cap);
-                // 错误率从 metrics 读取(此处 entries 锁已释放,只锁 metrics,不构成锁序环)。
-                let ewma_error = self
+                // 错误率/耗时从 metrics 读取(此处 entries 锁已释放,只锁 metrics,不构成锁序环)。
+                let (ewma_error, ewma_duration_ms) = self
                     .metrics
                     .lock()
                     .get(&id)
-                    .map(|m| m.ewma_error)
-                    .unwrap_or(0.0);
+                    .map(|m| (m.ewma_error, m.ewma_duration_ms))
+                    .unwrap_or((0.0, 0.0));
+                // 粘性：命中会话上次凭据 → rank 0(优先);其余 → 1。无 session 时 sticky_target=None
+                // → 全部 rank 1(粘性不生效,退化回纯负载均衡)。
+                let sticky_rank = if sticky_target == Some(id) { 0 } else { 1 };
                 CredentialCandidate {
                     id,
                     priority,
                     capacity: runtime.capacity(),
                     in_flight: runtime.in_flight(),
                     ewma_error,
+                    ewma_duration_ms,
+                    sticky_rank,
                     runtime,
                 }
             })
@@ -1994,7 +2128,25 @@ impl MultiTokenManager {
         // 的 P2C 抽选体现(balanced 随机分散抗羊群,priority 严格按序)。
         // large_penalty>0(Long 档大请求)时改用 biased_load:在途多的账号进一步降权,
         // 避免大请求扎堆;普通请求 large_penalty=0,biased_load≡effective_load,行为不变。
-        available.sort_by_key(|e| (e.biased_load(large_penalty), e.priority, e.id));
+        //
+        // 分层排序键：(quality_tier, sticky_rank, biased_load, priority, id)
+        // 1) quality_tier 主键：好号(tier0)排前 → 先被 try_acquire_lease 填满 cap → 溢出自然
+        //    落次 tier(垃圾号打满兜底)。
+        // 2) sticky_rank 次键：**仅在同 quality_tier 内**让会话粘性目标优先(提命中率)；跨 tier
+        //    时 tier 赢——绝不为粘性去打更差档的号。
+        // 3) biased_load/priority/id 保持原有语义不变。
+        // 全好号(同 tier)+无 session(sticky_rank 全相同)时，两个前缀键为常量，退化回原
+        // (biased_load, priority, id) 排序，行为与历史一致。
+        let thresholds = QualityThresholds::from_config(&self.config);
+        available.sort_by_key(|e| {
+            (
+                e.quality_tier(thresholds),
+                e.sticky_rank,
+                e.biased_load(large_penalty),
+                e.priority,
+                e.id,
+            )
+        });
 
         available
     }
@@ -2026,6 +2178,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
         large_penalty: usize,
+        session_seed: Option<&str>,
     ) -> anyhow::Result<(u64, KiroCredentials, CredentialLease)> {
         let total = self.total_count_in_group(group).max(1);
         // 默认非阻塞快速失败:非阻塞 sweep 一圈所有匹配凭据,全忙即返回"池忙",由
@@ -2040,7 +2193,8 @@ impl MultiTokenManager {
         let mut logged_busy_wait = false;
 
         'acquire_loop: loop {
-            let mut candidates = self.ranked_available_credentials(model, group, large_penalty);
+            let mut candidates =
+                self.ranked_available_credentials(model, group, large_penalty, session_seed);
 
             if candidates.is_empty() {
                 let mut entries = self.entries.lock();
@@ -2059,7 +2213,12 @@ impl MultiTokenManager {
                         }
                     }
                     drop(entries);
-                    candidates = self.ranked_available_credentials(model, group, large_penalty);
+                    candidates = self.ranked_available_credentials(
+                        model,
+                        group,
+                        large_penalty,
+                        session_seed,
+                    );
                 }
             }
 
@@ -2116,6 +2275,7 @@ impl MultiTokenManager {
                             self.clone_available_credentials(candidate.id, model, group)
                         {
                             *self.current_id.lock() = candidate.id;
+                            self.record_sticky(session_seed, candidate.id);
                             tracing::trace!("凭据 #{} 获取账号并发租约", candidate.id);
                             return Ok((candidate.id, credentials, permit));
                         }
@@ -2167,6 +2327,7 @@ impl MultiTokenManager {
                 Ok(Some((id, Ok(permit)))) => {
                     if let Some(credentials) = self.clone_available_credentials(id, model, group) {
                         *self.current_id.lock() = id;
+                        self.record_sticky(session_seed, id);
                         tracing::trace!("凭据 #{} 获取账号并发租约", id);
                         return Ok((id, credentials, permit));
                     }
@@ -2187,6 +2348,21 @@ impl MultiTokenManager {
         }
     }
 
+    /// 记录会话→凭据粘性映射（成功抢到并发槽后调用）。
+    ///
+    /// 写在"抢到槽"而非"请求成功"点：一是此处已有 session_seed 与选定 id、无需改
+    /// `report_success` 的签名及其所有调用点；二是粘性只是**排序偏好**，即便该凭据本次
+    /// 后续失败/变慢，下轮该会话再来时 `quality_tier` 主键会先把它降档、sticky_rank 仅在
+    /// 同档内生效，故不会因一次记录把会话钉死在坏号上。无 session_seed 时不记录。
+    fn record_sticky(&self, session_seed: Option<&str>, id: u64) {
+        if let Some(seed) = session_seed {
+            let ttl = StdDuration::from_secs(self.config.sticky_ttl_secs);
+            self.sticky_map
+                .lock()
+                .record(seed.to_string(), id, ttl, Instant::now());
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -2202,19 +2378,23 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        // 默认非大请求(large_penalty=0)，行为与历史完全一致；大请求走 acquire_context_sized。
-        self.acquire_context_sized(model, group, 0).await
+        // 默认非大请求(large_penalty=0)、无会话粘性(session_seed=None)，行为与历史完全一致；
+        // 大请求 + 粘性走 acquire_context_sized。
+        self.acquire_context_sized(model, group, 0, None).await
     }
 
-    /// 带大请求排序惩罚的 acquire（A4a）。
+    /// 带大请求排序惩罚 + 会话粘性的 acquire（A4a + 调度分层）。
     ///
     /// `large_penalty`(整数千分比)>0 时,Long 档大请求按命中账号在途数加排序惩罚,
     /// 避免多个大请求堆到同一账号拖垮其首字节;=0 时与 [`acquire_context`] 等价。
+    /// `session_seed`(见 `isolation_seed`)为 `Some` 时启用会话粘性：同会话优先复用上次成功
+    /// 命中的凭据(同 quality_tier 内)以提升上游前缀缓存命中率;为 `None` 时粘性不生效。
     pub async fn acquire_context_sized(
         &self,
         model: Option<&str>,
         group: Option<&str>,
         large_penalty: usize,
+        session_seed: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2230,7 +2410,7 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, permit) = self
-                .acquire_idle_permit(model, group, large_penalty)
+                .acquire_idle_permit(model, group, large_penalty, session_seed)
                 .await?;
 
             // 尝试获取/刷新 Token
@@ -3940,7 +4120,7 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert!(
-            manager.ranked_available_credentials(None, None, 0).is_empty(),
+            manager.ranked_available_credentials(None, None, 0, None).is_empty(),
             "刚被自动禁用（窗口未到）不应恢复"
         );
 
@@ -3953,7 +4133,7 @@ mod tests {
         }
 
         // 再次筛选 → 半开恢复
-        let cands = manager.ranked_available_credentials(None, None, 0);
+        let cands = manager.ranked_available_credentials(None, None, 0, None);
         assert_eq!(cands.len(), 1, "达半开窗口后应恢复该账号");
         {
             let entries = manager.entries.lock();
@@ -3982,7 +4162,7 @@ mod tests {
             entries.iter_mut().find(|e| e.id == 1).unwrap().auto_disabled_at = None;
         }
         assert!(
-            manager.ranked_available_credentials(None, None, 0).is_empty(),
+            manager.ranked_available_credentials(None, None, 0, None).is_empty(),
             "recovery_secs==0 时不应半开恢复"
         );
     }
@@ -5417,6 +5597,8 @@ mod tests {
             capacity: 100,
             in_flight,
             ewma_error: 0.0,
+            ewma_duration_ms: 0.0,
+            sticky_rank: 1,
             runtime: Arc::new(CredentialRuntime::new(100)),
         };
         // 多次重排:无论随机抽到哪两个,队首的 effective_load 必 <= 被换下来的那个;
@@ -5445,6 +5627,8 @@ mod tests {
             capacity: 100,
             in_flight,
             ewma_error: 0.0,
+            ewma_duration_ms: 0.0,
+            sticky_rank: 1,
             runtime: Arc::new(CredentialRuntime::new(100)),
         };
         let low = mk(1, 5); // load_per_mille = 50
@@ -5493,5 +5677,43 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    // ===== 会话粘性(StickyMap)确定性验证:时间可注入,无需上机/网络 =====
+
+    #[test]
+    fn sticky_same_seed_returns_same_credential() {
+        // 同一 session_seed 记录后,在 TTL 内再查必返回同一凭据 id → 会话粘同号。
+        let mut m = StickyMap::new();
+        let t0 = Instant::now();
+        let ttl = StdDuration::from_secs(300);
+        m.record("sess-A".to_string(), 42, ttl, t0);
+        // 同 seed、TTL 内(+10s)→ 命中同号
+        assert_eq!(m.get_fresh("sess-A", ttl, t0 + StdDuration::from_secs(10)), Some(42));
+        // 不同 seed → 无粘性(None,回落负载均衡)
+        assert_eq!(m.get_fresh("sess-B", ttl, t0), None);
+    }
+
+    #[test]
+    fn sticky_expires_after_ttl() {
+        // 超过 TTL → 粘性失效(None),换号由负载均衡决定,不会永久钉死某号。
+        let mut m = StickyMap::new();
+        let t0 = Instant::now();
+        let ttl = StdDuration::from_secs(300);
+        m.record("sess-A".to_string(), 42, ttl, t0);
+        // TTL 内边界(299s)仍命中
+        assert_eq!(m.get_fresh("sess-A", ttl, t0 + StdDuration::from_secs(299)), Some(42));
+        // 超 TTL(301s)→ 过期,None
+        assert_eq!(m.get_fresh("sess-A", ttl, t0 + StdDuration::from_secs(301)), None);
+    }
+
+    #[test]
+    fn sticky_ttl_zero_disables() {
+        // sticky_ttl_secs=0 → 粘性整体关闭:record 不写、get_fresh 恒 None(退化回纯负载均衡)。
+        let mut m = StickyMap::new();
+        let t0 = Instant::now();
+        let zero = StdDuration::ZERO;
+        m.record("sess-A".to_string(), 42, zero, t0);
+        assert_eq!(m.get_fresh("sess-A", zero, t0), None);
     }
 }
