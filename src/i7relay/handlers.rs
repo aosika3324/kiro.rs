@@ -90,6 +90,7 @@ pub async fn i7relay_restock_now(State(state): State<AdminState>) -> impl IntoRe
             "duplicate": out.duplicate,
             "failed": out.failed,
             "remainingQuota": out.remaining_quota,
+            "error": out.error,
         }))
         .into_response(),
         None => (StatusCode::TOO_MANY_REQUESTS, "已有补货进行中,请稍后再试").into_response(),

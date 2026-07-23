@@ -15,23 +15,41 @@ pub struct RemoteKey {
     pub status: String,
 }
 
-/// `POST /api/my/purchase` 返回的单个 key(通常只含 `key`)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct PurchasedKey {
-    pub key: String,
+/// 截断长响应体用于报错(避免把整段 key 打进日志)。
+fn trunc(s: &str) -> String {
+    s.chars().take(120).collect()
 }
 
-/// `GET /api/my/profile` 完整配额信息。
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+/// `GET /api/my/profile` 真实响应:`{"name","quota","remaining","webhook_url"}`。
+#[derive(Debug, Clone, Deserialize)]
+struct ProfileRaw {
+    #[serde(default)]
+    name: String,
+    /// 总配额。
+    #[serde(default)]
+    quota: i64,
+    #[serde(default)]
+    remaining: i64,
+}
+
+/// 归一化后的配额信息(供前端;`max_quota`=总配额,`used_quota`=总-剩)。
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Profile {
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub remaining: i64,
-    #[serde(default)]
     pub max_quota: i64,
-    #[serde(default)]
     pub used_quota: i64,
+}
+
+impl From<ProfileRaw> for Profile {
+    fn from(r: ProfileRaw) -> Self {
+        Profile {
+            name: r.name,
+            remaining: r.remaining,
+            max_quota: r.quota,
+            used_quota: (r.quota - r.remaining).max(0),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,12 +58,31 @@ struct KeysResp {
     keys: Vec<RemoteKey>,
 }
 
+/// purchase 成功响应:`keys` 可能是字符串数组或对象数组;`remaining` 可缺省。
 #[derive(Debug, Deserialize)]
 struct PurchaseResp {
     #[serde(default)]
-    keys: Vec<PurchasedKey>,
+    keys: Vec<KeyItem>,
+    /// 剩余配额;缺省时为 None(不伪造 0)。
     #[serde(default)]
-    remaining: i64,
+    remaining: Option<i64>,
+}
+
+/// key 条目:兼容裸字符串 `"ksk_..."` 或对象 `{"key":"ksk_..."}`。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum KeyItem {
+    Str(String),
+    Obj { key: String },
+}
+
+impl KeyItem {
+    fn into_key(self) -> String {
+        match self {
+            KeyItem::Str(s) => s,
+            KeyItem::Obj { key } => key,
+        }
+    }
 }
 
 /// i7relay API 客户端。持有 reqwest client + base_url + api_key(不打日志)。
@@ -82,7 +119,7 @@ impl I7relayClient {
         if !status.is_success() {
             anyhow::bail!("i7relay profile 失败: HTTP {status}");
         }
-        Ok(resp.json::<Profile>().await?)
+        Ok(resp.json::<ProfileRaw>().await?.into())
     }
 
     /// 剩余配额(remaining)。
@@ -108,6 +145,8 @@ impl I7relayClient {
     }
 
     /// 购买 `count` 个 key(**扣配额**)。返回 (keys, remaining)。
+    /// remaining = -1 表示响应未带该字段(未知,不伪造 0)。
+    /// 非 2xx 会带上响应体里的 `error`/`message`(如"暂无可用 Key")。
     pub async fn purchase(&self, count: u32) -> anyhow::Result<(Vec<String>, i64)> {
         let resp = self
             .http
@@ -117,12 +156,23 @@ impl I7relayClient {
             .send()
             .await?;
         let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("i7relay purchase 失败: HTTP {status}");
+            let msg = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            anyhow::bail!("{msg}");
         }
-        let p: PurchaseResp = resp.json().await?;
-        let keys = p.keys.into_iter().map(|k| k.key).collect();
-        Ok((keys, p.remaining))
+        let p: PurchaseResp = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("purchase 响应解析失败: {e}; body={}", trunc(&body)))?;
+        let keys = p.keys.into_iter().map(KeyItem::into_key).collect();
+        Ok((keys, p.remaining.unwrap_or(-1)))
     }
 
     /// 设置 webhook URL。
@@ -139,5 +189,49 @@ impl I7relayClient {
             anyhow::bail!("i7relay set_webhook 失败: HTTP {status}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_maps_real_schema() {
+        // 真实响应:{"name","quota","remaining","webhook_url"}
+        let raw: ProfileRaw =
+            serde_json::from_str(r#"{"name":"Beatingandroid","quota":50,"remaining":30,"webhook_url":""}"#)
+                .unwrap();
+        let p: Profile = raw.into();
+        assert_eq!(p.name, "Beatingandroid");
+        assert_eq!(p.max_quota, 50);
+        assert_eq!(p.remaining, 30);
+        assert_eq!(p.used_quota, 20); // 50-30
+    }
+
+    #[test]
+    fn profile_used_never_negative() {
+        let raw: ProfileRaw = serde_json::from_str(r#"{"quota":0,"remaining":50}"#).unwrap();
+        let p: Profile = raw.into();
+        assert_eq!(p.used_quota, 0); // max(0)
+    }
+
+    #[test]
+    fn keyitem_accepts_string_and_object() {
+        let a: KeyItem = serde_json::from_str(r#""ksk_abc""#).unwrap();
+        let b: KeyItem = serde_json::from_str(r#"{"key":"ksk_xyz"}"#).unwrap();
+        assert_eq!(a.into_key(), "ksk_abc");
+        assert_eq!(b.into_key(), "ksk_xyz");
+    }
+
+    #[test]
+    fn purchase_resp_remaining_optional() {
+        // 缺 remaining → None(不伪造 0)
+        let p: PurchaseResp = serde_json::from_str(r#"{"keys":["ksk_a","ksk_b"]}"#).unwrap();
+        assert_eq!(p.remaining, None);
+        assert_eq!(p.keys.len(), 2);
+        // 带 remaining
+        let p2: PurchaseResp = serde_json::from_str(r#"{"keys":[],"remaining":7}"#).unwrap();
+        assert_eq!(p2.remaining, Some(7));
     }
 }

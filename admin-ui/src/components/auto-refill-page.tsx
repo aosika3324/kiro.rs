@@ -71,7 +71,15 @@ export function AutoRefillPage() {
     setBusy(true)
     try {
       const r = await restockNow()
-      toast.success(`拉取完成：新增 ${r.imported}，重复 ${r.duplicate}，失败 ${r.failed}`)
+      if (r.error) {
+        // 供应站侧原因(如"暂无可用 Key"):明确报失败,不动配额显示。
+        toast.error('拉取失败：' + r.error)
+      } else if (r.imported === 0 && r.duplicate === 0 && r.failed === 0) {
+        toast.info('本次未拉到新 Key(供应站暂无可用)')
+      } else {
+        toast.success(`拉取完成：新增 ${r.imported}，重复 ${r.duplicate}，失败 ${r.failed}`)
+      }
+      // 仅当 remaining 已知(>=0)才更新显示,-1(未知)绝不覆盖成 0。
       if (r.remainingQuota >= 0) setQuota((q) => (q ? { ...q, remaining: r.remainingQuota } : q))
     } catch (e) {
       toast.error('拉取失败：' + extractErrorMessage(e))

@@ -36,13 +36,27 @@ impl RestockTrigger {
     }
 }
 
-/// 一次补货的结果汇总。
-#[derive(Debug, Default, Clone)]
+/// 一次补货的结果汇总。`remaining_quota=-1` 表示未知(purchase 未返回该字段/失败)。
+#[derive(Debug, Clone)]
 pub struct RestockOutcome {
     pub imported: usize,
     pub duplicate: usize,
     pub failed: usize,
     pub remaining_quota: i64,
+    /// 失败原因(如"暂无可用 Key");成功为 None。
+    pub error: Option<String>,
+}
+
+impl Default for RestockOutcome {
+    fn default() -> Self {
+        RestockOutcome {
+            imported: 0,
+            duplicate: 0,
+            failed: 0,
+            remaining_quota: -1, // 未知,不伪造 0
+            error: None,
+        }
+    }
 }
 
 fn ksk_prefix(k: &str) -> String {
@@ -194,7 +208,10 @@ pub async fn restock(
                 error: Some(format!("purchase 失败(重试耗尽): {e}")),
             });
             tracing::warn!("i7relay purchase 失败(重试耗尽): {e}");
-            return Some(RestockOutcome::default());
+            return Some(RestockOutcome {
+                error: Some(e.to_string()),
+                ..Default::default()
+            });
         }
     };
 

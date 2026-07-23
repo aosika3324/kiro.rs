@@ -54,7 +54,10 @@ export interface RestockResult {
   imported: number
   duplicate: number
   failed: number
+  /** -1 = 未知(purchase 未返回配额/失败),前端不据此覆盖显示。 */
   remainingQuota: number
+  /** 失败原因(如"暂无可用 Key");成功为 null。 */
+  error?: string | null
 }
 
 export interface RestockRecord {
