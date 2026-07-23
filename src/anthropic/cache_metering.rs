@@ -2389,6 +2389,81 @@ mod tests {
         assert!(request_has_cache_control(&req), "message content block 的断点应被检测");
     }
 
+    /// **端到端会话识别证明**：真实 pipeline（isolation_seed → observe_session → compute → split）
+    /// 跑一个稳定 session 的多轮对话，聚合 `Σread/Σtotal` 应随对话加深逼近 T（不塌到 0）。
+    /// 这是"会话识别正确 → 命中率达标"的守卫，防 observe_session/seed 归并回归。
+    #[test]
+    fn e2e_stable_session_aggregate_hit_rate_converges_to_t() {
+        let t = 0.9_f64;
+        let ttl = 3600_u64;
+        let g = MeterGovernance::new_with_max(t, ttl, 0.95);
+        // 稳定 session（Claude Code 显式 _session_ uuid）——多轮 messages[0] 不变、追加历史。
+        let sid = "user_x_account__session_conv-1";
+        let big = "the quick brown fox jumps ".repeat(60); // 每条 ~360 token
+        // system 足够大（>1024 token）使**首轮**（可缓存前缀=仅 system）也过最小门槛，模拟真实
+        // Claude Code 的大 system prompt。
+        let sys_text = "you are a helpful coding assistant ".repeat(320); // ~2800 token
+        let mut msgs: Vec<Message> = vec![msg("user", &big)];
+
+        let (mut sum_read, mut sum_total) = (0i64, 0i64);
+        let mut warm_hits: Vec<f64> = Vec::new();
+        // 10 轮：每轮追加 (assistant, user)，末条为本轮 input。带 system cache_control 使合格。
+        for turn in 0..10 {
+            let mut req = req_with(
+                msgs.clone(),
+                Some(vec![SystemMessage {
+                    text: sys_text.clone(),
+                    cache_control: Some(super::super::types::CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                }]),
+            );
+            req.metadata = Some(Metadata { user_id: Some(sid.to_string()) });
+            assert!(cache_eligible(&req), "每轮都应合格（带断点+大前缀）");
+
+            let seed = isolation_seed(&req, 0);
+            let now = 1_000 + turn * 30; // 每轮间隔 30s < TTL → 保持 warm
+            let cacheable = estimate_cacheable_tokens(&req).max(0) as u32;
+            let prev = g.observe_session(&seed, now, cacheable, ttl).map(|v| v as i32);
+            let usage = compute_structural_cache_usage(&req, t, prev);
+            // 真实 total 用 prompt_total_est 近似（本地估算口径）。
+            let total = usage.prompt_total_est;
+            let (_i, _c, read) = usage.split_against_total(total);
+            sum_read += read as i64;
+            sum_total += total as i64;
+            let _ = (cacheable, _i, _c);
+            if prev.is_some() {
+                warm_hits.push(read as f64 / total as f64);
+            }
+            // 追加一轮对话：assistant 回复 + user 新问题。
+            msgs.push(msg("assistant", &big));
+            msgs.push(msg("user", "next question please"));
+        }
+
+        // 深暖轮（后几轮）命中率应逼近 T=0.9。
+        let last = *warm_hits.last().unwrap();
+        assert!((last - t).abs() < 0.08, "深暖轮命中率应逼近 T=0.9，实得 {last:.3}");
+        // 聚合命中率（含第 1 轮冷）应显著 >0 且爬向 T（不塌）。
+        let agg = sum_read as f64 / sum_total as f64;
+        assert!(agg > 0.6, "10 轮聚合命中率应 >0.6（只 1 轮冷），实得 {agg:.3}");
+    }
+
+    /// TTL 到期使暖轮转冷：命中率塌到 0（诚实——缓存真凉了）。锁住"TTL 是命中率杠杆"语义。
+    #[test]
+    fn e2e_ttl_expiry_turns_cold_zero_hit() {
+        let t = 0.9_f64;
+        let ttl = 300_u64;
+        let g = MeterGovernance::new_with_max(t, ttl, 0.95);
+        let seed = "sess:gap";
+        // 第 1 轮：cold。
+        assert_eq!(g.observe_session(seed, 1_000, 5000, ttl), None);
+        // 30s 后：warm。
+        assert_eq!(g.observe_session(seed, 1_030, 5200, ttl), Some(5000));
+        // 间隔 > TTL（缓存凉）→ cold，命中率归 0（诚实）。
+        assert_eq!(g.observe_session(seed, 1_030 + 400, 5300, ttl), None, "超 TTL → cold");
+    }
+
     /// hit_rate_max 夹紧（MeterGovernance 侧的 setter/getter 语义）。
     #[test]
     fn hit_rate_max_getter_setter_clamps() {
