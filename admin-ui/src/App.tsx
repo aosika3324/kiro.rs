@@ -4,7 +4,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Settings } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Settings, PackagePlus } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -48,8 +48,13 @@ const SettingsPage = lazy(() =>
     default: m.SettingsPage,
   })),
 );
+const AutoRefillPage = lazy(() =>
+  import("@/components/auto-refill-page").then((m) => ({
+    default: m.AutoRefillPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "settings";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "traces" | "autorefill" | "settings";
 
 const TABS: {
   key: Tab;
@@ -88,6 +93,12 @@ const TABS: {
     icon: <ScrollText className="h-3.5 w-3.5" />,
   },
   {
+    key: "autorefill",
+    label: "自动取号",
+    mobileLabel: "取号",
+    icon: <PackagePlus className="h-3.5 w-3.5" />,
+  },
+  {
     key: "settings",
     label: "设置",
     mobileLabel: "设置",
@@ -103,6 +114,7 @@ function readTabFromHash(): Tab {
     h === "groups" ||
     h === "overview" ||
     h === "traces" ||
+    h === "autorefill" ||
     h === "settings"
   )
     return h;
@@ -390,6 +402,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
+        {tab === "autorefill" && <AutoRefillPage />}
         {tab === "settings" && <SettingsPage />}
       </Suspense>
     </main>

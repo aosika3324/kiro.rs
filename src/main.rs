@@ -4,6 +4,7 @@ mod anthropic;
 mod common;
 mod fingerprint_client;
 mod http_client;
+mod i7relay;
 mod image_resize;
 mod kiro;
 mod model;
@@ -359,6 +360,28 @@ async fn main() {
                 admin_trace_store,
                 group_manager.clone(),
             );
+
+            // i7relay 自动取号:**始终**初始化运行时 + 启动轮询(前端可运行时开关/改配置)。
+            // 轮询 loop 每 tick 读配置:disabled 空转,enabled 才真拉号。
+            {
+                let data_dir = std::path::Path::new(&config_path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let audit = std::sync::Arc::new(i7relay::I7relayAudit::new(&data_dir));
+                i7relay::init_runtime(config.i7relay.clone(), audit, config.tls_backend);
+                i7relay::spawn_poll_loop(admin_state.service.clone());
+                if config.i7relay.enabled {
+                    tracing::info!(
+                        "i7relay 自动取号已启用(baseUrl={}, 阈值={}, 轮询={}s)",
+                        config.i7relay.base_url,
+                        config.i7relay.restock_threshold,
+                        config.i7relay.poll_interval_secs
+                    );
+                } else {
+                    tracing::info!("i7relay 自动取号运行时已就绪(当前禁用,可经 Admin 启用)");
+                }
+            }
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

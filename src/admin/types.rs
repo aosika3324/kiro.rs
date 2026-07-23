@@ -524,6 +524,57 @@ pub struct RuntimeGovernanceConfigResponse {
     pub cache_hit_rate_max: f64,
 }
 
+/// i7relay 自动取号配置响应(**脱敏**:apiKey/webhookSecret 不回明文,只回是否已设 + 掩码)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct I7relayConfigResponse {
+    pub enabled: bool,
+    pub base_url: String,
+    pub purchase_count: u32,
+    pub poll_interval_secs: u64,
+    pub restock_threshold: u32,
+    pub verify_on_import: bool,
+    pub dead_key_action: String,
+    pub cooldown_secs: u64,
+    /// apiKey 是否已配置。
+    pub api_key_set: bool,
+    /// apiKey 掩码(前4…后4;未设为空)。
+    pub api_key_masked: String,
+    /// webhookSecret 是否已配置。
+    pub webhook_secret_set: bool,
+}
+
+/// 更新 i7relay 配置(字段缺省=不修改;apiKey/webhookSecret 传空串=不修改,保留原值)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetI7relayConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub purchase_count: Option<u32>,
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub restock_threshold: Option<u32>,
+    #[serde(default)]
+    pub verify_on_import: Option<bool>,
+    #[serde(default)]
+    pub dead_key_action: Option<String>,
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
+    /// apiKey 明文(空串或缺省 = 保留原值)。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// true = 清除已保存的 apiKey(优先级高于 api_key)。
+    #[serde(default)]
+    pub clear_api_key: bool,
+    /// webhookSecret 明文(空串或缺省 = 保留原值)。
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+}
+
 /// 更新运行时治理配置（字段缺省表示不修改）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

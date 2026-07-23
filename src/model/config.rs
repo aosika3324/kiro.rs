@@ -418,9 +418,88 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// i7relay 自动补号(上游账号供货商)配置。默认 disabled。见 [`I7relayConfig`]。
+    #[serde(default)]
+    pub i7relay: I7relayConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// i7relay 自动补号对接配置(消费端：从上游账号供货商拉 `ksk_` API Key 凭据补池)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct I7relayConfig {
+    /// 总开关(默认 false)。关闭时不注册 webhook 端点、不跑轮询、不补货。
+    #[serde(default)]
+    pub enabled: bool,
+    /// i7relay API Key(`usr-...`)。**敏感,不打日志**。
+    #[serde(default)]
+    pub api_key: String,
+    /// i7relay API base URL(默认 https://test.i7relay.com)。
+    #[serde(default = "default_i7relay_base_url")]
+    pub base_url: String,
+    /// 每次 purchase 拉取数量(供货商设定的固定值,默认 10)。
+    #[serde(default = "default_i7relay_purchase_count")]
+    pub purchase_count: u32,
+    /// webhook 共享密钥,请求头 `X-Webhook-Secret` 校验。**敏感,不打日志**。
+    #[serde(default)]
+    pub webhook_secret: String,
+    /// 兜底轮询周期(秒,默认 300)。
+    #[serde(default = "default_i7relay_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// 池内可用 i7relay apikey 凭据数低于此值 → 轮询时触发补货(默认 5)。
+    #[serde(default = "default_i7relay_restock_threshold")]
+    pub restock_threshold: u32,
+    /// 导入时是否验活(默认 true)。
+    #[serde(default = "default_true")]
+    pub verify_on_import: bool,
+    /// 死号处理:"disable"(默认,禁用留审计) 或 "delete"(删除)。
+    #[serde(default = "default_i7relay_dead_key_action")]
+    pub dead_key_action: String,
+    /// 两次 purchase 最小冷却间隔(秒,默认 30),防 webhook 重放烧配额。
+    #[serde(default = "default_i7relay_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for I7relayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            base_url: default_i7relay_base_url(),
+            purchase_count: default_i7relay_purchase_count(),
+            webhook_secret: String::new(),
+            poll_interval_secs: default_i7relay_poll_interval_secs(),
+            restock_threshold: default_i7relay_restock_threshold(),
+            verify_on_import: true,
+            dead_key_action: default_i7relay_dead_key_action(),
+            cooldown_secs: default_i7relay_cooldown_secs(),
+        }
+    }
+}
+
+fn default_i7relay_base_url() -> String {
+    "https://test.i7relay.com".to_string()
+}
+fn default_i7relay_purchase_count() -> u32 {
+    10
+}
+fn default_i7relay_poll_interval_secs() -> u64 {
+    300
+}
+fn default_i7relay_restock_threshold() -> u32 {
+    5
+}
+fn default_i7relay_dead_key_action() -> String {
+    "disable".to_string()
+}
+fn default_i7relay_cooldown_secs() -> u64 {
+    30
+}
+fn default_true() -> bool {
+    true
 }
 
 /// serde 默认值：`usage_gated_streaming_enabled` 默认开启。
@@ -658,6 +737,7 @@ impl Default for Config {
             quality_latency_enabled: false,
             quality_latency_ms: default_quality_latency_ms(),
             endpoints: HashMap::new(),
+            i7relay: I7relayConfig::default(),
             config_path: None,
         }
     }

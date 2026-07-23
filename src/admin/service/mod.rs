@@ -30,7 +30,8 @@ use super::types::{
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult,
     EndpointRoutingConfigResponse, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
-    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    I7relayConfigResponse, ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    SetI7relayConfigRequest,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RuntimeGovernanceConfigResponse,
     SetAccountThrottleConfigRequest, SetEndpointRoutingConfigRequest, SetLoadBalancingModeRequest,
@@ -1556,6 +1557,111 @@ impl AdminService {
     /// 从磁盘加载最新配置并应用更新，再写回磁盘。
     ///
     /// 每次读最新文件再写，避免多次调用之间字段互相覆盖。
+    /// 获取 i7relay 配置(脱敏:apiKey 掩码、webhookSecret 只回是否已设)。
+    /// 优先读运行时快照(热改后的真值);未 init 时回退磁盘加载的配置。
+    pub fn get_i7relay_config(&self) -> I7relayConfigResponse {
+        let c = crate::i7relay::runtime()
+            .map(|rt| rt.config)
+            .unwrap_or_else(|| self.token_manager.config().i7relay.clone());
+        let api_key_set = !c.api_key.is_empty();
+        let api_key_masked = if c.api_key.len() > 8 {
+            format!("{}...{}", &c.api_key[..4], &c.api_key[c.api_key.len() - 4..])
+        } else if api_key_set {
+            "****".to_string()
+        } else {
+            String::new()
+        };
+        I7relayConfigResponse {
+            enabled: c.enabled,
+            base_url: c.base_url,
+            purchase_count: c.purchase_count,
+            poll_interval_secs: c.poll_interval_secs,
+            restock_threshold: c.restock_threshold,
+            verify_on_import: c.verify_on_import,
+            dead_key_action: c.dead_key_action,
+            cooldown_secs: c.cooldown_secs,
+            api_key_set,
+            api_key_masked,
+            webhook_secret_set: !c.webhook_secret.is_empty(),
+        }
+    }
+
+    /// 更新 i7relay 配置:校验 → 持久化 config.json → 热更新运行时。
+    /// apiKey/webhookSecret 传空或缺省则保留原值(前端脱敏显示,不回传明文)。
+    pub fn set_i7relay_config(
+        &self,
+        req: SetI7relayConfigRequest,
+    ) -> Result<I7relayConfigResponse, AdminServiceError> {
+        let mut c = crate::i7relay::runtime()
+            .map(|rt| rt.config)
+            .unwrap_or_else(|| self.token_manager.config().i7relay.clone());
+        if let Some(v) = req.enabled {
+            c.enabled = v;
+        }
+        if let Some(v) = req.base_url {
+            let v = v.trim().trim_end_matches('/').to_string();
+            if !v.starts_with("http://") && !v.starts_with("https://") {
+                return Err(AdminServiceError::InvalidCredential(
+                    "baseUrl 需以 http:// 或 https:// 开头".to_string(),
+                ));
+            }
+            c.base_url = v;
+        }
+        if let Some(v) = req.purchase_count {
+            if !(1..=1000).contains(&v) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "purchaseCount 需在 1..=1000".to_string(),
+                ));
+            }
+            c.purchase_count = v;
+        }
+        if let Some(v) = req.poll_interval_secs {
+            if !(30..=86400).contains(&v) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "pollIntervalSecs 需在 30..=86400".to_string(),
+                ));
+            }
+            c.poll_interval_secs = v;
+        }
+        if let Some(v) = req.restock_threshold {
+            c.restock_threshold = v;
+        }
+        if let Some(v) = req.verify_on_import {
+            c.verify_on_import = v;
+        }
+        if let Some(v) = req.dead_key_action {
+            if v != "disable" && v != "delete" {
+                return Err(AdminServiceError::InvalidCredential(
+                    "deadKeyAction 只能是 disable 或 delete".to_string(),
+                ));
+            }
+            c.dead_key_action = v;
+        }
+        if let Some(v) = req.cooldown_secs {
+            c.cooldown_secs = v;
+        }
+        // apiKey:clear 优先;否则非空才覆盖(空=保留原值)。
+        if req.clear_api_key {
+            c.api_key = String::new();
+        } else if let Some(v) = req.api_key {
+            if !v.trim().is_empty() {
+                c.api_key = v.trim().to_string();
+            }
+        }
+        if let Some(v) = req.webhook_secret {
+            if !v.trim().is_empty() {
+                c.webhook_secret = v.trim().to_string();
+            }
+        }
+
+        // 持久化 + 热更新运行时。
+        let saved = c.clone();
+        self.update_config_file(move |cfg| cfg.i7relay = saved);
+        crate::i7relay::update_config(c);
+
+        Ok(self.get_i7relay_config())
+    }
+
     fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
         let base = self.token_manager.config();
         let Some(path) = base.config_path() else {

@@ -21,6 +21,11 @@
 /client_api_keys.json
 # 账号分组注册表（运行时产物，不入库）
 /groups.json
+# i7relay 自动取号审计日志（运行时产物，不入库）
+/i7relay_audit.jsonl
+# 本地运维脚本（含 SSH 密码 / admin key 明文，绝对不能提交）
+/tools/prod_monitor*.sh
+/tools/i7relay_smoke*.sh
 # 按天滚动的请求用量日志
 /usage_log.*.jsonl
 /usage_stats.json
