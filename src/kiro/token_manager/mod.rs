@@ -1076,6 +1076,11 @@ struct CredentialEntry {
     /// （旧逻辑只在"整池全禁用"时才一次性自愈，且羊群式全放，易再次集体 429）。
     /// 不持久化，进程重启即等价于全部恢复。
     auto_disabled_at: Option<Instant>,
+    /// 该凭据的运行时并发状态（semaphore/in_flight/capacity/EWMA 原子镜像）。
+    /// 与 `credential_locks` map 里的是**同一个 Arc**（两处索引同一 runtime）。
+    /// 排序热路径 `ranked_available_credentials` 直接从此字段读，避免逐候选锁
+    /// `credential_locks`/`metrics`（O(n) 全局锁 → O(1)）。
+    runtime: Arc<CredentialRuntime>,
 }
 
 /// 单凭据的运行时并发状态。
@@ -1089,6 +1094,13 @@ struct CredentialRuntime {
     in_flight: AtomicUsize,
     shrink_debt: AtomicUsize,
     resize_lock: Mutex<()>,
+    /// 近期错误率 EWMA 的原子镜像（`f64::to_bits`）。真值仍由 `CredMetrics` 维护，
+    /// 这里镜像一份供 `ranked_available_credentials` **无锁**读取——热路径排序不再逐候选
+    /// 锁 `metrics`。在 `report_success/report_failure` 喂错误后同步写入（那里已持 entries 锁）。
+    ewma_error_bits: AtomicU64,
+    /// 请求耗时 EWMA（毫秒）的原子镜像（`f64::to_bits`）。在 `CredentialLease` drop 的
+    /// `on_finish` 算出新值后由 lease 直接写入（lease 已持 `runtime` Arc，无额外锁）。
+    ewma_duration_bits: AtomicU64,
 }
 
 struct CredentialCandidate {
@@ -1192,11 +1204,31 @@ impl CredentialRuntime {
             in_flight: AtomicUsize::new(0),
             shrink_debt: AtomicUsize::new(0),
             resize_lock: Mutex::new(()),
+            ewma_error_bits: AtomicU64::new(0.0f64.to_bits()),
+            ewma_duration_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
     fn capacity(&self) -> usize {
         self.capacity.load(Ordering::Relaxed).max(1)
+    }
+
+    /// 无锁读近期错误率 EWMA 镜像（供排序热路径）。
+    fn ewma_error(&self) -> f64 {
+        f64::from_bits(self.ewma_error_bits.load(Ordering::Relaxed))
+    }
+
+    /// 无锁读请求耗时 EWMA 镜像（毫秒，供排序热路径）。
+    fn ewma_duration_ms(&self) -> f64 {
+        f64::from_bits(self.ewma_duration_bits.load(Ordering::Relaxed))
+    }
+
+    fn store_ewma_error(&self, v: f64) {
+        self.ewma_error_bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    fn store_ewma_duration(&self, v: f64) {
+        self.ewma_duration_bits.store(v.to_bits(), Ordering::Relaxed);
     }
 
     fn in_flight(&self) -> usize {
@@ -1317,8 +1349,14 @@ impl Drop for CredentialLease {
         } else {
             drop(permit);
         }
-        if let Some(m) = self.metrics.lock().get_mut(&self.credential_id) {
-            m.on_finish(self.req_id);
+        let updated = self
+            .metrics
+            .lock()
+            .get_mut(&self.credential_id)
+            .and_then(|m| m.on_finish(self.req_id));
+        // 同步耗时 EWMA 到 runtime 原子镜像（排序热路径无锁读）。lease 已持 runtime Arc。
+        if let Some(ms) = updated {
+            self.runtime.store_ewma_duration(ms);
         }
     }
 }
@@ -1567,19 +1605,24 @@ impl CredMetrics {
         self.active.insert(req, Instant::now());
         req
     }
-    fn on_finish(&mut self, req: u64) {
-        if let Some(start) = self.active.remove(&req) {
-            let ms = start.elapsed().as_millis() as f64;
-            self.ewma_duration_ms = if self.ewma_duration_ms == 0.0 {
-                ms
-            } else {
-                EWMA_ALPHA * ms + (1.0 - EWMA_ALPHA) * self.ewma_duration_ms
-            };
-        }
+    /// 结束一次在途请求并更新耗时 EWMA。返回更新后的 `ewma_duration_ms`（供调用方
+    /// 同步到 `CredentialRuntime` 的原子镜像）；该 req 不在途时返回 `None`（不更新）。
+    fn on_finish(&mut self, req: u64) -> Option<f64> {
+        let start = self.active.remove(&req)?;
+        let ms = start.elapsed().as_millis() as f64;
+        self.ewma_duration_ms = if self.ewma_duration_ms == 0.0 {
+            ms
+        } else {
+            EWMA_ALPHA * ms + (1.0 - EWMA_ALPHA) * self.ewma_duration_ms
+        };
+        Some(self.ewma_duration_ms)
     }
-    fn feed_error(&mut self, is_error: bool) {
+    /// 喂一个成功(false)/失败(true)样本并更新错误率 EWMA，返回更新后的值
+    /// （供调用方同步到 `CredentialRuntime` 的原子镜像）。
+    fn feed_error(&mut self, is_error: bool) -> f64 {
         let sample = if is_error { 1.0 } else { 0.0 };
         self.ewma_error = EWMA_ALPHA * sample + (1.0 - EWMA_ALPHA) * self.ewma_error;
+        self.ewma_error
     }
     /// 最老在途请求年龄（秒）；无在途则 None
     fn oldest_in_flight_secs(&self) -> Option<u64> {
@@ -1758,6 +1801,13 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     auto_disabled_at: None,
+                    runtime: {
+                        let cap = cred
+                            .max_concurrency
+                            .filter(|n| *n > 0)
+                            .unwrap_or_else(|| config_ref.account_max_concurrency.max(1));
+                        Arc::new(CredentialRuntime::new(cap))
+                    },
                 }
             })
             .collect();
@@ -1794,17 +1844,11 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        let account_max_concurrency = config.account_max_concurrency.max(1);
+        // `credential_locks` 复用 entry 里的**同一个** runtime Arc（二级索引，供 admin/resize
+        // 按 id 查找），不再新建，保证 entry.runtime 与 map 指向同一 runtime。
         let credential_locks = entries
             .iter()
-            .map(|entry| {
-                let cap = entry
-                    .credentials
-                    .max_concurrency
-                    .filter(|n| *n > 0)
-                    .unwrap_or(account_max_concurrency);
-                (entry.id, Arc::new(CredentialRuntime::new(cap)))
-            })
+            .map(|entry| (entry.id, Arc::clone(&entry.runtime)))
             .collect();
 
         // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
@@ -2013,14 +2057,6 @@ impl MultiTokenManager {
             .unwrap_or_else(|| self.config.account_max_concurrency.max(1))
     }
 
-    fn clone_credentials(&self, id: u64) -> Option<KiroCredentials> {
-        self.entries
-            .lock()
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.credentials.clone())
-    }
-
     fn clone_available_credentials(
         &self,
         id: u64,
@@ -2054,7 +2090,11 @@ impl MultiTokenManager {
         let sticky_ttl = StdDuration::from_secs(self.config.sticky_ttl_secs);
         let sticky_target: Option<u64> = session_seed
             .and_then(|seed| self.sticky_map.lock().get_fresh(seed, sticky_ttl, now));
-        let available_entries: Vec<_> = {
+        // 单次持 `entries` 锁即组装全部候选：容量/在途/EWMA 全部从 `entry.runtime` 的原子字段
+        // **无锁**读出——不再逐候选锁 `credential_locks`（runtime_for_credential）和 `metrics`。
+        // 这把每次 ranking 的全局锁获取从 O(n)（2n+1 把）降到 **1 把**（仅这里的 entries），
+        // 是高并发+多账号下"加账号越多越慢"串行的根因修复。排序在锁外做（纯 CPU）。
+        let mut available: Vec<CredentialCandidate> = {
             let mut entries = self.entries.lock();
             // 半开恢复：自动禁用（TooManyFailures）超过恢复窗口的账号在此就地"半开"，
             // 给一次新机会（清禁用+重置失败计数）。逐账号按各自禁用时刻错峰恢复，避免旧的
@@ -2088,39 +2128,22 @@ impl MultiTokenManager {
                         && credential_matches_request(&e.credentials, model, group)
                 })
                 .map(|e| {
-                    let cap = self.cap_of(&e.credentials);
-                    (e.id, e.credentials.priority, cap)
+                    // 粘性：命中会话上次凭据 → rank 0(优先);其余 → 1。无 session 时
+                    // sticky_target=None → 全部 rank 1(粘性不生效,退化回纯负载均衡)。
+                    let sticky_rank = if sticky_target == Some(e.id) { 0 } else { 1 };
+                    CredentialCandidate {
+                        id: e.id,
+                        priority: e.credentials.priority,
+                        capacity: e.runtime.capacity(),
+                        in_flight: e.runtime.in_flight(),
+                        ewma_error: e.runtime.ewma_error(),
+                        ewma_duration_ms: e.runtime.ewma_duration_ms(),
+                        sticky_rank,
+                        runtime: Arc::clone(&e.runtime),
+                    }
                 })
                 .collect()
         };
-
-        let mut available: Vec<_> = available_entries
-            .into_iter()
-            .map(|(id, priority, cap)| {
-                let runtime = self.runtime_for_credential(id, cap);
-                runtime.set_capacity(cap);
-                // 错误率/耗时从 metrics 读取(此处 entries 锁已释放,只锁 metrics,不构成锁序环)。
-                let (ewma_error, ewma_duration_ms) = self
-                    .metrics
-                    .lock()
-                    .get(&id)
-                    .map(|m| (m.ewma_error, m.ewma_duration_ms))
-                    .unwrap_or((0.0, 0.0));
-                // 粘性：命中会话上次凭据 → rank 0(优先);其余 → 1。无 session 时 sticky_target=None
-                // → 全部 rank 1(粘性不生效,退化回纯负载均衡)。
-                let sticky_rank = if sticky_target == Some(id) { 0 } else { 1 };
-                CredentialCandidate {
-                    id,
-                    priority,
-                    capacity: runtime.capacity(),
-                    in_flight: runtime.in_flight(),
-                    ewma_error,
-                    ewma_duration_ms,
-                    sticky_rank,
-                    runtime,
-                }
-            })
-            .collect();
 
         // 排序：两种模式都按 effective_load(已含 ewma_error 惩罚) → priority → id。
         // balanced 不再以 success_count(单调累计+持久化)作次键——那会让老账号/曾被禁账号
@@ -2897,12 +2920,14 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        if let Some(m) = self.metrics.lock().get_mut(&id) {
-            m.feed_error(false);
-        }
+        let new_ewma = self.metrics.lock().get_mut(&id).map(|m| m.feed_error(false));
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                // 同步错误率 EWMA 到 runtime 原子镜像（排序热路径无锁读）。
+                if let Some(v) = new_ewma {
+                    entry.runtime.store_ewma_error(v);
+                }
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
@@ -2929,9 +2954,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        if let Some(m) = self.metrics.lock().get_mut(&id) {
-            m.feed_error(true);
-        }
+        let new_ewma = self.metrics.lock().get_mut(&id).map(|m| m.feed_error(true));
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -2940,6 +2963,11 @@ impl MultiTokenManager {
                 Some(e) => e,
                 None => return entries.iter().any(|e| !e.disabled),
             };
+
+            // 同步错误率 EWMA 到 runtime 原子镜像（排序热路径无锁读）。
+            if let Some(v) = new_ewma {
+                entry.runtime.store_ewma_error(v);
+            }
 
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
@@ -4105,6 +4133,51 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 不变量：runtime 的 EWMA 错误率原子镜像（排序热路径无锁读）必须与 metrics 真值同步。
+    /// 生产两个写点 report_success/report_failure 都会同步镜像；这里走生产路径验证。
+    /// 注意：metrics 的 ewma 项仅在该账号被 acquire 过后存在（on_acquire 建项），故先 acquire。
+    #[tokio::test]
+    async fn test_runtime_ewma_error_mirror_synced() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("tok1", &[]), grouped_cred("tok2", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mirror = |id: u64| {
+            manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.runtime.ewma_error())
+                .unwrap()
+        };
+        let truth = |id: u64| manager.metrics.lock().get(&id).map(|m| m.ewma_error);
+
+        // 先 acquire 一次建立 metrics 项（模拟生产：报告前必先被调度）。
+        {
+            let _lease = manager.acquire_context(None, None).await.unwrap();
+        }
+        assert_eq!(mirror(1), 0.0, "初始镜像应为 0");
+
+        // 失败一次：镜像应等于 metrics 真值且 > 0。
+        manager.report_failure(1);
+        let t1 = truth(1).unwrap();
+        assert!(t1 > 0.0, "失败后 ewma_error 应 > 0");
+        assert!((mirror(1) - t1).abs() < 1e-12, "失败后镜像应与真值一致");
+
+        // 成功一次：真值下降，镜像仍跟随。
+        manager.report_success(1);
+        let t2 = truth(1).unwrap();
+        assert!(t2 < t1, "成功后 ewma_error 应下降");
+        assert!((mirror(1) - t2).abs() < 1e-12, "成功后镜像应与真值一致");
     }
 
     #[test]
@@ -5334,13 +5407,14 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![flaky, healthy], None, None, false)
                 .unwrap();
 
-        // 直接喂 error EWMA 抬高 id=1 的错误率(绕开 report_failure 的禁用副作用,
-        // 本测试只验证排序惩罚,不验证故障转移)。喂满几次使 ewma_error 接近 1.0。
+        // 直接抬高 id=1 的错误率原子镜像(绕开 report_failure 的禁用副作用,本测试只验证排序惩罚)。
+        // 排序热路径读的是 entry.runtime 的 EWMA 镜像（单锁快照），故直接写它。
         {
-            let mut m = manager.metrics.lock();
-            let cm = m.entry(1).or_default();
+            let entries = manager.entries.lock();
+            let e = entries.iter().find(|e| e.id == 1).unwrap();
             for _ in 0..10 {
-                cm.feed_error(true);
+                let next = EWMA_ALPHA * 1.0 + (1.0 - EWMA_ALPHA) * e.runtime.ewma_error();
+                e.runtime.store_ewma_error(next);
             }
         }
 
@@ -5397,6 +5471,119 @@ mod tests {
         let acquired = handle.await.unwrap().unwrap();
         assert_eq!(acquired.id, 1);
         drop(acquired);
+    }
+
+    /// 手动基准（默认 `#[ignore]`，用 `cargo test -- --ignored bench_ranked` 跑）：
+    /// 100 账号 + 500 并发线程各自狂调 `ranked_available_credentials`，测每次 ranking 的
+    /// 平均耗时。修复前每次 ranking 做 2n+1 次全局锁（entries + n×credential_locks +
+    /// n×metrics），100 账号时约 201 把锁/次，500 并发全撞同 3 锁 → 严重串行。修复后
+    /// 每次仅 1 把 entries 锁 + 锁外排序，应显著更快且不随并发塌陷。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "manual perf benchmark; run with --ignored"]
+    async fn bench_ranked_available_credentials_100_accounts_500_concurrent() {
+        const N_ACCOUNTS: usize = 100;
+        const N_THREADS: usize = 500;
+        const ITERS_PER_THREAD: usize = 200;
+
+        let creds: Vec<_> = (0..N_ACCOUNTS)
+            .map(|i| grouped_cred(&format!("tok{i}"), &[]))
+            .collect();
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap(),
+        );
+
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for _ in 0..N_THREADS {
+            let m = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERS_PER_THREAD {
+                    let ranked = m.ranked_available_credentials(None, None, 0, None);
+                    assert_eq!(ranked.len(), N_ACCOUNTS);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        let total_calls = (N_THREADS * ITERS_PER_THREAD) as f64;
+        let per_call_us = elapsed.as_secs_f64() * 1e6 / total_calls;
+        println!(
+            "bench NEW (single entries lock): {N_ACCOUNTS} accounts × {N_THREADS} threads × \
+             {ITERS_PER_THREAD} iters = {total_calls:.0} rankings in {elapsed:?} → \
+             {per_call_us:.2} µs/ranking",
+        );
+    }
+
+    /// A/B 对照基准：复刻**修复前**的 per-candidate 锁模式（每候选锁 credential_locks +
+    /// metrics），在同一台机器、同一并发压力下测其每次 ranking 耗时，量化本次修复的收益。
+    /// 默认 `#[ignore]`，与上面的 NEW 基准配对跑对比。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "manual perf benchmark (legacy A/B baseline); run with --ignored"]
+    async fn bench_legacy_percandidate_locks_100_accounts_500_concurrent() {
+        const N_ACCOUNTS: usize = 100;
+        const N_THREADS: usize = 500;
+        const ITERS_PER_THREAD: usize = 200;
+
+        let creds: Vec<_> = (0..N_ACCOUNTS)
+            .map(|i| grouped_cred(&format!("tok{i}"), &[]))
+            .collect();
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap(),
+        );
+
+        // 复刻旧热路径：持 entries 锁取 (id, priority, cap) 列表后释放，然后**逐候选**
+        // 锁 credential_locks（runtime_for_credential）+ 锁 metrics 读 EWMA —— 即修复前
+        // 每次 ranking 的 2n+1 把全局锁。
+        let legacy_rank = |m: &MultiTokenManager| {
+            let now = Instant::now();
+            let list: Vec<(u64, u32, usize)> = {
+                let entries = m.entries.lock();
+                entries
+                    .iter()
+                    .filter(|e| {
+                        !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    })
+                    .map(|e| (e.id, e.credentials.priority, m.cap_of(&e.credentials)))
+                    .collect()
+            };
+            let mut out = Vec::with_capacity(list.len());
+            for (id, _priority, cap) in list {
+                let runtime = m.runtime_for_credential(id, cap); // 锁 credential_locks
+                let (ee, ed) = m
+                    .metrics
+                    .lock() // 锁 metrics
+                    .get(&id)
+                    .map(|cm| (cm.ewma_error, cm.ewma_duration_ms))
+                    .unwrap_or((0.0, 0.0));
+                out.push((id, runtime.in_flight(), ee, ed));
+            }
+            out
+        };
+
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for _ in 0..N_THREADS {
+            let m = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERS_PER_THREAD {
+                    let ranked = legacy_rank(&m);
+                    assert_eq!(ranked.len(), N_ACCOUNTS);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        let total_calls = (N_THREADS * ITERS_PER_THREAD) as f64;
+        let per_call_us = elapsed.as_secs_f64() * 1e6 / total_calls;
+        println!(
+            "bench LEGACY (2n+1 locks/ranking): {N_ACCOUNTS} accounts × {N_THREADS} threads × \
+             {ITERS_PER_THREAD} iters = {total_calls:.0} rankings in {elapsed:?} → \
+             {per_call_us:.2} µs/ranking",
+        );
     }
 
     /// 高并发回归守卫:断言"实测同时在途从不超过 cap",包含运行中动态扩缩竞态。

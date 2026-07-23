@@ -185,6 +185,12 @@ impl MultiTokenManager {
                     anyhow::bail!(msg);
                 }
             }
+            let cap = self.cap_of(&validated_cred);
+            // entry 与 credential_locks 共享同一个 runtime Arc（见 CredentialEntry.runtime 文档）。
+            let runtime = Arc::new(CredentialRuntime::new(cap));
+            self.credential_locks
+                .lock()
+                .insert(new_id, Arc::clone(&runtime));
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -197,14 +203,8 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 auto_disabled_at: None,
+                runtime,
             });
-        }
-        {
-            let cap = self
-                .clone_credentials(new_id)
-                .map(|c| self.cap_of(&c))
-                .unwrap_or_else(|| self.config.account_max_concurrency.max(1));
-            self.runtime_for_credential(new_id, cap).set_capacity(cap);
         }
 
         // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
