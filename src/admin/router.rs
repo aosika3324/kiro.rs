@@ -222,6 +222,18 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(crate::i7relay::handlers::i7relay_extracts),
         )
         .route(
+            "/i7relay/stock",
+            get(crate::i7relay::handlers::i7relay_stock),
+        )
+        .route(
+            "/i7relay/system-status",
+            get(crate::i7relay::handlers::i7relay_system_status),
+        )
+        .route(
+            "/i7relay/test-webhook",
+            post(crate::i7relay::handlers::i7relay_test_webhook),
+        )
+        .route(
             "/i7relay/register-webhook",
             axum::routing::post(crate::i7relay::handlers::i7relay_register_webhook),
         )

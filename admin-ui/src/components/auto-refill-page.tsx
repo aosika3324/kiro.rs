@@ -13,10 +13,14 @@ import {
   getI7relayQuota,
   getI7relayExtracts,
   registerWebhook,
+  getI7relayStock,
+  getI7relaySystemStatus,
+  testI7relayWebhook,
   type I7relayConfig,
   type QuotaInfo,
   type SetI7relayConfigRequest,
   type KeyExtractRecord,
+  type I7relaySystemStatus,
 } from '@/api/i7relay'
 
 /** 我方接收回调的固定路径(供应商 POST 到此)。 */
@@ -33,6 +37,8 @@ export function AutoRefillPage() {
   const [webhookSecret, setWebhookSecret] = useState('')
   const [quota, setQuota] = useState<QuotaInfo | null>(null)
   const [extracts, setExtracts] = useState<KeyExtractRecord[]>([])
+  const [stockMax, setStockMax] = useState<number | null>(null)
+  const [sysStatus, setSysStatus] = useState<I7relaySystemStatus | null>(null)
   const [busy, setBusy] = useState(false)
 
   const applyCfg = (c: I7relayConfig) => {
@@ -150,9 +156,28 @@ export function AutoRefillPage() {
   const checkQuota = async () => {
     setBusy(true)
     try {
-      setQuota(await getI7relayQuota())
+      // 并发拉配额 + 本轮可提取 + 供应商系统状态。
+      const [q, stock, st] = await Promise.allSettled([
+        getI7relayQuota(),
+        getI7relayStock(),
+        getI7relaySystemStatus(),
+      ])
+      if (q.status === 'fulfilled') setQuota(q.value)
+      if (stock.status === 'fulfilled') setStockMax(stock.value)
+      if (st.status === 'fulfilled') setSysStatus(st.value)
+      if (q.status === 'rejected') toast.error('查配额失败：' + extractErrorMessage(q.reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doTestWebhook = async () => {
+    setBusy(true)
+    try {
+      await testI7relayWebhook()
+      toast.success('已请求供应商推送测试消息（片刻后应收到 webhook 回调）')
     } catch (e) {
-      toast.error('查配额失败：' + extractErrorMessage(e))
+      toast.error('测试 webhook 失败：' + extractErrorMessage(e))
     } finally {
       setBusy(false)
     }
@@ -298,9 +323,12 @@ export function AutoRefillPage() {
                 <Copy className="h-3.5 w-3.5" />
               </Button>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Button variant="outline" size="sm" onClick={doRegisterWebhook} disabled={busy}>
                 注册到供应商
+              </Button>
+              <Button variant="outline" size="sm" onClick={doTestWebhook} disabled={busy}>
+                测试 webhook
               </Button>
               <span className="text-xs text-amber-600">注册会覆盖供应商侧原有 webhook</span>
             </div>
@@ -344,10 +372,48 @@ export function AutoRefillPage() {
                 </div>
               </div>
             </div>
+            {stockMax !== null && (
+              <p className="mt-2 text-center text-xs text-muted-foreground">
+                本轮最大可提取：<span className="font-semibold text-foreground">{stockMax}</span> 个
+                {stockMax === 0 && '（供应商暂无可分配给本账号的库存）'}
+              </p>
+            )}
             <Button variant="outline" className="mt-3 w-full" onClick={doRestock} disabled={busy}>
               <Download className="mr-1.5 h-4 w-4" /> 立即拉取 {count} 个
             </Button>
           </div>
+
+          {/* 供应商系统状态 */}
+          {sysStatus && (
+            <div className="rounded-lg border p-4">
+              <div className="mb-2 text-sm font-semibold">
+                供应商系统状态
+                {sysStatus.generating && (
+                  <span className="ml-2 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
+                    生成中
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-4 gap-2 text-center text-xs">
+                <div>
+                  <div className="text-muted-foreground">活跃</div>
+                  <div className="font-semibold text-emerald-600">{sysStatus.keys_active ?? '—'}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">失效</div>
+                  <div className="font-semibold">{sysStatus.keys_dead ?? '—'}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">库存</div>
+                  <div className="font-semibold">{sysStatus.keys_stock ?? '—'}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">总计</div>
+                  <div className="font-semibold">{sysStatus.keys_total ?? '—'}</div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* 提取记录 */}
           <div className="space-y-2 rounded-lg border p-4">

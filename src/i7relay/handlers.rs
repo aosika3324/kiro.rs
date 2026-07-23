@@ -189,6 +189,51 @@ pub async fn i7relay_status(State(state): State<AdminState>) -> impl IntoRespons
     .into_response()
 }
 
+/// GET /api/admin/i7relay/stock (鉴权组)。本轮最大可提取数量 {max}。
+pub async fn i7relay_stock(State(_state): State<AdminState>) -> impl IntoResponse {
+    let Some(rt) = super::runtime() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "i7relay 未就绪").into_response();
+    };
+    let client = match super::I7relayClient::new(&rt.config, rt.tls_backend) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("建 client 失败: {e}")).into_response(),
+    };
+    match client.stock_max().await {
+        Ok(max) => Json(serde_json::json!({ "max": max })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("查库存失败: {e}")).into_response(),
+    }
+}
+
+/// GET /api/admin/i7relay/system-status (鉴权组)。供应商系统状态(原样透传 JSON)。
+pub async fn i7relay_system_status(State(_state): State<AdminState>) -> impl IntoResponse {
+    let Some(rt) = super::runtime() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "i7relay 未就绪").into_response();
+    };
+    let client = match super::I7relayClient::new(&rt.config, rt.tls_backend) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("建 client 失败: {e}")).into_response(),
+    };
+    match client.system_status().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("查系统状态失败: {e}")).into_response(),
+    }
+}
+
+/// POST /api/admin/i7relay/test-webhook (鉴权组)。让供应商向我方 webhook 推测试消息。
+pub async fn i7relay_test_webhook(State(_state): State<AdminState>) -> impl IntoResponse {
+    let Some(rt) = super::runtime() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "i7relay 未就绪").into_response();
+    };
+    let client = match super::I7relayClient::new(&rt.config, rt.tls_backend) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("建 client 失败: {e}")).into_response(),
+    };
+    match client.test_webhook().await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("测试 webhook 失败: {e}")).into_response(),
+    }
+}
+
 /// GET /api/admin/i7relay/extracts?limit= (鉴权组)。只读:最近每 key 提取记录(新→旧)。
 pub async fn i7relay_extracts(
     State(_state): State<AdminState>,

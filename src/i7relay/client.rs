@@ -167,15 +167,20 @@ impl I7relayClient {
         Ok(resp.json::<KeysResp>().await?.keys)
     }
 
-    /// 购买 `count` 个 key(**扣配额**)。返回 (keys, remaining)。
-    /// remaining = -1 表示响应未带该字段(未知,不伪造 0)。
-    /// 非 2xx 会带上响应体里的 `error`/`message`(如"暂无可用 Key")。
-    pub async fn purchase(&self, count: u32) -> anyhow::Result<(Vec<String>, i64)> {
+    /// 购买 `count` 个 key(**扣余额**)。`order_id` 为 32 位十六进制幂等键:
+    /// 同一 (order_id, count) 重试返回首次结果且不重复扣费(超时重试防双扣)。
+    /// 返回 (keys, remaining, purchased)。remaining/purchased = -1 表示响应未带该字段。
+    /// 非 2xx 带响应体里的 `error`(如"暂无可用 Key");409=同单号不同 count。
+    pub async fn purchase(
+        &self,
+        count: u32,
+        order_id: &str,
+    ) -> anyhow::Result<(Vec<String>, i64, i64)> {
         let resp = self
             .http
             .post(self.url("/api/my/purchase"))
             .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({ "count": count }))
+            .json(&serde_json::json!({ "count": count, "client_order_id": order_id }))
             .send()
             .await?;
         let status = resp.status();
@@ -190,12 +195,75 @@ impl I7relayClient {
                         .map(String::from)
                 })
                 .unwrap_or_else(|| format!("HTTP {status}"));
+            // 409 特别标注(同单号不同数量),便于上层不当作可重试的普通失败。
+            if status.as_u16() == 409 {
+                anyhow::bail!("订单号冲突(同单号不同数量): {msg}");
+            }
             anyhow::bail!("{msg}");
         }
         let p: PurchaseResp = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("purchase 响应解析失败: {e}; body={}", trunc(&body)))?;
         let keys = p.keys.into_iter().map(KeyItem::into_key).collect();
-        Ok((keys, p.remaining.unwrap_or(-1)))
+        Ok((
+            keys,
+            p.remaining.unwrap_or(-1),
+            p.purchased.map(|n| n as i64).unwrap_or(-1),
+        ))
+    }
+
+    /// 本轮最大可提取数量(综合余额/母号库存/预留/每母号上限)。
+    pub async fn stock_max(&self) -> anyhow::Result<i64> {
+        let resp = self
+            .http
+            .get(self.url("/api/my/stock"))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("i7relay stock 失败: HTTP {status}");
+        }
+        #[derive(Deserialize)]
+        struct StockResp {
+            #[serde(default)]
+            max: i64,
+        }
+        Ok(resp.json::<StockResp>().await?.max)
+    }
+
+    /// 供应商系统状态(GET /api/status):活/死/库存/生成中等。原样返回 JSON。
+    pub async fn system_status(&self) -> anyhow::Result<serde_json::Value> {
+        let resp = self
+            .http
+            .get(self.url("/api/status"))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("i7relay status 失败: HTTP {status}");
+        }
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    /// 让供应商向我方已注册的 webhook 推一条测试消息(POST /api/my/webhook/test)。
+    pub async fn test_webhook(&self) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/api/my/webhook/test"))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            anyhow::bail!("{msg}");
+        }
+        Ok(())
     }
 
     /// 设置 webhook URL。
@@ -345,9 +413,10 @@ mod tests {
     #[ignore = "需 I7RELAY_TEST_KEY,会扣配额/或返回无货错误"]
     async fn i7relay_live_purchase() {
         let c = live_client().expect("需设 I7RELAY_TEST_KEY");
-        match c.purchase(1).await {
-            Ok((keys, remaining)) => {
-                println!("purchase ok: {} keys, remaining={}", keys.len(), remaining);
+        let oid = uuid::Uuid::new_v4().simple().to_string();
+        match c.purchase(1, &oid).await {
+            Ok((keys, remaining, purchased)) => {
+                println!("purchase ok: {} keys, remaining={} purchased={}", keys.len(), remaining, purchased);
                 for k in &keys {
                     assert!(k.starts_with("ksk_"));
                 }
@@ -358,6 +427,19 @@ mod tests {
                 assert!(!e.to_string().is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "需 I7RELAY_TEST_KEY,打真实网络"]
+    async fn i7relay_live_stock_and_status() {
+        let c = live_client().expect("需设 I7RELAY_TEST_KEY");
+        let max = c.stock_max().await.expect("stock 应成功");
+        println!("stock max={max}");
+        assert!(max >= 0);
+        let st = c.system_status().await.expect("status 应成功");
+        println!("status keys_active={:?} keys_stock={:?} generating={:?}",
+            st.get("keys_active"), st.get("keys_stock"), st.get("generating"));
+        assert!(st.get("keys_active").is_some(), "status 应含 keys_active");
     }
 
     #[tokio::test]

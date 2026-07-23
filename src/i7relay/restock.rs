@@ -128,32 +128,45 @@ fn now_rfc3339() -> String {
 const RETRY_INTERVAL_SECS: u64 = 30;
 const RETRY_MAX_ATTEMPTS: u32 = 3;
 
+/// 生成 32 位十六进制幂等订单号(uuid v4 无连字符)。
+fn new_order_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 /// purchase 重试:`retry=true`(自动触发)时,失败**或拉到 0 个**都等 30s 再试,最多 3 次;
 /// `retry=false`(手动"立即拉取")只试一次,即时返回结果。
+///
+/// **全程复用同一 `order_id`**:若首次已成功但响应超时丢失,重试凭幂等键返回首次结果、
+/// 不重复扣费(防双扣)。返回 (keys, remaining)。
 async fn purchase_with_retry(
     client: &I7relayClient,
     count: u32,
     retry: bool,
 ) -> anyhow::Result<(Vec<String>, i64)> {
     let max = if retry { RETRY_MAX_ATTEMPTS } else { 1 };
+    let order_id = new_order_id();
     let mut last_err = None;
     for attempt in 0..max {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(RETRY_INTERVAL_SECS)).await;
-            tracing::info!("i7relay purchase 重试 #{attempt}(间隔 {RETRY_INTERVAL_SECS}s)");
+            tracing::info!("i7relay purchase 重试 #{attempt}(间隔 {RETRY_INTERVAL_SECS}s,同单号)");
         }
-        match client.purchase(count).await {
-            // 拿到 key:成功返回。
-            Ok(v) if !v.0.is_empty() => return Ok(v),
+        match client.purchase(count, &order_id).await {
+            // 拿到 key:成功返回 (keys, remaining)。
+            Ok((keys, remaining, _purchased)) if !keys.is_empty() => return Ok((keys, remaining)),
             // 拉到 0 个:自动模式视为可重试,手动模式直接返回空。
-            Ok(empty) => {
+            Ok((keys, remaining, _)) => {
                 if !retry {
-                    return Ok(empty);
+                    return Ok((keys, remaining));
                 }
                 tracing::info!("i7relay purchase 第 {} 次拉到 0 个,待重试", attempt + 1);
                 last_err = Some(anyhow::anyhow!("拉取到 0 个 key"));
             }
             Err(e) => {
+                // 订单号冲突(409)不可通过重试解决,立即中止。
+                if e.to_string().contains("订单号冲突") {
+                    return Err(e);
+                }
                 tracing::warn!("i7relay purchase 第 {} 次失败: {e}", attempt + 1);
                 last_err = Some(e);
             }

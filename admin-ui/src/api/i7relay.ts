@@ -134,3 +134,33 @@ export async function getI7relayExtracts(limit = 100): Promise<KeyExtractRecord[
   return data.extracts ?? []
 }
 
+/** 本轮最大可提取数量。 */
+export async function getI7relayStock(): Promise<number> {
+  const { data } = await api.get<{ max: number }>('/i7relay/stock')
+  return data.max ?? 0
+}
+
+/** 供应商系统状态(原样透传)。 */
+export interface I7relaySystemStatus {
+  keys_active?: number
+  keys_dead?: number
+  keys_stock?: number
+  keys_total?: number
+  generating?: boolean
+  auto_check?: boolean
+  auto_generate?: boolean
+  uptime_seconds?: number
+  [k: string]: unknown
+}
+
+export async function getI7relaySystemStatus(): Promise<I7relaySystemStatus> {
+  const { data } = await api.get<I7relaySystemStatus>('/i7relay/system-status')
+  return data
+}
+
+/** 让供应商向我方 webhook 推一条测试消息。 */
+export async function testI7relayWebhook(): Promise<{ ok: boolean }> {
+  const { data } = await api.post('/i7relay/test-webhook')
+  return data
+}
+
