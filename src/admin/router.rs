@@ -200,6 +200,27 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
+        .route(
+            "/i7relay/status",
+            get(crate::i7relay::handlers::i7relay_status),
+        )
+        .route(
+            "/config/i7relay",
+            get(crate::i7relay::handlers::get_i7relay_config)
+                .put(crate::i7relay::handlers::set_i7relay_config),
+        )
+        .route(
+            "/i7relay/restock-now",
+            axum::routing::post(crate::i7relay::handlers::i7relay_restock_now),
+        )
+        .route(
+            "/i7relay/quota",
+            get(crate::i7relay::handlers::i7relay_quota),
+        )
+        .route(
+            "/i7relay/register-webhook",
+            axum::routing::post(crate::i7relay::handlers::i7relay_register_webhook),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -207,7 +228,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
 
     // 免鉴权路由：远程部署模式下 OAuth 公网回调（浏览器顶层导航到达，不带 admin API Key）。
     // 由 OAuth state 定位会话，CSRF 保护与本地回调服务器同等。
-    let public = Router::new().route("/auth/callback/{*tail}", get(social_oauth_callback));
+    let public = Router::new()
+        .route("/auth/callback/{*tail}", get(social_oauth_callback))
+        .route(
+            "/webhook/account-refill",
+            axum::routing::post(crate::i7relay::handlers::i7relay_webhook),
+        );
 
     Router::new()
         .merge(authenticated)

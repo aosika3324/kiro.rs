@@ -24,7 +24,7 @@ mod handlers;
 mod middleware;
 pub mod proxy_pool;
 mod router;
-mod service;
+pub(crate) mod service;
 pub mod trace_db;
 pub mod types;
 pub mod usage_stats;
