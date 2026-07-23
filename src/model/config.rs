@@ -180,10 +180,10 @@ pub struct Config {
     #[serde(default = "default_auto_disable_recovery_secs")]
     pub auto_disable_recovery_secs: u64,
 
-    /// 单账号最大并发请求数（默认 2）。
+    /// 单账号最大并发请求数（默认 1000）。
     ///
     /// 用于避免同一账号被无限并发打爆；不是串行，多个账号的整体并发约为
-    /// `账号数 * account_max_concurrency`。
+    /// `账号数 * account_max_concurrency`。默认 1000 实质放开单账号并发上限。
     #[serde(default = "default_account_max_concurrency")]
     pub account_max_concurrency: usize,
 
@@ -592,7 +592,7 @@ fn default_auto_disable_recovery_secs() -> u64 {
 }
 
 fn default_account_max_concurrency() -> usize {
-    2
+    1000
 }
 
 fn default_account_acquire_timeout_secs() -> u64 {

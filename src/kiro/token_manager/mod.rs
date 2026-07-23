@@ -5659,6 +5659,7 @@ mod tests {
         // （唯一账号满槽时第三个请求排队等待，而非默认的非阻塞快速失败）。
         let mut config = Config::default();
         config.account_acquire_blocking = true;
+        config.account_max_concurrency = 2; // 显式设 2，使前两次占满槽（不依赖全局默认值）。
         let manager = Arc::new(
             MultiTokenManager::new(config, vec![grouped_cred("a", &[])], None, None, false)
                 .unwrap(),
