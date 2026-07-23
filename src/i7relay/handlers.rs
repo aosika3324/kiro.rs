@@ -3,30 +3,41 @@
 use crate::admin::AdminState;
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use std::collections::HashMap;
 
-/// POST /api/admin/i7relay/webhook (挂免鉴权 public 组,靠 X-Webhook-Secret 校验)。
+/// POST /api/admin/webhook/account-refill (免鉴权 public 组)。
 ///
+/// 供应商回调是**裸 POST 无鉴权头**(见 API 文档),故校验 URL 里的 `?token=<secret>`
+/// (兼容 `X-Webhook-Secret` 头)。若未配置 webhookSecret 则放行 + WARN(仅耗自身配额)。
 /// 事件:new_keys_available → 补货;all_keys_dead → 死号对账禁用 + 补货。
 /// 立即 200,重活异步 spawn(不阻塞 i7relay 回调)。
 pub async fn i7relay_webhook(
     State(state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let Some(rt) = super::runtime() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "i7relay 未启用").into_response();
     };
-    // 共享密钥校验(常数时间比较避免时序侧信道)。
-    let provided = headers
-        .get("x-webhook-secret")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !secret_eq(provided, &rt.config.webhook_secret) {
-        return (StatusCode::UNAUTHORIZED, "invalid webhook secret").into_response();
+    let secret = &rt.config.webhook_secret;
+    if secret.is_empty() {
+        // 未设密钥:放行但告警(低风险:仅耗自身配额 + 有冷却门)。
+        tracing::warn!("i7relay webhook 未配置 secret,放行(建议设置 webhookSecret 防误触发)");
+    } else {
+        // token 优先取查询参数,回退 X-Webhook-Secret 头;常数时间比较。
+        let provided = q
+            .get("token")
+            .map(|s| s.as_str())
+            .or_else(|| headers.get("x-webhook-secret").and_then(|v| v.to_str().ok()))
+            .unwrap_or("");
+        if !secret_eq(provided, secret) {
+            return (StatusCode::UNAUTHORIZED, "invalid webhook token").into_response();
+        }
     }
 
     let event = serde_json::from_slice::<serde_json::Value>(&body)
@@ -153,6 +164,15 @@ pub async fn i7relay_status(State(state): State<AdminState>) -> impl IntoRespons
         }
     }
     let recent = rt.audit.recent(20);
+    // 最近一次成功(有导入)时间 + 最近一次错误(供健康展示)。
+    let last_success_at = recent
+        .iter()
+        .find(|r| r.imported > 0)
+        .map(|r| r.at.clone());
+    let last_error = recent
+        .iter()
+        .find(|r| r.error.is_some())
+        .and_then(|r| r.error.clone());
     Json(serde_json::json!({
         "enabled": rt.config.enabled,
         "baseUrl": rt.config.base_url,
@@ -162,9 +182,27 @@ pub async fn i7relay_status(State(state): State<AdminState>) -> impl IntoRespons
         "deadKeyAction": rt.config.dead_key_action,
         "poolI7relayTotal": total,
         "poolI7relayActive": active,
+        "lastSuccessAt": last_success_at,
+        "lastError": last_error,
         "recentRestocks": recent,
     }))
     .into_response()
+}
+
+/// GET /api/admin/i7relay/extracts?limit= (鉴权组)。只读:最近每 key 提取记录(新→旧)。
+pub async fn i7relay_extracts(
+    State(_state): State<AdminState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(rt) = super::runtime() else {
+        return Json(serde_json::json!({ "extracts": [] })).into_response();
+    };
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    Json(serde_json::json!({ "extracts": rt.audit.recent_extracts(limit) })).into_response()
 }
 
 /// 常数时间字符串比较(空密钥视为未配置 → 拒绝)。

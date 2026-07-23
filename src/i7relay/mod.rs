@@ -15,7 +15,7 @@ mod restock;
 pub mod handlers;
 mod poll;
 
-pub use audit::I7relayAudit;
+pub use audit::{I7relayAudit, KeyExtractRecord};
 pub use client::I7relayClient;
 pub use poll::spawn_poll_loop;
 pub use restock::{restock, sync_dead_keys, RestockTrigger};

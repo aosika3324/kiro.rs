@@ -218,6 +218,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(crate::i7relay::handlers::i7relay_quota),
         )
         .route(
+            "/i7relay/extracts",
+            get(crate::i7relay::handlers::i7relay_extracts),
+        )
+        .route(
             "/i7relay/register-webhook",
             axum::routing::post(crate::i7relay::handlers::i7relay_register_webhook),
         )

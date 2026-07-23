@@ -20,16 +20,25 @@ fn trunc(s: &str) -> String {
     s.chars().take(120).collect()
 }
 
-/// `GET /api/my/profile` 真实响应:`{"name","quota","remaining","webhook_url"}`。
+/// `GET /api/my/profile` 响应。实测字段是 `quota`;官方文档写 `max_quota`/`used_quota`。
+/// 两套都收(兼容供应商任一实现),归一化到 Profile。`webhook_url` 用于判断是否已注册。
 #[derive(Debug, Clone, Deserialize)]
 struct ProfileRaw {
     #[serde(default)]
     name: String,
-    /// 总配额。
+    /// 实测口径:总配额。
     #[serde(default)]
-    quota: i64,
+    quota: Option<i64>,
+    /// 文档口径:总配额。
+    #[serde(default)]
+    max_quota: Option<i64>,
+    /// 文档口径:已用。
+    #[serde(default)]
+    used_quota: Option<i64>,
     #[serde(default)]
     remaining: i64,
+    #[serde(default)]
+    webhook_url: String,
 }
 
 /// 归一化后的配额信息(供前端;`max_quota`=总配额,`used_quota`=总-剩)。
@@ -39,15 +48,24 @@ pub struct Profile {
     pub remaining: i64,
     pub max_quota: i64,
     pub used_quota: i64,
+    /// 供应商侧当前注册的 webhook URL(空=未注册)。
+    pub webhook_url: String,
 }
 
 impl From<ProfileRaw> for Profile {
     fn from(r: ProfileRaw) -> Self {
+        // 总配额:优先实测 quota,回退文档 max_quota,再回退 used+remaining。
+        let max = r
+            .quota
+            .or(r.max_quota)
+            .unwrap_or_else(|| r.used_quota.unwrap_or(0) + r.remaining);
+        let used = r.used_quota.unwrap_or_else(|| (max - r.remaining).max(0));
         Profile {
             name: r.name,
             remaining: r.remaining,
-            max_quota: r.quota,
-            used_quota: (r.quota - r.remaining).max(0),
+            max_quota: max,
+            used_quota: used,
+            webhook_url: r.webhook_url,
         }
     }
 }
@@ -58,7 +76,8 @@ struct KeysResp {
     keys: Vec<RemoteKey>,
 }
 
-/// purchase 成功响应:`keys` 可能是字符串数组或对象数组;`remaining` 可缺省。
+/// purchase 成功响应:文档 `{"purchased":N,"remaining":M,"keys":[{"key":"ksk_..."}]}`。
+/// `keys` 兼容字符串数组或对象数组;`remaining`/`purchased` 可缺省。
 #[derive(Debug, Deserialize)]
 struct PurchaseResp {
     #[serde(default)]
@@ -66,6 +85,10 @@ struct PurchaseResp {
     /// 剩余配额;缺省时为 None(不伪造 0)。
     #[serde(default)]
     remaining: Option<i64>,
+    /// 本次实际发放数(文档字段;仅作日志/校验用,不强依赖)。
+    #[serde(default)]
+    #[allow(dead_code)]
+    purchased: Option<u32>,
 }
 
 /// key 条目:兼容裸字符串 `"ksk_..."` 或对象 `{"key":"ksk_..."}`。
@@ -217,6 +240,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_accepts_doc_schema() {
+        // 官方文档口径:max_quota/used_quota
+        let raw: ProfileRaw =
+            serde_json::from_str(r#"{"name":"alice","max_quota":100,"used_quota":5,"remaining":95,"webhook_url":"https://x/h"}"#)
+                .unwrap();
+        let p: Profile = raw.into();
+        assert_eq!(p.max_quota, 100);
+        assert_eq!(p.used_quota, 5);
+        assert_eq!(p.remaining, 95);
+        assert_eq!(p.webhook_url, "https://x/h");
+    }
+
+    #[test]
+    fn profile_extracts_webhook_url() {
+        let raw: ProfileRaw =
+            serde_json::from_str(r#"{"name":"test","quota":999999,"remaining":999999,"webhook_url":"https://example.com/hook"}"#)
+                .unwrap();
+        let p: Profile = raw.into();
+        assert_eq!(p.webhook_url, "https://example.com/hook");
+    }
+
+    #[test]
     fn keyitem_accepts_string_and_object() {
         let a: KeyItem = serde_json::from_str(r#""ksk_abc""#).unwrap();
         let b: KeyItem = serde_json::from_str(r#"{"key":"ksk_xyz"}"#).unwrap();
@@ -233,5 +278,95 @@ mod tests {
         // 带 remaining
         let p2: PurchaseResp = serde_json::from_str(r#"{"keys":[],"remaining":7}"#).unwrap();
         assert_eq!(p2.remaining, Some(7));
+    }
+
+    #[test]
+    fn purchase_resp_doc_shape() {
+        // 文档成功形态:{"purchased":5,"remaining":95,"keys":[{"key":"ksk_..."}]}
+        let p: PurchaseResp =
+            serde_json::from_str(r#"{"purchased":2,"remaining":95,"keys":[{"key":"ksk_a"},{"key":"ksk_b"}]}"#)
+                .unwrap();
+        assert_eq!(p.purchased, Some(2));
+        assert_eq!(p.remaining, Some(95));
+        let keys: Vec<String> = p.keys.into_iter().map(KeyItem::into_key).collect();
+        assert_eq!(keys, vec!["ksk_a", "ksk_b"]);
+    }
+
+    #[test]
+    fn keys_resp_ignores_sensitive_fields() {
+        // /api/my/keys 条目含 account/password/issuer_url,只取 key/status。
+        let r: KeysResp = serde_json::from_str(
+            r#"{"count":1,"active":1,"keys":[{"key":"ksk_x","account":"u1","password":"p!","issuer_url":"https://d/","status":"active"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.keys.len(), 1);
+        assert_eq!(r.keys[0].key, "ksk_x");
+        assert_eq!(r.keys[0].status, "active");
+    }
+
+    // ===== 集成测试:打真实 test.i7relay.com。默认 #[ignore],需 env I7RELAY_TEST_KEY。 =====
+    // 运行:I7RELAY_TEST_KEY=usr-... cargo test --features native-tls i7relay_live -- --ignored --nocapture
+    fn live_client() -> Option<I7relayClient> {
+        let key = std::env::var("I7RELAY_TEST_KEY").ok()?;
+        let cfg = I7relayConfig {
+            base_url: "https://test.i7relay.com".to_string(),
+            api_key: key,
+            ..Default::default()
+        };
+        I7relayClient::new(&cfg, TlsBackend::Rustls).ok()
+    }
+
+    #[tokio::test]
+    #[ignore = "需 I7RELAY_TEST_KEY,打真实网络"]
+    async fn i7relay_live_profile() {
+        let c = live_client().expect("需设 I7RELAY_TEST_KEY");
+        let p = c.profile().await.expect("profile 应成功");
+        println!("profile: name={} max={} used={} remaining={} webhook={}",
+            p.name, p.max_quota, p.used_quota, p.remaining, p.webhook_url);
+        assert!(p.max_quota >= 0);
+        assert!(p.remaining >= 0);
+        // used = max - remaining 恒等(归一化保证)。
+        assert_eq!(p.used_quota, (p.max_quota - p.remaining).max(0));
+    }
+
+    #[tokio::test]
+    #[ignore = "需 I7RELAY_TEST_KEY,打真实网络"]
+    async fn i7relay_live_list_keys() {
+        let c = live_client().expect("需设 I7RELAY_TEST_KEY");
+        let keys = c.list_keys(false).await.expect("list_keys 应成功");
+        println!("keys: {} 个", keys.len());
+        // 敏感字段应被忽略:每条只有 key/status(编译期即保证,这里验非空 key)。
+        for k in keys.iter().take(3) {
+            assert!(k.key.starts_with("ksk_"), "key 前缀应为 ksk_");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "需 I7RELAY_TEST_KEY,会扣配额/或返回无货错误"]
+    async fn i7relay_live_purchase() {
+        let c = live_client().expect("需设 I7RELAY_TEST_KEY");
+        match c.purchase(1).await {
+            Ok((keys, remaining)) => {
+                println!("purchase ok: {} keys, remaining={}", keys.len(), remaining);
+                for k in &keys {
+                    assert!(k.starts_with("ksk_"));
+                }
+            }
+            // 无货是合法路径:错误消息应可读(如"暂无可用 Key")。
+            Err(e) => {
+                println!("purchase 无货/失败(合法): {e}");
+                assert!(!e.to_string().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "需 I7RELAY_TEST_KEY,会改测试账号 webhook"]
+    async fn i7relay_live_set_webhook_roundtrip() {
+        let c = live_client().expect("需设 I7RELAY_TEST_KEY");
+        let url = "https://example.com/kiro-rs-test-hook";
+        c.set_webhook(url).await.expect("set_webhook 应成功");
+        let p = c.profile().await.expect("profile 应成功");
+        assert_eq!(p.webhook_url, url, "profile 应回读刚设的 webhook");
     }
 }

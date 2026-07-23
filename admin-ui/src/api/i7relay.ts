@@ -48,6 +48,8 @@ export interface QuotaInfo {
   remaining: number
   max_quota: number
   used_quota: number
+  /** 供应商当前注册的 webhook URL(空=未注册)。 */
+  webhook_url?: string
 }
 
 export interface RestockResult {
@@ -114,3 +116,21 @@ export async function getI7relayStatus(): Promise<I7relayStatus> {
   const { data } = await api.get<I7relayStatus>('/i7relay/status')
   return data
 }
+
+/** 单个 key 的提取记录。 */
+export interface KeyExtractRecord {
+  at: string
+  key_prefix: string
+  trigger: string
+  import_status: string
+  valid?: boolean | null
+  credential_id?: number | null
+}
+
+export async function getI7relayExtracts(limit = 100): Promise<KeyExtractRecord[]> {
+  const { data } = await api.get<{ extracts: KeyExtractRecord[] }>('/i7relay/extracts', {
+    params: { limit },
+  })
+  return data.extracts ?? []
+}
+

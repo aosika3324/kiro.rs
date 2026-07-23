@@ -217,23 +217,56 @@ pub async fn restock(
 
     let mut out = RestockOutcome { remaining_quota: remaining, ..Default::default() };
     let mut prefixes = Vec::new();
+    let trig = trigger.as_str().to_string();
     for ksk in &keys {
+        let prefix = ksk_prefix(ksk);
         if prefixes.len() < 8 {
-            prefixes.push(ksk_prefix(ksk));
+            prefixes.push(prefix.clone());
         }
         let req = match build_import_req(ksk) {
             Ok(r) => r,
             Err(_) => {
                 out.failed += 1;
+                audit.record_extract(crate::i7relay::KeyExtractRecord {
+                    at: now_rfc3339(),
+                    key_prefix: prefix,
+                    trigger: trig.clone(),
+                    import_status: "failed".to_string(),
+                    valid: None,
+                    credential_id: None,
+                });
                 continue;
             }
         };
         let res = service.import_one_credential(req, cfg.verify_on_import).await;
-        match res.status {
-            ImportStatus::Verified | ImportStatus::Imported => out.imported += 1,
-            ImportStatus::Duplicate => out.duplicate += 1,
-            ImportStatus::Failed => out.failed += 1,
-        }
+        // 映射导入状态 → 提取记录(脱敏:仅前缀)。
+        let (status_str, valid) = match res.status {
+            ImportStatus::Verified => {
+                out.imported += 1;
+                ("imported", Some(true))
+            }
+            ImportStatus::Imported => {
+                out.imported += 1;
+                // 未验活导入:valid 未知(除非配置了 verify_on_import 仍走到这里=未验)。
+                ("imported", None)
+            }
+            ImportStatus::Duplicate => {
+                out.duplicate += 1;
+                ("duplicate", None)
+            }
+            ImportStatus::Failed => {
+                out.failed += 1;
+                ("failed", Some(false))
+            }
+        };
+        audit.record_extract(crate::i7relay::KeyExtractRecord {
+            at: now_rfc3339(),
+            key_prefix: prefix,
+            trigger: trig.clone(),
+            import_status: status_str.to_string(),
+            valid,
+            credential_id: res.credential_id.map(|id| id as i64),
+        });
     }
 
     audit.record(RestockRecord {
