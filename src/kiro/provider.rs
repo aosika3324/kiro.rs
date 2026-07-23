@@ -8,7 +8,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -16,7 +16,7 @@ use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet}
 use crate::fingerprint_client::UpstreamResponse;
 #[cfg(feature = "tls-fingerprint")]
 use crate::fingerprint_client::{build_fingerprint_client, send_via_wreq};
-use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client, http_shard_count};
 use crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME;
 use crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
 use crate::kiro::endpoint::codewhisperer::CODEWHISPERER_ENDPOINT_NAME;
@@ -309,13 +309,40 @@ impl EndpointRouting {
     }
 }
 
+/// 一个账户（一个 effective proxy）的 HTTP Client **分片集**：N 个独立 `Client`，每个各自一条
+/// 到上游 host 的 HTTP/2 连接。`pick()` 按原子游标 round-robin 选一个，把同账户的并发请求摊到
+/// N 条独立连接上——复现"多进程各自一条连接"的并行度，根治单 H2 连接多路复用的首字节瓶颈。
+/// 见 [`crate::http_client::http_shard_count`]。
+struct ShardSet {
+    clients: Vec<Client>,
+    cursor: AtomicUsize,
+}
+
+impl ShardSet {
+    fn new(clients: Vec<Client>) -> Self {
+        debug_assert!(!clients.is_empty(), "ShardSet 至少要有一个 client");
+        Self {
+            clients,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    /// round-robin 取一个 client（clone 廉价，内部是 Arc）。
+    fn pick(&self) -> Client {
+        let n = self.clients.len().max(1);
+        let i = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        self.clients[i].clone()
+    }
+}
+
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
+/// - value 为该账户的 [`ShardSet`]（N 个独立 Client，round-robin 摊连接）
 /// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
 /// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
 struct ClientCache {
-    map: HashMap<Option<ProxyConfig>, Client>,
+    map: HashMap<Option<ProxyConfig>, ShardSet>,
     /// 插入顺序（仅记录可淘汰的非受保护 key）
     order: std::collections::VecDeque<Option<ProxyConfig>>,
     /// 受保护、不参与淘汰的 key（全局代理）
@@ -324,7 +351,7 @@ struct ClientCache {
 }
 
 impl ClientCache {
-    fn new(protected: Option<ProxyConfig>, initial: Client, cap: usize) -> Self {
+    fn new(protected: Option<ProxyConfig>, initial: ShardSet, cap: usize) -> Self {
         let mut map = HashMap::new();
         map.insert(protected.clone(), initial);
         Self {
@@ -335,14 +362,15 @@ impl ClientCache {
         }
     }
 
+    /// round-robin 取该 key 分片集里的一个 client。
     fn get(&self, key: &Option<ProxyConfig>) -> Option<Client> {
-        self.map.get(key).cloned()
+        self.map.get(key).map(|s| s.pick())
     }
 
-    /// 插入新条目，必要时淘汰最旧的非受保护条目
-    fn insert(&mut self, key: Option<ProxyConfig>, client: Client) {
+    /// 插入新分片集，必要时淘汰最旧的非受保护条目
+    fn insert(&mut self, key: Option<ProxyConfig>, shard: ShardSet) {
         if key == self.protected || self.map.contains_key(&key) {
-            self.map.insert(key, client);
+            self.map.insert(key, shard);
             return;
         }
         while self.order.len() >= self.cap {
@@ -353,7 +381,44 @@ impl ClientCache {
             }
         }
         self.order.push_back(key.clone());
-        self.map.insert(key, client);
+        self.map.insert(key, shard);
+    }
+}
+
+/// 构建 N 个分片 client（`build` 为单个 client 的构造闭包），组装成 [`ShardSet`]。
+fn build_shard_set<F>(mut build: F) -> anyhow::Result<ShardSet>
+where
+    F: FnMut() -> anyhow::Result<Client>,
+{
+    let n = http_shard_count();
+    let mut clients = Vec::with_capacity(n);
+    for _ in 0..n {
+        clients.push(build()?);
+    }
+    Ok(ShardSet::new(clients))
+}
+
+/// [`ShardSet`] 的 wreq（TLS 指纹）版：N 个独立 wreq::Client，round-robin 摊连接。语义同 ShardSet。
+#[cfg(feature = "tls-fingerprint")]
+struct WreqShardSet {
+    clients: Vec<wreq::Client>,
+    cursor: AtomicUsize,
+}
+
+#[cfg(feature = "tls-fingerprint")]
+impl WreqShardSet {
+    fn new(clients: Vec<wreq::Client>) -> Self {
+        debug_assert!(!clients.is_empty(), "WreqShardSet 至少要有一个 client");
+        Self {
+            clients,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    fn pick(&self) -> wreq::Client {
+        let n = self.clients.len().max(1);
+        let i = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        self.clients[i].clone()
     }
 }
 
@@ -395,7 +460,7 @@ pub struct KiroProvider {
     /// key = (effective proxy, 是否流式禁复用, profile 名)；三者任一不同即用独立 client。
     /// 惰性构建（默认关闭时不产生任何 wreq client / BoringSSL 开销），带容量上限简单淘汰。
     #[cfg(feature = "tls-fingerprint")]
-    wreq_client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool, String), wreq::Client>>,
+    wreq_client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool, String), WreqShardSet>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -466,15 +531,17 @@ impl KiroProvider {
             );
         }
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
-        let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
-        // 流式专用 Client（禁用空闲连接复用）同样预热全局代理条目。
-        let initial_streaming_client = build_streaming_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建流式 HTTP 客户端失败");
+        // 预热：构建全局代理对应的分片集（N 条独立连接，作为受保护的常驻条目）。
+        let initial_shard =
+            build_shard_set(|| build_client(proxy.as_ref(), 720, tls_backend))
+                .expect("创建 HTTP 客户端失败");
+        let client_cache = ClientCache::new(proxy.clone(), initial_shard, CLIENT_CACHE_CAP);
+        // 流式专用分片集同样预热全局代理条目。
+        let initial_streaming_shard =
+            build_shard_set(|| build_streaming_client(proxy.as_ref(), 720, tls_backend))
+                .expect("创建流式 HTTP 客户端失败");
         let streaming_client_cache =
-            ClientCache::new(proxy.clone(), initial_streaming_client, CLIENT_CACHE_CAP);
+            ClientCache::new(proxy.clone(), initial_streaming_shard, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
@@ -499,8 +566,9 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let shard = build_shard_set(|| build_client(effective.as_ref(), 720, self.tls_backend))?;
+        let client = shard.pick();
+        cache.insert(effective, shard);
         Ok(client)
     }
 
@@ -514,8 +582,10 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let shard =
+            build_shard_set(|| build_streaming_client(effective.as_ref(), 720, self.tls_backend))?;
+        let client = shard.pick();
+        cache.insert(effective, shard);
         Ok(client)
     }
 
@@ -536,15 +606,22 @@ impl KiroProvider {
         let effective = credentials.effective_proxy(global_proxy.as_ref());
         let key = (effective.clone(), streaming, profile.to_string());
         let mut cache = self.wreq_client_cache.lock();
-        if let Some(client) = cache.get(&key) {
-            return Ok(client.clone());
+        if let Some(shard) = cache.get(&key) {
+            return Ok(shard.pick());
         }
         let pool = if streaming { 0 } else { 8 };
-        let client = build_fingerprint_client(effective.as_ref(), 720, profile, pool)?;
+        // N 个独立 wreq client（各自一条 H2 连接），round-robin 摊同账户并发。
+        let n = http_shard_count();
+        let mut clients = Vec::with_capacity(n);
+        for _ in 0..n {
+            clients.push(build_fingerprint_client(effective.as_ref(), 720, profile, pool)?);
+        }
+        let shard = WreqShardSet::new(clients);
+        let client = shard.pick();
         if cache.len() >= WREQ_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, client.clone());
+        cache.insert(key, shard);
         Ok(client)
     }
 
@@ -1856,6 +1933,24 @@ mod rate_limit_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ShardSet::pick 严格 round-robin 轮询 N 个 client（游标取模），保证并发被均匀摊到各分片。
+    #[test]
+    fn shard_set_round_robins() {
+        let mk = || build_client(None, 30, TlsBackend::Rustls).unwrap();
+        let shard = ShardSet::new(vec![mk(), mk(), mk()]);
+        // 连续 pick 的游标序列应为 0,1,2,0,1,2...（用 cursor 前后差验证严格递增取模）。
+        let start = shard.cursor.load(Ordering::Relaxed);
+        for _ in 0..7 {
+            let _ = shard.pick();
+        }
+        let end = shard.cursor.load(Ordering::Relaxed);
+        assert_eq!(end - start, 7, "每次 pick 游标 +1（round-robin 依据）");
+        // 单分片集也能正常工作（关闭分片 = 退化为单 client）。
+        let one = ShardSet::new(vec![mk()]);
+        let _ = one.pick();
+        let _ = one.pick();
+    }
 
     #[test]
     fn test_body_shape_tool_id_hash_correlates_across_turns() {

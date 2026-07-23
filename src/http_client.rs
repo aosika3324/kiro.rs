@@ -16,6 +16,14 @@ fn env_secs(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// 读取一个以字节为单位的环境变量（u32），缺失或非法时回退到 `default`。用于 H2 窗口调优。
+fn env_bytes(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
 /// 分层超时配置（秒），由 `KIRO_RS_HTTP_*` 环境变量覆盖。作为 reqwest 与 TLS 指纹
 /// (wreq) 两条客户端构建路径的**单一数据源**，保证两者超时/保活/连接池语义一致。
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +42,22 @@ pub fn resolve_http_timeouts() -> HttpTimeouts {
         keepalive: env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60),
         pool_idle: env_secs("KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS", 15),
     }
+}
+
+/// 每账户（每 effective proxy）的 HTTP Client **分片数**。
+///
+/// 背景：单个 `reqwest::Client` 对同一上游 host 走 HTTP/2 时**只保持一条 TCP 连接**，把该账户
+/// 的所有并发请求 multiplex 到这一条连接上——单 hyper 连接任务串行处理所有流的帧、连接级流控
+/// 窗口被众流瓜分、单条 TCP 拥塞域队头阻塞，高并发下直接拖垮首字节延迟（TTFT）。把同账户的并发
+/// **摊到 N 个独立 Client（= N 条独立连接）** 即可复现"多进程各自一条连接"的并行度、根治该瓶颈。
+///
+/// 默认 4，可经 `KIRO_RS_HTTP_SHARDS` 覆盖，clamp 到 `1..=16`（1 = 关闭分片、回退旧行为）。
+pub fn http_shard_count() -> usize {
+    std::env::var("KIRO_RS_HTTP_SHARDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16)
 }
 
 /// 代理配置
@@ -167,6 +191,19 @@ fn build_client_inner(
             .http2_adaptive_window(true);
     }
 
+    // H2 流控窗口调大（方法 C，与 client sharding 互补）：H2 连接级/流级初始窗口默认仅 64KB，
+    // 同一连接上多条并发流会迅速把连接级窗口打满 → 后续流的数据帧（含首字节）被 stall。调大到
+    // 数 MB 让众流并发接收不再互相饿死，缓解高并发下的首字节延迟。sharding 拆连接是根治（拆开
+    // 单 hyper 任务/单 TCP 拥塞域），窗口调大是每条连接内的兜底。可经 env 覆盖（0 = 保持默认）。
+    let conn_window = env_bytes("KIRO_RS_HTTP2_CONN_WINDOW", 16 * 1024 * 1024);
+    let stream_window = env_bytes("KIRO_RS_HTTP2_STREAM_WINDOW", 4 * 1024 * 1024);
+    if conn_window > 0 {
+        builder = builder.http2_initial_connection_window_size(Some(conn_window));
+    }
+    if stream_window > 0 {
+        builder = builder.http2_initial_stream_window_size(Some(stream_window));
+    }
+
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -204,6 +241,40 @@ fn build_client_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// http_shard_count 默认 4，env 覆盖并 clamp 到 [1,16]。串行设置 env 避免并发污染。
+    #[test]
+    fn shard_count_default_and_clamp() {
+        // 保存并清理，测完还原（进程内其它测试不依赖它，但保持整洁）。
+        let saved = std::env::var("KIRO_RS_HTTP_SHARDS").ok();
+        unsafe {
+            std::env::remove_var("KIRO_RS_HTTP_SHARDS");
+        }
+        assert_eq!(http_shard_count(), 4, "默认 4");
+        unsafe {
+            std::env::set_var("KIRO_RS_HTTP_SHARDS", "8");
+        }
+        assert_eq!(http_shard_count(), 8, "env 覆盖");
+        unsafe {
+            std::env::set_var("KIRO_RS_HTTP_SHARDS", "0");
+        }
+        assert_eq!(http_shard_count(), 1, "0 clamp 到下限 1(关闭分片)");
+        unsafe {
+            std::env::set_var("KIRO_RS_HTTP_SHARDS", "999");
+        }
+        assert_eq!(http_shard_count(), 16, "超大 clamp 到上限 16");
+        unsafe {
+            std::env::set_var("KIRO_RS_HTTP_SHARDS", "notanumber");
+        }
+        assert_eq!(http_shard_count(), 4, "非法值回退默认 4");
+        // 还原
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("KIRO_RS_HTTP_SHARDS", v),
+                None => std::env::remove_var("KIRO_RS_HTTP_SHARDS"),
+            }
+        }
+    }
 
     #[test]
     fn test_proxy_config_new() {
