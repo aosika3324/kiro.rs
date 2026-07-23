@@ -267,6 +267,13 @@ pub struct Config {
     #[serde(default = "default_cache_meter_ttl_secs")]
     pub cache_meter_ttl_secs: u64,
 
+    /// 目标缓存率 T 的**全局上限**（默认 [`default_cache_hit_rate_max`]=0.95）。生效目标率
+    /// （per-key `cacheHitRate` 覆盖优先，否则全局 `cacheReadRatio` 作默认 T）在入口按此夹紧，
+    /// 防恒 ~100% 命中（检测特征）。运行时可经 Admin API `/config/runtime-governance` 调整。
+    /// clamp 到 [0,1]。
+    #[serde(default = "default_cache_hit_rate_max")]
+    pub cache_hit_rate_max: f64,
+
     /// CCH（Anthropic 标准计费模式，per-key `anthropicBillingMode`）内容指纹缓存的**兜底默认
     /// TTL**（秒，默认 300 = 5min）。**独立**于 delta 支路的 `cache_meter_ttl_secs`（两套计量
     /// 模型互不影响，见 `crate::anthropic::cache_metering`）。
@@ -560,6 +567,10 @@ fn default_cache_meter_ttl_secs() -> u64 {
     300
 }
 
+fn default_cache_hit_rate_max() -> f64 {
+    crate::anthropic::cache_metering::DEFAULT_CACHE_HIT_RATE_MAX
+}
+
 fn default_cch_cache_ttl_secs() -> u64 {
     300
 }
@@ -625,6 +636,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_read_ratio: default_cache_read_ratio(),
             cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
+            cache_hit_rate_max: default_cache_hit_rate_max(),
             cch_cache_ttl_secs: default_cch_cache_ttl_secs(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),

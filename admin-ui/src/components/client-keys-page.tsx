@@ -74,8 +74,12 @@ export function ClientKeysPage() {
   const [editRespCache, setEditRespCache] = useState<'global' | 'on' | 'off'>('global')
   // 响应缓存 TTL 覆盖（秒）；空串=跟随全局
   const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
-  // 缓存命中率 R 覆盖（利润档）：空串=跟随全局，否则 0~1
+  // 缓存命中率 R 覆盖（已废弃语义，保留兼容）：空串=跟随全局，否则 0~1
   const [editCacheRatio, setEditCacheRatio] = useState('')
+  // 目标缓存率 T 覆盖：空串=跟随全局默认，否则 0~1（面板 cache_read/总prompt 逼近此值）
+  const [editHitRate, setEditHitRate] = useState('')
+  // 每 Key 缓存热度 TTL 覆盖（秒）：空串=跟随全局，否则 ≥1
+  const [editTtlSecs, setEditTtlSecs] = useState('')
   // multiplier 护栏上限覆盖：空串=跟随默认 1.25，否则 0.1~1.25
   const [editMultiplierCap, setEditMultiplierCap] = useState('')
   // Anthropic 标准计费模式开关（默认关）+ creation 占比（空串=跟随默认 3%）
@@ -196,6 +200,8 @@ export function ClientKeysPage() {
     )
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
+    setEditHitRate(item.cacheHitRate != null ? String(item.cacheHitRate) : '')
+    setEditTtlSecs(item.cacheTtlSecs != null ? String(item.cacheTtlSecs) : '')
     setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
     setEditBillingMode(item.anthropicBillingMode ?? false)
     setEditCreationRatio(item.cacheCreationRatio != null ? String(item.cacheCreationRatio) : '')
@@ -216,11 +222,25 @@ export function ClientKeysPage() {
       toast.error('缓存 TTL 需在 1..=86400 秒，或留空跟随全局')
       return
     }
-    // 命中率覆盖：空串→null（复位跟随全局）；否则 0~1
+    // 命中率 R 覆盖（已废弃，保留兼容）：空串→null（复位跟随全局）；否则 0~1
     const ratioRaw = editCacheRatio.trim()
     const cacheReadRatio = ratioRaw === '' ? null : parseFloat(ratioRaw)
     if (ratioRaw !== '' && (isNaN(cacheReadRatio as number) || (cacheReadRatio as number) < 0 || (cacheReadRatio as number) > 1)) {
       toast.error('缓存命中率需在 0..=1，或留空跟随全局')
+      return
+    }
+    // 目标缓存率 T 覆盖：空串→null（复位跟随全局默认）；否则 0~1
+    const hitRaw = editHitRate.trim()
+    const cacheHitRate = hitRaw === '' ? null : parseFloat(hitRaw)
+    if (hitRaw !== '' && (isNaN(cacheHitRate as number) || (cacheHitRate as number) < 0 || (cacheHitRate as number) > 1)) {
+      toast.error('目标缓存率需在 0..=1，或留空跟随全局')
+      return
+    }
+    // 每 Key 缓存 TTL 覆盖：空串→null（复位跟随全局）；否则 1..=86400 秒
+    const ttlSecsRaw = editTtlSecs.trim()
+    const cacheTtlSecs = ttlSecsRaw === '' ? null : parseInt(ttlSecsRaw, 10)
+    if (ttlSecsRaw !== '' && (isNaN(cacheTtlSecs as number) || (cacheTtlSecs as number) < 1 || (cacheTtlSecs as number) > 86400)) {
+      toast.error('每 Key 缓存 TTL 需在 1..=86400 秒，或留空跟随全局')
       return
     }
     // multiplier 护栏上限：空串→null（复位跟随默认 1.25）；否则 0.1~1.25
@@ -251,6 +271,8 @@ export function ClientKeysPage() {
           responseCacheEnabled: respCacheEnabled,
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
+          cacheHitRate,
+          cacheTtlSecs,
           cacheMultiplierCap,
           anthropicBillingMode: editBillingMode,
           cacheCreationRatio,
@@ -635,21 +657,22 @@ export function ClientKeysPage() {
                     disabled={updateKey.isPending}
                   />
                 </div>
-                {/* 利润档滑块（复用 R）：命中率≈R，multiplier≈1−0.9R；越左命中越高利润越低 */}
+                {/* 利润档滑块（目标缓存率 T）：面板命中率≈T，multiplier≈1.25−1.15T；越右命中越高利润越低 */}
                 {(() => {
-                  const r = editCacheRatio.trim() === '' ? 1.0 : parseFloat(editCacheRatio)
-                  const rv = isNaN(r) ? 1.0 : Math.min(1, Math.max(0, r))
+                  const t = editHitRate.trim() === '' ? 0.9 : parseFloat(editHitRate)
+                  const tv = isNaN(t) ? 0.9 : Math.min(1, Math.max(0, t))
                   const capRaw = editMultiplierCap.trim() === '' ? 1.25 : parseFloat(editMultiplierCap)
                   const cap = isNaN(capRaw) ? 1.25 : Math.min(1.25, Math.max(0.1, capRaw))
-                  const hit = Math.round(rv * 100)
-                  const mult = Math.min(cap, 1 - 0.9 * rv)
+                  const hit = Math.round(tv * 100)
+                  // 深暖轮近似：input≈0，read=T×total、creation=(1−T)×total → weighted=1.25−1.15T。
+                  const mult = Math.min(cap, 1.25 - 1.15 * tv)
                   const band = mult <= 1.0 ? ['正常', 'text-emerald-600'] : mult <= 1.25 ? ['临界', 'text-amber-600'] : ['异常', 'text-red-600']
                   return (
                     <div>
                       <div className="mb-1 flex items-center justify-between">
-                        <div className="text-sm">利润档（read 留存 R）</div>
+                        <div className="text-sm">利润档（目标缓存率 T）</div>
                         <span className="text-[11px] text-muted-foreground">
-                          {editCacheRatio.trim() === '' ? '跟随全局' : `R=${rv.toFixed(2)}`}
+                          {editHitRate.trim() === '' ? '跟随全局' : `T=${tv.toFixed(2)}`}
                         </span>
                       </div>
                       <input
@@ -657,14 +680,14 @@ export function ClientKeysPage() {
                         min={0}
                         max={1}
                         step={0.05}
-                        value={rv}
-                        onChange={(e) => setEditCacheRatio(e.target.value)}
+                        value={tv}
+                        onChange={(e) => setEditHitRate(e.target.value)}
                         disabled={updateKey.isPending || !editCacheEnabled}
                         className="w-full accent-primary disabled:opacity-50"
                       />
                       <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
-                        <span>← 命中率高·利润低</span>
-                        <span>利润高·命中率低 →</span>
+                        <span>← 利润高·命中率低</span>
+                        <span>命中率高·利润低 →</span>
                       </div>
                       <div className="mt-2 flex items-center gap-3 rounded bg-muted/60 px-2 py-1 text-[11px]">
                         <span>预计命中率 <b>{hit}%</b></span>
@@ -672,11 +695,30 @@ export function ClientKeysPage() {
                         <span>检测带 <b className={band[1]}>{band[0]}</b></span>
                       </div>
                       <p className="mt-1 text-[11px] text-muted-foreground">
-                        R 越低 → 越多 read(0.1x) 挪回 input(1.0x)：命中率降、利润升、multiplier 向 1.0 爬。留空＝跟随全局。预览为纯暖轮近似，实际随冷/热轮与真实占比浮动。
+                        T = 面板 cache_read/总prompt 逼近值。T 越低 → 越多旧前缀挪 creation(1.25x)：命中率降、利润升。留空＝跟随全局（按全局命中率上限夹紧）。预览为纯暖轮近似，实际随冷/热轮浮动。
                       </p>
                     </div>
                   )
                 })()}
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">每 Key 缓存热度 TTL（秒）</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局；1~86400。距上次请求超此值 → 本轮转 cold（整段前缀按 creation 重写、read=0）。TTL 越短越多请求判冷、命中率越低。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={86400}
+                    step={1}
+                    placeholder="跟随全局"
+                    value={editTtlSecs}
+                    onChange={(e) => setEditTtlSecs(e.target.value)}
+                    disabled={updateKey.isPending || !editCacheEnabled}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="text-sm">multiplier 护栏上限</div>

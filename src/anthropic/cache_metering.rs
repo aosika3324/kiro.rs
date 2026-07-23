@@ -49,8 +49,16 @@ pub struct DeltaCacheUsage {
     pub creation_est: i32,
     /// 整个 prompt（system + tools + 全部 messages）的 estimate token，比例分摊的分母。
     pub prompt_total_est: i32,
-    /// read 留存阻尼 R ∈ [0,1]（利润档）：read 桶保留 `read × R`，其余推回 input（不给缓存折扣）。
-    /// R 越低 → 越多 read 挪 input → 加权收入越高、命中率越低。可全局设也可 per-key 覆盖。
+    /// 上轮已沉淀、本轮可作 `cache_read` 的旧前缀 estimate token（warm 时来自
+    /// [`MeterGovernance::observe_session`] 高水位；cold=0）。目标率算法据此预测「真实该读多少」，
+    /// 再由 `hit_rate` 削顶。
+    pub prev_cached_est: i32,
+    /// 目标缓存率 T ∈ [0,1]（新语义主旋钮）：面板显示 `cache_read / 总prompt` 逼近此值。
+    /// 分摊时 `read = min(prev_cached, T×total)`，超出的旧前缀挪进 creation（1.25× 贵桶，真实
+    /// 「部分重写」+ 利润）。T 越低 → read 越少、creation 越多 → 面板命中率越低、加权收入越高。
+    /// 生效值在入口已按全局 `hit_rate_max` 夹紧。
+    pub hit_rate: f64,
+    /// **已废弃**（R 留存语义被 `hit_rate` 目标率取代）。保留仅为老配置/调用点兼容，分摊不再使用。
     pub read_ratio: f64,
     /// multiplier 护栏上限（C，仅**检测安全默认模式**生效）：`weighted/baseline` 超此值时把
     /// input→read 压回（见 [`DeltaCacheUsage::apply_multiplier_cap`]）。默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25。
@@ -113,6 +121,8 @@ impl Default for DeltaCacheUsage {
             input_est: 0,
             creation_est: 0,
             prompt_total_est: 0,
+            prev_cached_est: 0,
+            hit_rate: 1.0,
             read_ratio: 1.0,
             multiplier_cap: DEFAULT_MULTIPLIER_CAP,
             billing_mode: false,
@@ -128,36 +138,54 @@ impl DeltaCacheUsage {
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`，
     /// 三者满足 `input + creation + read == total_real`。
     ///
-    /// `total_real` 是最终上报口径的全量 prompt token。input / creation 各按其 estimate 占比
-    /// 折算到真实 total，剩余即 read；再对 read 施加留存阻尼 R（砍掉的部分推回 input）。
-    /// 无可缓存内容（`prompt_total_est <= 0`）时全部计入 input，不凭空造缓存计数。
+    /// `total_real` 是最终上报口径的全量 prompt token。默认（检测安全）支路：走目标率分摊
+    /// [`Self::split_target_rate`] 后**施加 multiplier_cap 护栏**。无可缓存内容
+    /// （`prompt_total_est <= 0`）时全部计入 input，不凭空造缓存计数。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        let (input, creation, read) = self.split_target_rate(total_real);
+        self.apply_multiplier_cap(total_real.max(0), input, creation, read)
+    }
+
+    /// 目标缓存率分摊核心（两支路共用）。恒满足 `input + creation + read == total_real`（互斥）。
+    ///
+    /// 语义：input/creation/prev_cached 各按其 estimate 占比折算到真实 total；真实预测
+    /// `read* = prev`（旧前缀全命中）、`creation* = delta`（本轮新沉淀）；再按目标率 T 削顶——
+    /// `read = min(prev, round(T×total))`，超目标的旧前缀 `excess` 挪进 creation（1.25× 贵桶，
+    /// 真实"部分重写" + 利润）。浮点 round 余数兜底进 input，保证三桶和恒等 total。
+    /// cold 时 `prev_cached_est=0` → read=0（面板 0%，真实：缓存刚建没得读）。
+    pub fn split_target_rate(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.prompt_total_est <= 0 || total == 0 {
             return (total, 0, 0);
         }
         let denom = self.prompt_total_est as f64;
+        let totf = total as f64;
         let input_share = (self.input_est as f64 / denom).clamp(0.0, 1.0);
-        let creation_share = (self.creation_est as f64 / denom).clamp(0.0, 1.0);
+        let prev_share = (self.prev_cached_est as f64 / denom).clamp(0.0, 1.0);
 
-        // input / creation 按占比折算，clamp 保证 input + creation <= total。
-        let mut input = ((total as f64) * input_share).round() as i32;
-        input = input.clamp(0, total);
-        let mut creation = ((total as f64) * creation_share).round() as i32;
-        creation = creation.clamp(0, total - input);
+        // input 按占比折算（本轮真新增，永不缓存）。
+        let mut input = (totf * input_share).round().clamp(0.0, totf) as i32;
+        // 旧前缀（预测可 read 的量）折算到真实 total，clamp 到 input 之外的空间。
+        let prev = (totf * prev_share).round().clamp(0.0, (total - input) as f64) as i32;
 
-        // 剩余即已缓存前缀（read 基数）。
-        let read_base = total - input - creation;
-        let mut read = 0;
-        if read_base > 0 {
-            // read 留存阻尼 R（利润档）：保留 read_base × R，被砍部分推回 input（无缓存折扣），
-            // creation 不动。R 越低 → 越多 read 挪 input → 加权收入越高、命中率越低。
-            let r = self.read_ratio.clamp(0.0, 1.0);
-            read = ((read_base as f64) * r).round() as i32;
-            read = read.clamp(0, read_base);
-            input += read_base - read;
+        // 目标率削顶：read 最多 min(prev, T×total)。超出的旧前缀挪 creation。
+        let t = self.hit_rate.clamp(0.0, 1.0);
+        let read_cap = (totf * t).round().clamp(0.0, totf) as i32;
+        let read = prev.min(read_cap).clamp(0, total - input);
+        let excess = (prev - read).max(0);
+
+        // creation = 本轮真实新沉淀 delta（= cacheable_est − prev_cached_est，占比折算）+ 削顶 excess。
+        // delta 直接由 total − input − prev 得到（互斥剩余），再加 excess；最后 input 吸收 round 余数。
+        let delta = (total - input - prev).max(0);
+        let mut creation = (delta + excess).clamp(0, total - input - read);
+        // round 余数兜底进 input，保证 input + creation + read == total。
+        input += total - input - creation - read;
+        // 极端负数保护（浮点边界）。
+        if input < 0 {
+            creation = (creation + input).max(0);
+            input = 0;
         }
-        self.apply_multiplier_cap(total, input, creation, read)
+        (input, creation, read)
     }
 
     /// multiplier 护栏（C）：`weighted/baseline` 超 `multiplier_cap` 时，把 input(1.0x) 闭式挪去
@@ -226,42 +254,13 @@ impl DeltaCacheUsage {
     /// Anthropic 标准计费口径（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
     ///
     /// **互斥三桶，恒满足 `input + creation + read == total_real`——绝不超报、拒绝双重收费。**
-    /// 与默认 [`Self::split_against_total`] 数学同源，唯一区别是**不施加 multiplier_cap 护栏**
-    /// （接受更高检测风险换 margin）。两个正交的 margin 旋钮，都不破坏 sum==total：
-    /// - **`creation_ratio`（默认 3%）**：`creation = cacheable × creation_ratio`，定"写多少"形状。
-    /// - **`R`（read_ratio）**：read 桶保留 `read0 × R`，被砍部分挪回 input（1.0×）——利润主杠杆。
-    ///
-    /// 其中 input 按结构占比（`input_est/prompt_total_est`）折算真实 total（= 本轮新问题，永不进缓存），
-    /// `cacheable = total − input`。read0 = cacheable − creation，经 R 挪桶后得 read。
-    /// output 独立按输出价计费,不在此三桶内。无可缓存内容（`prompt_total_est<=0`）时全计 input。
+    /// 与默认 [`Self::split_against_total`] 数学**同源**（都走目标率 [`Self::split_target_rate`]），
+    /// 唯一区别是**不施加 multiplier_cap 护栏**（接受更高检测风险换 margin）。利润与形状由
+    /// 目标率 T（`hit_rate`）统一表达：T 越低 → read 越少、creation 越多 → 加权收入越高。
+    /// output 独立按输出价计费，不在此三桶内。无可缓存内容（`prompt_total_est<=0`）时全计 input。
     pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
-        let total = total_real.max(0);
-        if self.prompt_total_est <= 0 || total == 0 {
-            return (total, 0, 0);
-        }
-        let denom = self.prompt_total_est as f64;
-        // input = 本轮新问题（最后一条 message），按结构占比折算真实 total，永不进缓存。
-        let input_share = (self.input_est as f64 / denom).clamp(0.0, 1.0);
-        let mut input = ((total as f64) * input_share).round() as i32;
-        input = input.clamp(0, total);
-
-        // cacheable = 除本轮新问题外的全量前缀；creation 由 creation_ratio 旋钮定形状。
-        let cacheable = total - input;
-        let cr = self.creation_ratio.clamp(0.0, 1.0);
-        let mut creation = ((cacheable as f64) * cr).round() as i32;
-        creation = creation.clamp(0, cacheable);
-
-        // read0 = cacheable − creation；R 挪桶：保留 read0×R，被砍部分推回 input（1.0×）出利润。
-        let read0 = cacheable - creation;
-        let mut read = 0;
-        if read0 > 0 {
-            let r = self.read_ratio.clamp(0.0, 1.0);
-            read = ((read0 as f64) * r).round() as i32;
-            read = read.clamp(0, read0);
-            input += read0 - read;
-        }
-        // 标准模式不施加护栏（与默认模式的唯一差异）。三桶恒等 total（互斥、不双重收费）。
-        (input, creation, read)
+        // 标准模式 = 目标率分摊但不施加护栏（与默认模式的唯一差异）。
+        self.split_target_rate(total_real)
     }
 }
 
@@ -324,36 +323,79 @@ impl CacheUsage {
 /// 算「本轮新增了几条」从而界定 creation 区间（见 [`compute_structural_cache_usage`]）。
 pub struct MeterGovernance {
     /// 全局 R 的 bit 表示（f64 → u64，原子读写）。per-key 未覆盖时用此值。
+    /// **语义迁移期**：新算法用「目标缓存率 T」（见 [`compute_structural_cache_usage`] 的
+    /// `hit_rate`），此字段作为「未设 per-key `cache_hit_rate` 时的全局默认 T」回退值继续使用
+    /// （旧 `cacheReadRatio` 的深轮语义 ≈ 目标命中率，数值平滑）。
     read_ratio_bits: AtomicU64,
     /// 缓存热度 TTL（秒，原子）。距某会话上次请求超过此值即判 cold（缓存已凉）。
+    /// per-key `cache_ttl_secs` 未覆盖时用此全局值。
     ttl_secs: AtomicU64,
-    /// 会话热度表：`isolation_seed → (上次请求 unix 秒, 上次请求的 messages 条数)`。
-    last_seen: parking_lot::Mutex<std::collections::HashMap<String, (i64, usize)>>,
+    /// 目标缓存率 T 的上限（bit 表示）。生效 T 在入口按此夹紧，防恒 ~100%（检测特征）。
+    /// admin 前端可配，默认 [`DEFAULT_CACHE_HIT_RATE_MAX`]。
+    hit_rate_max_bits: AtomicU64,
+    /// 会话热度表：`isolation_seed → (上次请求 unix 秒, 已沉淀可缓存前缀 token 高水位估算)`。
+    /// token 级（不再是 messages 条数）：warm 时该值即「上轮已缓存、本轮可 read 的前缀量」。
+    last_seen: parking_lot::Mutex<std::collections::HashMap<String, (i64, u32)>>,
 }
 
 /// `last_seen` 表的清理阈值：超过此条目数时，借一次请求顺手清掉所有已过 2×TTL 的死会话，
 /// 避免长期运行内存无界增长（纯防护，不影响判定语义）。
 const LAST_SEEN_SWEEP_THRESHOLD: usize = 4096;
 
+/// 目标缓存率 T 的默认上限。恒 ~100% 命中是检测特征，夹到 0.95 保留自然抖动余量。
+pub const DEFAULT_CACHE_HIT_RATE_MAX: f64 = 0.95;
+
+/// **真实性闸门（破绽 B）**：真实 Anthropic prompt caching 的最小可缓存前缀 token 门槛。
+/// 可缓存前缀（`prompt_total − input`）低于此值 → 不缓存，全计 input（cache 两桶为 0）。
+/// Anthropic 文档：Sonnet/Opus 1024、Haiku 2048；取保守下限 1024（低估门槛 = 更少请求被判可缓存
+/// = 偏向诚实，不会把本不该缓存的短请求报成缓存）。可经 `KIRO_RS_MIN_CACHEABLE_TOKENS` 覆盖。
+pub const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
+
+/// 读取生效的最小可缓存门槛（env 覆盖，缺省 [`DEFAULT_MIN_CACHEABLE_TOKENS`]）。
+fn min_cacheable_tokens() -> i32 {
+    std::env::var("KIRO_RS_MIN_CACHEABLE_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_MIN_CACHEABLE_TOKENS)
+}
+
 impl MeterGovernance {
-    /// 用初始 R + TTL 构造（R clamp 到 [0,1]）。
+    /// 用初始 R（= 全局默认目标率 T）+ TTL 构造。命中率上限取默认 [`DEFAULT_CACHE_HIT_RATE_MAX`]。
     pub fn new(read_ratio: f64, ttl_secs: u64) -> Self {
+        Self::new_with_max(read_ratio, ttl_secs, DEFAULT_CACHE_HIT_RATE_MAX)
+    }
+
+    /// 用初始 R + TTL + 命中率上限构造（均 clamp 到 [0,1]）。
+    pub fn new_with_max(read_ratio: f64, ttl_secs: u64, hit_rate_max: f64) -> Self {
         Self {
             read_ratio_bits: AtomicU64::new(read_ratio.clamp(0.0, 1.0).to_bits()),
             ttl_secs: AtomicU64::new(ttl_secs),
+            hit_rate_max_bits: AtomicU64::new(hit_rate_max.clamp(0.0, 1.0).to_bits()),
             last_seen: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// 当前全局 R。
+    /// 当前全局默认目标缓存率 T（旧称 R）。
     pub fn read_ratio(&self) -> f64 {
         f64::from_bits(self.read_ratio_bits.load(Ordering::Relaxed))
     }
 
-    /// 设置全局 R（clamp 到 [0,1]），运行时立即对后续请求生效。
+    /// 设置全局默认目标率 T（clamp 到 [0,1]），运行时立即对后续请求生效。
     pub fn set_read_ratio(&self, ratio: f64) {
         self.read_ratio_bits
             .store(ratio.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// 当前目标缓存率上限。
+    pub fn hit_rate_max(&self) -> f64 {
+        f64::from_bits(self.hit_rate_max_bits.load(Ordering::Relaxed))
+    }
+
+    /// 设置目标缓存率上限（clamp 到 [0,1]），运行时立即生效。
+    pub fn set_hit_rate_max(&self, v: f64) {
+        self.hit_rate_max_bits
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// 当前缓存热度 TTL（秒）。
@@ -366,23 +408,32 @@ impl MeterGovernance {
         self.ttl_secs.store(ttl, Ordering::Relaxed);
     }
 
-    /// 记录本会话本次请求（时间 + 消息条数**高水位**），返回**上轮缓存还热时的消息条数高水位**。
+    /// 记录本会话本次请求（时间 + 可缓存前缀 token **高水位**），返回**上轮缓存还热时的
+    /// 已沉淀可读前缀 token 高水位**。
     ///
-    /// 返回 `Some(prev_n)` = warm：该会话此前出现过 **且** 距上次请求 `<= TTL`（缓存未凉），
-    /// `prev_n` 是**已见过的消息条数高水位**，供调用方界定「本轮新增 = 当前条数 − prev_n」的
-    /// creation 区间。返回 `None` = cold（首次出现 / 间隔超 TTL）→ 调用方把整段前缀按 creation
-    /// 重写计费。`now` / `msg_count` 为本次请求的 unix 秒与 messages 条数（参数化便于测试）。
+    /// 返回 `Some(prev_cached)` = warm：该会话此前出现过 **且** 距上次请求 `<= ttl`（缓存未凉），
+    /// `prev_cached` 是**已见过的可缓存前缀 token 高水位**，即本轮可作 `cache_read` 的旧前缀量；
+    /// 调用方据此界定「本轮新写入 delta = 当前 cacheable − prev_cached」的 creation 区间。
+    /// 返回 `None` = cold（首次出现 / 间隔超 ttl）→ 调用方把整段前缀按 creation 重写计费。
     ///
-    /// **存高水位（`prev_n.max(msg_count)`）而非裸 msg_count**：`creation = msg_est[prev_n .. n-1]`
-    /// 的下界依赖 prev_n，但同一 session seed 上可能出现**更小 msg_count** 的请求——OpenAI 端点回退
-    /// key 级 seed 时多对话共享一条记录、Claude Code 的 title/探针/子任务复用同 session 但消息少、
-    /// 历史被重截断、并发乱序。裸存会把 prev_n 打小，使下一条真实长请求算出**横跨整段历史**的巨大
-    /// delta → `creation` 爆炸（吃掉本该进 read 便宜桶的历史）。取高水位后，短请求不再拉低下界，
-    /// 后续长请求的 creation 恢复到「真实新增」量级。副作用只在合法 compaction/截断使条数**永久**
-    /// 下降时出现：那一轮 creation 计 0（欠计新摘要）——**偏向便宜桶，经济上安全**，永不再虚高。
-    /// cold（缓存已凉）则重置基线为本次条数，不保留旧高水位（前缀确实要整段重建）。
-    pub fn observe_session(&self, session: &str, now: i64, msg_count: usize) -> Option<usize> {
-        let ttl = self.ttl_secs.load(Ordering::Relaxed) as i64;
+    /// `ttl` **由调用方传入**（per-key `cache_ttl_secs` 覆盖优先，否则全局 [`Self::ttl_secs`]）——
+    /// 表按 session_key 共享，key_id 已并入 seed，天然隔离。`now` / `cacheable_est` 为本次请求的
+    /// unix 秒与可缓存前缀（`prompt_total_est − input_est`）token 估算（参数化便于测试）。
+    ///
+    /// **存高水位（`prev.max(cacheable_est)`）而非裸值**：同一 session seed 上可能出现**更小**的
+    /// 请求（OpenAI 端点回退 key 级 seed 多对话共享、Claude Code title/探针/子任务复用同 session
+    /// 但消息少、历史被重截断、并发乱序）。裸存会把 prev 打小，使下一条长请求算出横跨整段历史的
+    /// 巨大 delta → creation 爆炸（吃掉本该进 read 便宜桶的历史）。取高水位后短请求不拉低下界。
+    /// 副作用只在合法 compaction/截断使前缀**永久**变短时出现：那轮 creation 计 0（欠计新摘要）
+    /// ——偏向便宜桶、经济安全。cold 则重置基线为本次 cacheable，不留旧高水位（前缀确要整段重建）。
+    pub fn observe_session(
+        &self,
+        session: &str,
+        now: i64,
+        cacheable_est: u32,
+        ttl_secs: u64,
+    ) -> Option<u32> {
+        let ttl = ttl_secs as i64;
         let mut map = self.last_seen.lock();
         // 偶发清理：表过大时清掉死会话（超 2×TTL 没来过的）。
         if map.len() > LAST_SEEN_SWEEP_THRESHOLD {
@@ -390,15 +441,15 @@ impl MeterGovernance {
             map.retain(|_, &mut (last, _)| last >= dead_before);
         }
         let warm = match map.get(session) {
-            Some(&(last, prev_n)) if now.saturating_sub(last) <= ttl => Some(prev_n),
+            Some(&(last, prev)) if now.saturating_sub(last) <= ttl => Some(prev),
             _ => None,
         };
-        // warm：存高水位（短请求不拉低下界）；cold：重置基线为本次条数。
-        let stored_n = match warm {
-            Some(prev_n) => prev_n.max(msg_count),
-            None => msg_count,
+        // warm：存高水位（短请求不拉低下界）；cold：重置基线为本次 cacheable。
+        let stored = match warm {
+            Some(prev) => prev.max(cacheable_est),
+            None => cacheable_est,
         };
-        map.insert(session.to_string(), (now, stored_n));
+        map.insert(session.to_string(), (now, stored));
         warm
     }
 }
@@ -422,23 +473,49 @@ pub fn now_unix_secs() -> i64 {
 use super::stream::estimate_tokens;
 use super::types::{MessagesRequest, SystemMessage, Tool};
 
-/// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构、R、上轮消息条数，
-/// 不依赖时间或负载。返回 [`DeltaCacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// 计算本次请求的结构化缓存覆盖（目标缓存率口径）。纯函数：只看请求结构、目标率 T、上轮
+/// 已缓存前缀 token。返回 [`DeltaCacheUsage`]，由调用方在拿到真实 total 后经
+/// [`DeltaCacheUsage::split_target_rate`] 做互斥分摊。
 ///
-/// 桶划分（见模块文档）：input = 最后一条 message；read = 其余前缀。`read_ratio` 是该请求
-/// 生效的 R（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
-///
-/// `prev_msg_count` 是本会话上轮缓存还热时的上次消息条数（见 [`MeterGovernance::observe_session`]）:
-/// - **`Some(prev_n)`**（缓存还热）→ creation = `messages[prev_n .. n-1]`，即上次见到后**新增、
-///   且已沉为稳定前缀**的那几条（标准对话 = 倒数第二条一条；agent 工具循环可能多条），其余前缀
-///   走 read 便宜桶。`prev_n` 钳到 `[0, n-1]`；若 `prev_n >= n-1`（无新增沉淀）则 creation=0。
-/// - **`None`**（首次出现 / 超 TTL 缓存已凉）→ 整段可缓存前缀（system+tools+除最后一条外的全部
-///   历史）按 **creation** 重写计费、read 基数=0，如同首轮重建缓存。这让"凉了的会话"不再白
-///   拿 0.1× 折扣。
+/// - `hit_rate`：该请求生效的目标缓存率 T（per-key `cache_hit_rate` 覆盖优先，否则全局默认，
+///   且已按 `hit_rate_max` 夹紧）。面板 `cache_read/总prompt` 逼近此值。
+/// - `prev_cached`：本会话上轮缓存还热时**已沉淀可读前缀的 token 高水位**（见
+///   [`MeterGovernance::observe_session`]，token 级）：
+///   - **`Some(prev)`**（warm）→ `prev_cached_est = min(prev, cacheable)`（旧前缀，预测可 read），
+///     `creation_est = cacheable − prev_cached_est`（本轮新沉淀 delta，写入缓存）。
+///   - **`None`**（cold：首次/超 TTL）→ `prev_cached_est=0`，`creation_est=cacheable`（整段重写，
+///     read=0），如首轮重建；面板显示 0%，真实。
+/// 估算本次请求的**可缓存前缀** token（`system + tools + 除最后一条外的全部 messages`）。
+/// 供入口在调用 [`compute_structural_cache_usage`] 前喂给 [`MeterGovernance::observe_session`]
+/// 记高水位/判 cold-warm。与 `compute_structural_cache_usage` 内部口径一致（都用 estimate）。
+pub fn estimate_cacheable_tokens(req: &MessagesRequest) -> i32 {
+    let mut overhead: i32 = 0;
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            overhead = overhead.saturating_add(tool_tokens(t));
+        }
+    }
+    if let Some(systems) = req.system.as_ref() {
+        for sys in systems {
+            overhead = overhead.saturating_add(system_tokens(sys));
+        }
+    }
+    let n = req.messages.len();
+    if n == 0 {
+        return 0;
+    }
+    // 除最后一条（本轮新输入）外的历史前缀。
+    let hist: i32 = req.messages[..n - 1]
+        .iter()
+        .map(message_tokens)
+        .fold(0i32, |a, b| a.saturating_add(b));
+    overhead.saturating_add(hist).max(0)
+}
+
 pub fn compute_structural_cache_usage(
     req: &MessagesRequest,
-    read_ratio: f64,
-    prev_msg_count: Option<usize>,
+    hit_rate: f64,
+    prev_cached: Option<i32>,
 ) -> DeltaCacheUsage {
     // system + tools 开销（首轮即首次写入缓存的那段）。
     let mut overhead: i32 = 0;
@@ -455,6 +532,7 @@ pub fn compute_structural_cache_usage(
 
     // 入站 cache_control.ttl 决定 creation 归 5m 还是 1h 桶（仅影响上报归桶与计价权重）。
     let creation_is_1h = request_marks_1h_cache(req);
+    let t = hit_rate.clamp(0.0, 1.0);
 
     let n = req.messages.len();
     if n == 0 {
@@ -463,7 +541,8 @@ pub fn compute_structural_cache_usage(
             input_est: 0,
             creation_est: 0,
             prompt_total_est: 0,
-            read_ratio: read_ratio.clamp(0.0, 1.0),
+            prev_cached_est: 0,
+            hit_rate: t,
             creation_is_1h,
             ..DeltaCacheUsage::default()
         };
@@ -475,17 +554,16 @@ pub fn compute_structural_cache_usage(
 
     // input = 最后一条 message（本轮新问题），永不计入缓存。
     let input_est = msg_est[n - 1];
-    // creation = 本轮"写入缓存"的部分：
-    //   cold（None：首次/超TTL，缓存已凉）→ 整段可缓存前缀 = prompt_total − input，全部重写计
-    //     creation（read 基数随之为 0），如同首轮；
-    //   warm（Some(prev_n)）→ messages[prev_n .. n-1]：上次见到后新增、且已沉为稳定前缀的那几条。
-    //     prev_n 钳到 [0, n-1]；标准对话每轮 +2 条（prev_n = n-2）→ 恰为倒数第二条；agent 工具
-    //     循环一轮补进多对 → 覆盖全部新增中间消息。prev_n >= n-1（无新增沉淀，如纯重放）→ creation=0。
-    let creation_est = match prev_msg_count {
-        None => prompt_total_est.saturating_sub(input_est),
-        Some(prev_n) => {
-            let start = prev_n.min(n - 1);
-            msg_est[start..n - 1].iter().fold(0i32, |a, b| a.saturating_add(*b))
+    let cacheable = prompt_total_est.saturating_sub(input_est).max(0);
+
+    // prev_cached / creation 由会话热度决定：
+    //   cold（None）→ 无旧前缀可读，整段 cacheable 按 creation 重写；
+    //   warm（Some(prev)）→ 旧前缀 min(prev, cacheable) 可 read，其余（本轮新沉淀）计 creation。
+    let (prev_cached_est, creation_est) = match prev_cached {
+        None => (0, cacheable),
+        Some(prev) => {
+            let p = prev.clamp(0, cacheable);
+            (p, cacheable - p)
         }
     };
 
@@ -493,7 +571,8 @@ pub fn compute_structural_cache_usage(
         input_est,
         creation_est,
         prompt_total_est,
-        read_ratio: read_ratio.clamp(0.0, 1.0),
+        prev_cached_est,
+        hit_rate: t,
         creation_is_1h,
         ..DeltaCacheUsage::default()
     }
@@ -522,6 +601,49 @@ fn request_marks_1h_cache(req: &MessagesRequest) -> bool {
     }
     // message content blocks：content 为自由 JSON，扫其中对象的 cache_control.ttl。
     req.messages.iter().any(|m| json_has_1h_cache_control(&m.content))
+}
+
+/// **真实性闸门（破绽 A + B）**：本请求是否有资格产生 cache 两桶（cache_read/cache_creation）。
+///
+/// 真实 Anthropic 仅在①请求带 `cache_control` 断点、且②可缓存前缀（`estimate_cacheable_tokens`）
+/// ≥ 最小门槛（[`DEFAULT_MIN_CACHEABLE_TOKENS`]）时才产生缓存两桶；否则整段计 `input_tokens`。
+/// 不满足此条件却上报缓存 → 客户端 diff 请求即可识破转卖。计量入口据此决定：不合格 → 全 input。
+pub fn cache_eligible(req: &MessagesRequest) -> bool {
+    request_has_cache_control(req) && estimate_cacheable_tokens(req) >= min_cacheable_tokens()
+}
+
+/// 请求里是否**存在任一** `cache_control` 断点（不论 ttl）。
+///
+/// **真实性闸门（破绽 A）**：真实 Anthropic 只在请求显式带 `cache_control` 断点时才产生
+/// `cache_read`/`cache_creation`；无任何断点 → 全部计 `input_tokens`、缓存两桶为 0。客户端
+/// 若发不带断点的请求却看到我们上报缓存，即穿帮。故计量前先查此条件，无断点直接全 input。
+/// 扫 system / tools 的强类型 `cache_control` + message content blocks 的 JSON 形态。
+fn request_has_cache_control(req: &MessagesRequest) -> bool {
+    if let Some(systems) = req.system.as_ref() {
+        if systems.iter().any(|s| s.cache_control.is_some()) {
+            return true;
+        }
+    }
+    if let Some(tools) = req.tools.as_ref() {
+        if tools.iter().any(|t| t.cache_control.is_some()) {
+            return true;
+        }
+    }
+    req.messages.iter().any(|m| json_has_cache_control(&m.content))
+}
+
+/// 递归扫 JSON 里是否存在任一 `cache_control` 键（用于 `Message.content` 的自由形态）。
+fn json_has_cache_control(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            if map.contains_key("cache_control") {
+                return true;
+            }
+            map.values().any(json_has_cache_control)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(json_has_cache_control),
+        _ => false,
+    }
 }
 
 /// 递归扫 JSON 里任一 `cache_control.ttl == "1h"`（用于 `Message.content` 的自由形态）。
@@ -1276,105 +1398,108 @@ mod tests {
 
     #[test]
     fn split_three_buckets_by_share() {
-        // input 占比 10%、creation 占比 5%，剩余 85% 为 read（R=1 全留存）。
+        // 目标率口径：input 占比 10%、旧缓存前缀占比 85%（T=1 全读）、本轮新沉淀 delta=5% 计 creation。
         let u = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 5,
+            prev_cached_est: 85,
             prompt_total_est: 100,
-            read_ratio: 1.0,
+            hit_rate: 1.0,
             ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input, 100);
-        assert_eq!(creation, 50);
-        assert_eq!(read, 850);
+        assert_eq!(creation, 50, "delta = total − input − prev = 1000−100−850");
+        assert_eq!(read, 850, "T=1 → 旧前缀全命中");
         assert_eq!(input + creation + read, 1000);
     }
 
     #[test]
     fn split_creation_bounded_independent_of_history() {
-        // creation 只随 creation_est 占比走，不随 read 基数（历史规模）变化——贵桶有界。
-        // 短历史：total 小
+        // 历史增长（旧缓存前缀变大）全进 read 便宜桶，creation（本轮新沉淀 delta）不被历史放大。
+        // 短历史：delta 占 20%、旧前缀占 70%。
         let short = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 20,
+            prev_cached_est: 70,
             prompt_total_est: 100,
-            read_ratio: 1.0,
+            hit_rate: 1.0,
             ..DeltaCacheUsage::default()
         };
-        // 长历史：同样的 input/creation 占比，但 prompt_total 大得多（read 基数暴涨）
+        // 长历史：同样 input(1%)/delta，旧前缀占比涨到 89%（read 基数暴涨）。
         let long = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 20,
+            prev_cached_est: 890,
             prompt_total_est: 1000,
-            read_ratio: 1.0,
+            hit_rate: 1.0,
             ..DeltaCacheUsage::default()
         };
         let (_, c_short, _) = short.split_against_total(300);
         let (_, c_long, r_long) = long.split_against_total(3000);
-        // creation 占比相同（20/100 vs 20/1000 → 真实 total 也等比放大），关键是 read 吃掉增量
-        assert_eq!(c_short, 60); // 300 × 20/100
-        assert_eq!(c_long, 60); // 3000 × 20/1000 —— creation 不被历史放大
-        assert!(r_long > 2000, "历史增长全进 read（便宜桶），不进 creation");
+        // delta 占比相同(20/100 vs 100/1000=10%? 不——保持 delta = total−input−prev 等比)
+        assert_eq!(c_short, 60, "300 − 30(input) − 210(prev) = 60 delta");
+        assert_eq!(c_long, 300, "3000 − 30 − 2670 = 300 delta（等比放大，非被历史额外放大）");
+        assert!(r_long > 2000, "历史增长主要进 read（便宜桶）");
     }
 
     #[test]
-    fn split_read_retention_pushes_to_input_not_creation() {
-        // R<1：read 被砍的部分推回 input，creation 纹丝不动（贵桶经济正确）。
+    fn split_target_rate_caps_read_excess_to_creation() {
+        // T<1：read 被目标率削顶，超出的旧前缀挪进 creation（贵桶，真实"部分重写"+利润）。
+        // input 占 10%、旧前缀占 80%，T=0.5 → read 上限=total×0.5。
         let u = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 10,
+            prev_cached_est: 80,
             prompt_total_est: 100,
-            read_ratio: 0.5,
+            hit_rate: 0.5,
             ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
-        // base: input=100, creation=100, read_base=800
-        // R=0.5 → read=400，被砍 400 推回 input → input=500
-        assert_eq!(input, 500);
-        assert_eq!(creation, 100, "creation 不受 R 影响");
-        assert_eq!(read, 400);
+        // input=100, prev=800, read_cap=500 → read=500, excess=300
+        // delta = 1000−100−800 = 100 → creation = 100 + 300 = 400
+        assert_eq!(input, 100);
+        assert_eq!(read, 500, "read 被 T=0.5 削顶到 total×0.5");
+        assert_eq!(creation, 400, "被削的旧前缀 300 挪进 creation + delta 100");
         assert_eq!(input + creation + read, 1000);
+        assert!((read as f64 / 1000.0 - 0.5).abs() < 1e-9, "命中率 = T");
     }
 
     #[test]
-    fn split_ratio_zero_no_read() {
-        // R=0：完全不给缓存折扣，read 全部推回 input；creation 仍按其占比保留。
+    fn split_target_rate_zero_no_read() {
+        // T=0：不认任何缓存命中，旧前缀全挪进 creation（重写），read=0。
         let u = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 10,
+            prev_cached_est: 80,
             prompt_total_est: 100,
-            read_ratio: 0.0,
+            hit_rate: 0.0,
             ..DeltaCacheUsage::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
-        assert_eq!(creation, 100);
         assert_eq!(read, 0);
-        assert_eq!(input, 900);
+        assert_eq!(creation, 900, "delta 100 + 全部旧前缀 800 挪 creation");
+        assert_eq!(input, 100);
     }
 
     #[test]
-    fn split_pure_replay_hit_rate_equals_r() {
-        // 纯重放（creation_est≈0：无新增沉淀）时命中率精确 = R。锁住此语义:
-        //   R=1.0 → read≈total、input≈0 → 命中率 100%(贴近真实 Anthropic 稳态);
-        //   R=0.8 → read=total×0.8、input=total×0.2 → 命中率精确 80%(实证里所有高命中样本卡 80.0% 的成因)。
-        // 这是「配置能到多少」与「改码能到多少」归因的数学基准，不能悄悄漂移。
-        let replay = |r: f64| DeltaCacheUsage {
+    fn split_pure_replay_hit_rate_equals_t() {
+        // 纯重放（整段前缀已缓存、无新增 delta：prev_cached_est == prompt_total_est，input=0）时
+        // 命中率精确 = T。锁住此语义（面板 read/total 逼近 T）:
+        //   T=1.0 → read=total、input=0、creation=0 → 命中率 100%(真实 Anthropic 稳态);
+        //   T=0.8 → read=total×0.8，被削的 20% 挪 creation → 命中率精确 80%。
+        let replay = |t: f64| DeltaCacheUsage {
             input_est: 0,
-            creation_est: 0,
-            prompt_total_est: 1000, // >0 触发分摊；input/creation 占比为 0 → read_base=total
-            read_ratio: r,
+            prev_cached_est: 1000, // 整段前缀都是旧缓存,无新增 delta
+            prompt_total_est: 1000,
+            hit_rate: t,
             ..DeltaCacheUsage::default()
         };
         let hit = |(_i, _c, rd): (i32, i32, i32), tot: i32| rd as f64 / tot as f64;
 
         let (i1, c1, r1) = replay(1.0).split_against_total(1000);
-        assert_eq!((i1, c1, r1), (0, 0, 1000), "R=1.0 纯重放 → 全 read");
-        assert!((hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9, "R=1.0 → 命中率 100%");
+        assert_eq!((i1, c1, r1), (0, 0, 1000), "T=1.0 纯重放 → 全 read");
+        assert!((hit((i1, c1, r1), 1000) - 1.0).abs() < 1e-9, "T=1.0 → 命中率 100%");
 
         let (i8, c8, r8) = replay(0.8).split_against_total(1000);
-        assert_eq!((i8, c8, r8), (200, 0, 800), "R=0.8 → read=800、被砍 200 推回 input");
-        assert!((hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9, "R=0.8 → 命中率精确 80%");
+        // input=0, prev=1000, read_cap=800 → read=800, excess=200 → creation=0+200
+        assert_eq!((i8, c8, r8), (0, 200, 800), "T=0.8 → read=800、被削 200 挪 creation");
+        assert!((hit((i8, c8, r8), 1000) - 0.8).abs() < 1e-9, "T=0.8 → 命中率精确 80%");
     }
 
     #[test]
@@ -1441,27 +1566,29 @@ mod tests {
     #[test]
     fn cap_default_1_25_is_noop_for_normal_shapes() {
         // 默认 cap=1.25 对正常形状不触发：三桶不被改写，multiplier 本就 ≤1.25。
+        // input 占 10%、旧前缀占 40%、T=1；delta=50%。
         let u = DeltaCacheUsage {
             input_est: 10,
-            creation_est: 10,
+            prev_cached_est: 40,
             prompt_total_est: 100,
-            read_ratio: 0.5,
+            hit_rate: 1.0,
             ..DeltaCacheUsage::default()
         };
-        let out = u.split_against_total(1000); // (500,100,400)，weighted=665 → 0.665x
-        assert_eq!(out, (500, 100, 400), "默认 cap 不改写正常形状");
+        // input=100, prev=400, read=400, delta=1000−100−400=500 → creation=500
+        let out = u.split_against_total(1000); // weighted=100+625+40=765 → 0.765x
+        assert_eq!(out, (100, 500, 400), "默认 cap 不改写正常形状");
         assert!(mult(out, 1000) <= 1.25 + 1e-9);
     }
 
     #[test]
     fn cap_pushes_input_to_read_not_creation() {
-        // 低 R（利润档拉高）使 input 变大、multiplier 逼近 1.0；收紧 cap=0.5 → 护栏把 input 挪回 read。
-        // R=0：input=900,creation=100,read=0 → weighted=1025 → 1.025x。cap=0.5 → 须压到 ≤500。
+        // 高 input 占比使 multiplier 逼近 1.0；收紧 cap=0.5 → 护栏把 input 挪回 read（不碰 creation）。
+        // input 占 90%、无旧前缀 → input=900,creation=100(delta),read=0 → weighted=1025 → 1.025x。
         let u = DeltaCacheUsage {
-            input_est: 10,
-            creation_est: 10,
+            input_est: 90,
+            prev_cached_est: 0,
             prompt_total_est: 100,
-            read_ratio: 0.0,
+            hit_rate: 1.0,
             multiplier_cap: 0.5,
             ..DeltaCacheUsage::default()
         };
@@ -1474,12 +1601,12 @@ mod tests {
 
     #[test]
     fn cap_zero_disables_guardrail() {
-        // cap<=0 → 不设护栏，形状原样返回。
+        // cap<=0 → 不设护栏，形状原样返回。input 占 90%、无旧前缀 → (900,100,0)。
         let u = DeltaCacheUsage {
-            input_est: 10,
-            creation_est: 10,
+            input_est: 90,
+            prev_cached_est: 0,
             prompt_total_est: 100,
-            read_ratio: 0.0,
+            hit_rate: 1.0,
             multiplier_cap: 0.0,
             ..DeltaCacheUsage::default()
         };
@@ -1488,16 +1615,16 @@ mod tests {
 
     // ---- split_anthropic_standard（标准计费：互斥三桶，拒绝双重收费）--------------
 
-    /// 标准模式构造：input 按结构占比折算，creation = cacheable×creation_ratio，read 经 R 挪桶。
-    /// `input_share_est` / `total_est` 定 input 占比;`cr` 定 creation 形状;`r` 定 read↔input 利润。
-    fn std_usage_cr(total_est: i32, r: f64, cr: f64) -> DeltaCacheUsage {
+    /// 标准模式构造（目标率口径，与默认模式同源，仅不施加护栏）：input=0（全量前缀可缓存），
+    /// `prev_cached_est` 定旧缓存前缀占比、`total_est` 为分母、`t` 为目标缓存率。
+    /// read=min(prev, T×total)，delta+excess 计 creation。便于单验 T 对 read/creation 形状的控制。
+    fn std_usage(prev_cached_est: i32, total_est: i32, t: f64) -> DeltaCacheUsage {
         DeltaCacheUsage {
-            input_est: 0, // input 占比 0 → 全量前缀可缓存,便于单验 creation/read 形状
-            creation_est: 0,
+            input_est: 0,
+            prev_cached_est,
             prompt_total_est: total_est,
-            read_ratio: r,
+            hit_rate: t,
             billing_mode: true,
-            creation_ratio: cr,
             ..DeltaCacheUsage::default()
         }
     }
@@ -1506,8 +1633,8 @@ mod tests {
     fn std_sum_equals_total_never_over_reports() {
         // 拒绝双重收费的核心不变量：标准模式三桶和**恒等** total_real，绝不超报。
         // 覆盖多种 R / creation_ratio / total 组合。
-        for (r, cr) in [(1.0, 0.03), (0.5, 0.03), (0.0, 0.1), (0.8, 0.0), (1.0, 1.0)] {
-            let u = std_usage_cr(1000, r, cr);
+        for (prev, t) in [(990, 1.0), (900, 0.5), (1000, 0.0), (950, 0.8), (0, 1.0)] {
+            let u = std_usage(prev, 1000, t);
             for total in [1, 500, 4096, 10_000, 140_210] {
                 let (i, c, rd) = u.split_final(total);
                 assert!(i >= 0 && c >= 0 && rd >= 0, "桶非负");
@@ -1517,33 +1644,35 @@ mod tests {
     }
 
     #[test]
-    fn std_creation_ratio_shapes_creation() {
-        // creation = cacheable × creation_ratio；input_est=0 → cacheable=total。R=1 → read=余下。
-        let lo = std_usage_cr(1000, 1.0, 0.01);
+    fn std_delta_shapes_creation() {
+        // 本轮新沉淀 delta = total − prev 计 creation；旧前缀 prev 在 T=1 时全 read。
+        // prev 占 99% → delta=1% → creation=1%。
+        let lo = std_usage(990, 1000, 1.0);
         let (i1, c1, r1) = lo.split_final(10000);
-        assert_eq!(c1, 100, "1% → creation=100");
+        assert_eq!(c1, 100, "delta 1% → creation=100");
         assert_eq!(i1, 0, "input_est=0 → input=0");
-        assert_eq!(r1, 9900, "R=1 → read=cacheable−creation");
-        let hi = std_usage_cr(1000, 1.0, 0.05);
-        assert_eq!(hi.split_final(10000).1, 500, "5% → creation=500");
+        assert_eq!(r1, 9900, "T=1 → 旧前缀全 read");
+        // prev 占 95% → delta=5% → creation=500。
+        let hi = std_usage(950, 1000, 1.0);
+        assert_eq!(hi.split_final(10000).1, 500, "delta 5% → creation=500");
     }
 
     #[test]
-    fn std_r_shifts_read_to_input_for_margin() {
-        // R 挪桶利润杠杆:R 越低 → read↓、input↑，加权收入↑,但 sum 恒等 total（不超报）。
-        // total=10000, cr=1% → creation=100, read0=9900。
-        let (_, _, r_full) = std_usage_cr(1000, 1.0, 0.01).split_final(10000);
-        let (i_half, c_half, r_half) = std_usage_cr(1000, 0.5, 0.01).split_final(10000);
-        let (i_zero, _, r_zero) = std_usage_cr(1000, 0.0, 0.01).split_final(10000);
-        assert_eq!(r_full, 9900, "R=1 → read 全保留");
-        assert_eq!(r_half, 4950, "R=0.5 → read 减半");
-        assert_eq!(i_half, 4950, "被砍的 read 挪回 input");
-        assert_eq!(c_half, 100, "creation 不受 R 影响");
-        assert_eq!(r_zero, 0, "R=0 → read 全挪回 input");
-        assert_eq!(i_zero, 9900, "R=0 → input 吃下全部 read0");
-        // 加权收入单调:R 越低越高（input 1.0× > read 0.1×），但都不超报。
+    fn std_lower_t_shifts_read_to_creation_for_margin() {
+        // 目标率 T 利润杠杆:T 越低 → read↓、creation↑（被削旧前缀挪 creation），加权收入↑,
+        // 但 sum 恒等 total（不超报）。prev 占 99% → delta=1%；total=10000。
+        let (_, _, r_full) = std_usage(990, 1000, 1.0).split_final(10000);
+        let (i_half, c_half, r_half) = std_usage(990, 1000, 0.5).split_final(10000);
+        let (i_zero, c_zero, r_zero) = std_usage(990, 1000, 0.0).split_final(10000);
+        assert_eq!(r_full, 9900, "T=1 → 旧前缀全 read");
+        assert_eq!(r_half, 5000, "T=0.5 → read 削顶到 total×0.5");
+        assert_eq!(c_half, 5000, "被削旧前缀 4900 + delta 100 → creation=5000");
+        assert_eq!(i_half, 0, "input_est=0 → input 恒 0（不再挪 input）");
+        assert_eq!(r_zero, 0, "T=0 → read=0");
+        assert_eq!(c_zero, 10000, "T=0 → 旧前缀+delta 全 creation");
+        // 加权收入单调:T 越低越高（creation 1.25× > read 0.1×），但都不超报。
         let w = |i: i32, c: i32, rd: i32| WEIGHT_INPUT * i as f64 + WEIGHT_CREATION * c as f64 + WEIGHT_READ * rd as f64;
-        assert!(w(i_zero, 100, r_zero) > w(i_half, c_half, r_half), "R↓ 加权收入↑");
+        assert!(w(i_zero, c_zero, r_zero) > w(i_half, c_half, r_half), "T↓ 加权收入↑");
     }
 
     #[test]
@@ -1556,32 +1685,34 @@ mod tests {
     #[test]
     fn std_no_guardrail_unlike_default() {
         // 标准模式不施加 multiplier_cap 护栏（与默认模式的唯一区别）。
-        // 即便 multiplier_cap 设得很低,标准模式也不压 input→read。
+        // 即便 multiplier_cap 设得很低,标准模式也不压 creation→read。
+        // T=0 → 旧前缀全挪 creation：input=0, creation=1000, read=0 → weighted=1250(1.25x)。
+        // 护栏本会想压,但标准模式忽略护栏。
         let u = DeltaCacheUsage {
             input_est: 0,
+            prev_cached_est: 1000,
             prompt_total_est: 1000,
-            read_ratio: 0.0, // 全 read 挪回 input,加权最高
-            creation_ratio: 0.1,
+            hit_rate: 0.0, // read 全挪 creation,加权最高
             multiplier_cap: 0.5, // 激进护栏
             billing_mode: true,
             ..DeltaCacheUsage::default()
         };
-        // R=0 → input=900, creation=100, read=0。护栏本会把 input 挪 read,但标准模式忽略护栏。
-        assert_eq!(u.split_final(1000), (900, 100, 0), "标准模式无视护栏");
+        assert_eq!(u.split_final(1000), (0, 1000, 0), "标准模式无视护栏(creation 不被压)");
     }
 
     #[test]
     fn std_billing_mode_off_uses_safe_default() {
         // billing_mode 关（默认）→ split_final 走 split_against_total（检测安全，受护栏）。
+        // 整段前缀已缓存、T=1 → 全 read。
         let u = DeltaCacheUsage {
             input_est: 0,
-            creation_est: 0,
+            prev_cached_est: 1000,
             prompt_total_est: 1000,
-            read_ratio: 1.0,
+            hit_rate: 1.0,
             ..DeltaCacheUsage::default()
         };
         assert!(!u.billing_mode, "默认关");
-        assert_eq!(u.split_final(1000), (0, 0, 1000), "默认模式全 read");
+        assert_eq!(u.split_final(1000), (0, 0, 1000), "默认模式 T=1 全 read");
     }
 
     #[test]
@@ -1671,14 +1802,18 @@ mod tests {
                 cache_control: None,
             }]),
         );
-        let warm = compute_structural_cache_usage(&req, 1.0, Some(req.messages.len() - 2));
         let cold = compute_structural_cache_usage(&req, 1.0, None);
+        // warm 的 prev_cached 是上轮已缓存前缀的 token 数（token 级）。取可缓存前缀的 3/4，
+        // 使 warm.creation = cacheable − prev ≈ 1/4 cacheable（远小于 cold 的整段）、且 read>0。
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        let warm = compute_structural_cache_usage(&req, 1.0, Some(cacheable * 3 / 4));
 
         // 两者 input 相同(都是最后一条),prompt_total 相同。
         assert_eq!(cold.input_est, warm.input_est);
         assert_eq!(cold.prompt_total_est, warm.prompt_total_est);
-        // cold 的 creation = 整段前缀 = total − input;warm 的 creation 只一条,远小于 cold。
-        assert_eq!(cold.creation_est, cold.prompt_total_est - cold.input_est);
+        // cold 的 creation = 整段前缀 = total − input;warm 的 creation 只 delta,远小于 cold。
+        assert_eq!(cold.creation_est, cacheable);
+        assert_eq!(warm.creation_est, cacheable - cacheable * 3 / 4, "warm creation = delta");
         assert!(cold.creation_est > warm.creation_est * 2, "cold 把整段前缀都计 creation");
 
         let (ci, cc, cr) = cold.split_against_total(cold.prompt_total_est);
@@ -1736,10 +1871,14 @@ mod tests {
                 cache_control: None,
             }]),
         );
-        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // token 级：令上轮已缓存 prev = 可缓存前缀 − a1（即缓存到只差最后那条 assistant），
+        // 则本轮新沉淀 delta = a1 → creation = a1，其余 (system+u1) 进 read。
         let a1_est = message_tokens(&msg("assistant", &big));
         let u2_est = message_tokens(&msg("user", "short new question"));
-        assert_eq!(u.creation_est, a1_est, "creation = 倒数第二条 message");
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        let u = compute_structural_cache_usage(&req, 1.0, Some(cacheable - a1_est));
+        assert_eq!(u.creation_est, a1_est, "creation = 本轮新沉淀 delta（倒数第二条 a1）");
         assert_eq!(u.input_est, u2_est, "input = 最后一条 message");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(read > 0, "非首轮应有 cache_read");
@@ -1765,10 +1904,15 @@ mod tests {
         long_msgs.push(msg("user", "q"));
         let long = req_with(long_msgs, None);
 
-        let cu_short = compute_structural_cache_usage(&short, 1.0, Some(short.messages.len() - 2));
-        let cu_long = compute_structural_cache_usage(&long, 1.0, Some(long.messages.len() - 2));
-        // creation_est 都≈一条 assistant 消息，长对话不放大
+        // token 级：令上轮已缓存到只差最后一条 assistant（prev = cacheable − a_est），则本轮新沉淀
+        // delta = a_est → creation 恒 = 一条 assistant，无论历史多长，不随历史线性增长。
         let a_est = message_tokens(&msg("assistant", &unit));
+        let cold_short = compute_structural_cache_usage(&short, 1.0, None);
+        let cold_long = compute_structural_cache_usage(&long, 1.0, None);
+        let cacheable_short = cold_short.prompt_total_est - cold_short.input_est;
+        let cacheable_long = cold_long.prompt_total_est - cold_long.input_est;
+        let cu_short = compute_structural_cache_usage(&short, 1.0, Some(cacheable_short - a_est));
+        let cu_long = compute_structural_cache_usage(&long, 1.0, Some(cacheable_long - a_est));
         assert_eq!(cu_short.creation_est, a_est);
         assert_eq!(cu_long.creation_est, a_est, "长对话 creation 仍是一条 message");
         // 而 prompt_total（→read 基数）长对话远大于短对话
@@ -1782,19 +1926,25 @@ mod tests {
     }
 
     #[test]
-    fn compute_read_retention_controls_discount() {
-        // R 越大，read 越多、input 越少；creation 不变。
+    fn compute_target_rate_controls_read() {
+        // 目标率 T 越大 → read 越多、creation 越少（削顶更松）。input 不受 T 影响（本轮新问题）。
+        // 用深暖轮（prev 大）使 T 削顶真正生效：prev = cacheable，read=min(prev, T×total)=T×total。
         let body = "lorem ipsum dolor sit amet ".repeat(20);
         let req = req_with(
             vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
             None,
         );
-        let total = compute_structural_cache_usage(&req, 1.0, Some(1)).prompt_total_est;
-        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5, Some(1)).split_against_total(total);
-        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0, Some(1)).split_against_total(total);
-        assert!(r_hi > r_lo, "R 越大 read 越多");
-        assert!(i_hi < i_lo, "R 越大 input 越少（折扣更足）");
-        assert_eq!(c_lo, c_hi, "creation 不受 R 影响");
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let total = cold.prompt_total_est;
+        let cacheable = total - cold.input_est;
+        // prev = 整段可缓存前缀（纯重放式深暖轮）→ delta=0，read 完全由 T 削顶决定。
+        let (i_lo, c_lo, r_lo) =
+            compute_structural_cache_usage(&req, 0.5, Some(cacheable)).split_against_total(total);
+        let (i_hi, c_hi, r_hi) =
+            compute_structural_cache_usage(&req, 1.0, Some(cacheable)).split_against_total(total);
+        assert!(r_hi > r_lo, "T 越大 read 越多");
+        assert!(c_hi < c_lo, "T 越大 creation 越少（削顶挪进 creation 的 excess 更少）");
+        assert_eq!(i_lo, i_hi, "input 不受 T 影响（恒为本轮新问题）");
     }
 
     #[test]
@@ -1816,7 +1966,10 @@ mod tests {
             ],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // 深暖轮：prev = 整段可缓存前缀（含图历史）→ 含图前缀进 read 桶。
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        let u = compute_structural_cache_usage(&req, 1.0, Some(cacheable));
         // 含图历史(u1)在 read 前缀里 → prompt_total 应远大于本轮纯文本新输入。
         assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
         let (_, _, read) = u.split_against_total(u.prompt_total_est);
@@ -1843,7 +1996,10 @@ mod tests {
             vec![msg("user", "do something"), tool_use, msg("user", "next")],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0, Some(1));
+        // token 级：prev = 首条 user（缓存到只差 tool_use）→ 本轮 delta = tool_use → creation=toolu_est。
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        let u = compute_structural_cache_usage(&req, 1.0, Some(cacheable - toolu_est));
         assert_eq!(u.creation_est, toolu_est, "creation 应等于 tool_use message 的 token");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(creation > 0, "修复后 cache_creation 不再塌成 0");
@@ -1907,16 +2063,16 @@ mod tests {
     #[test]
     fn governance_warmth_cold_then_warm_then_expired() {
         let g = MeterGovernance::new(1.0, 300);
-        // 首次出现 → cold(None)，本次记 5 条
-        assert_eq!(g.observe_session("sess:a", 1000, 5), None, "首次出现应判 cold");
-        // TTL 内再来 → warm，返回上次条数 5；本次记 7 条
-        assert_eq!(g.observe_session("sess:a", 1200, 7), Some(5), "TTL(300)内应 warm 且返回上次条数");
-        // 超 TTL → cold(缓存凉了)；本次记 9 条
-        assert_eq!(g.observe_session("sess:a", 1600, 9), None, "距上次>300s 应判 cold");
+        // 首次出现 → cold(None)，本次记 cacheable=5
+        assert_eq!(g.observe_session("sess:a", 1000, 5, 300), None, "首次出现应判 cold");
+        // TTL 内再来 → warm，返回上次高水位 5；本次记 7
+        assert_eq!(g.observe_session("sess:a", 1200, 7, 300), Some(5), "TTL(300)内应 warm 且返回上次高水位");
+        // 超 TTL → cold(缓存凉了)；本次记 9
+        assert_eq!(g.observe_session("sess:a", 1600, 9, 300), None, "距上次>300s 应判 cold");
         // 刚刷新过,紧接着再来 → warm，返回刚记的 9
-        assert_eq!(g.observe_session("sess:a", 1700, 11), Some(9), "刷新后 TTL 内应 warm");
+        assert_eq!(g.observe_session("sess:a", 1700, 11, 300), Some(9), "刷新后 TTL 内应 warm");
         // 不同会话互不影响 → cold
-        assert_eq!(g.observe_session("sess:b", 1700, 3), None, "另一会话首次应 cold");
+        assert_eq!(g.observe_session("sess:b", 1700, 3, 300), None, "另一会话首次应 cold");
     }
 
     #[test]
@@ -1925,22 +2081,22 @@ mod tests {
         // title/探针/子任务、被重截断的历史），不得把 prev_n 下界打小 → 否则下一条长请求会算出
         // 横跨整段历史的巨大 creation delta。存高水位后短请求不拉低下界。
         let g = MeterGovernance::new(1.0, 300);
-        // 长对话到 200 条 → 首次 cold，记高水位 200。
-        assert_eq!(g.observe_session("key:42", 1000, 200), None);
-        // 同 seed 冒出一条短请求（另一对话/探针，只 3 条）→ warm，返回高水位 200（不是 3）。
+        // 长对话到 cacheable=200 → 首次 cold，记高水位 200。
+        assert_eq!(g.observe_session("key:42", 1000, 200, 300), None);
+        // 同 seed 冒出一条短请求（另一对话/探针，只 3）→ warm，返回高水位 200（不是 3）。
         assert_eq!(
-            g.observe_session("key:42", 1010, 3),
+            g.observe_session("key:42", 1010, 3, 300),
             Some(200),
             "短请求应读到高水位 200,而非被自己打小"
         );
-        // 长对话回来到 202 条 → warm，返回的 prev_n 仍是高水位 200（旧 bug 会返回 3）。
+        // 长对话回来到 202 → warm，返回的 prev 仍是高水位 200（旧 bug 会返回 3）。
         assert_eq!(
-            g.observe_session("key:42", 1020, 202),
+            g.observe_session("key:42", 1020, 202, 300),
             Some(200),
-            "长请求应读到高水位 200 → creation 只覆盖新增 2 条,不横跨历史"
+            "长请求应读到高水位 200 → creation 只覆盖新增 2,不横跨历史"
         );
         // 高水位随真实增长上移。
-        assert_eq!(g.observe_session("key:42", 1030, 205), Some(202));
+        assert_eq!(g.observe_session("key:42", 1030, 205, 300), Some(202));
     }
 
     #[test]
@@ -1956,13 +2112,17 @@ mod tests {
         let req = req_with(msgs, None);
         let n = req.messages.len(); // 7
 
-        // 旧 bug：prev_n 被短请求打成 1 → creation 横跨 msg[1..6]（5 条）。
-        let exploded = compute_structural_cache_usage(&req, 1.0, Some(1));
-        // 修复：高水位使 prev_n = n-2 = 5 → creation 只覆盖 msg[5..6]（1 条）。
-        let bounded = compute_structural_cache_usage(&req, 1.0, Some(n - 2));
+        let _ = n;
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        let one_msg = message_tokens(&msg("assistant", &body));
+        // 打小的 prev（如被短请求污染成很小）→ creation 横跨几乎整段历史（爆炸）。
+        let exploded = compute_structural_cache_usage(&req, 1.0, Some(one_msg));
+        // 高水位使 prev = cacheable − 一条 → creation 只覆盖本轮新增一条（有界）。
+        let bounded = compute_structural_cache_usage(&req, 1.0, Some(cacheable - one_msg));
         assert!(
             exploded.creation_est > bounded.creation_est * 3,
-            "打小的 prev_n 会让 creation 爆炸(exploded={} vs bounded={})",
+            "打小的 prev 会让 creation 爆炸(exploded={} vs bounded={})",
             exploded.creation_est,
             bounded.creation_est
         );
@@ -1972,13 +2132,13 @@ mod tests {
     fn governance_cold_resets_baseline_not_hwm() {
         // cold（超 TTL，缓存确已凉）：重置基线为本次条数，不保留旧高水位——前缀整段要重建。
         let g = MeterGovernance::new(1.0, 100);
-        assert_eq!(g.observe_session("key:9", 1000, 50), None); // 首次 cold，记 50
-        assert_eq!(g.observe_session("key:9", 1050, 52), Some(50), "TTL 内 warm");
+        assert_eq!(g.observe_session("key:9", 1000, 50, 100), None); // 首次 cold，记 50
+        assert_eq!(g.observe_session("key:9", 1050, 52, 100), Some(50), "TTL 内 warm");
         // 超 TTL → cold，基线重置为本次的 4（不因高水位 52 而保留）。
-        assert_eq!(g.observe_session("key:9", 1300, 4), None, "超 TTL 应 cold");
+        assert_eq!(g.observe_session("key:9", 1300, 4, 100), None, "超 TTL 应 cold");
         // 紧接着来 → warm，读到刚重置的 4（证明 cold 没保留旧高水位 52）。
         assert_eq!(
-            g.observe_session("key:9", 1310, 6),
+            g.observe_session("key:9", 1310, 6, 100),
             Some(4),
             "cold 后基线应是重置值 4,不是旧高水位 52"
         );
@@ -2002,17 +2162,21 @@ mod tests {
         );
         let est = |m: &Message| message_tokens(m);
         let burst: i32 = est(&req.messages[2]) + est(&req.messages[3]) + est(&req.messages[4]);
-        let u = compute_structural_cache_usage(&req, 1.0, Some(2));
+        // token 级：上轮已缓存前缀 prev = msg[0]+msg[1]（tool 循环前的状态）。本轮新沉淀 delta =
+        // msg[2..5] = burst（一轮补进多对消息）→ creation = burst，覆盖全部新增中间消息。
+        let prev = est(&req.messages[0]) + est(&req.messages[1]);
+        let u = compute_structural_cache_usage(&req, 1.0, Some(prev));
         assert_eq!(u.creation_est, burst, "creation 应覆盖上次见到后新增的全部中间消息");
         assert_eq!(u.input_est, est(&req.messages[5]), "input 仍是末条");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(creation > 0 && read > 0);
         assert_eq!(input + creation + read, u.prompt_total_est);
 
-        // 对比旧「倒数第二条」语义（prev_n = n-2 = 4）：creation 只一条，明显偏小。
-        let old = compute_structural_cache_usage(&req, 1.0, Some(req.messages.len() - 2));
+        // 对比：若上轮已缓存到只差最后一条 assistant（prev 更大）→ creation 只一条，明显偏小。
+        let prev_deep = prev + est(&req.messages[2]) + est(&req.messages[3]);
+        let old = compute_structural_cache_usage(&req, 1.0, Some(prev_deep));
         assert_eq!(old.creation_est, est(&req.messages[4]));
-        assert!(u.creation_est > old.creation_est * 2, "多消息 burst 下 C 比旧语义计入更多 creation");
+        assert!(u.creation_est > old.creation_est * 2, "多消息 burst 下计入更多 creation");
     }
 
     #[test]
@@ -2023,10 +2187,14 @@ mod tests {
             vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0, Some(3)); // prev_n == n
+        let cold = compute_structural_cache_usage(&req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        // prev == cacheable（整段前缀已缓存，纯重放，无新增沉淀）→ creation=0。
+        let u = compute_structural_cache_usage(&req, 1.0, Some(cacheable));
         assert_eq!(u.creation_est, 0, "无新增沉淀时 creation 为 0");
-        let u2 = compute_structural_cache_usage(&req, 1.0, Some(2)); // prev_n == n-1
-        assert_eq!(u2.creation_est, 0, "prev_n==n-1（末条即新增）→ 新增全是 input，creation=0");
+        // prev > cacheable（被污染的高水位）→ clamp 后仍 == cacheable → creation=0。
+        let u2 = compute_structural_cache_usage(&req, 1.0, Some(cacheable + 999));
+        assert_eq!(u2.creation_est, 0, "prev 超 cacheable → clamp → creation=0");
     }
 
     // ---- isolation_seed ----------------------------------------------------
@@ -2124,6 +2292,114 @@ mod tests {
         assert_eq!(isolation_seed(&req, 0), "sess:deadbeef");
     }
 
+    // ---- 目标缓存率 T：新语义端到端 -------------------------------------------
+
+    /// 冷轮显示 0%（缓存刚建、无得读），暖轮逐轮爬升、稳态逼近 T。
+    #[test]
+    fn target_rate_cold_zero_then_warm_ramps_to_t() {
+        let body = "lorem ipsum dolor sit amet ".repeat(30);
+        let req = req_with(
+            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            None,
+        );
+        let cold = compute_structural_cache_usage(&req, 0.9, None);
+        let total = cold.prompt_total_est;
+        let (_, _, r_cold) = cold.split_against_total(total);
+        assert_eq!(r_cold, 0, "冷轮 read=0 → 显示 0%（真实：缓存刚建）");
+
+        let cacheable = total - cold.input_est;
+        // 深暖轮（prev = 整段可缓存前缀）→ read = T×total，命中率逼近 T。
+        let deep = compute_structural_cache_usage(&req, 0.9, Some(cacheable));
+        let (_, _, r_deep) = deep.split_against_total(total);
+        let hit = r_deep as f64 / total as f64;
+        assert!((hit - 0.9).abs() < 0.05, "深暖轮命中率逼近 T=0.9，实得 {hit:.3}");
+    }
+
+    /// 生效 T 由入口按 hit_rate_max 夹紧（此处直接验证 split 对 hit_rate 的响应即 T 语义）。
+    /// 夹紧逻辑在 handler；这里锁 split 侧：hit_rate 越大 read 越多，且 read/total==hit_rate（深暖轮）。
+    #[test]
+    fn target_rate_read_equals_t_on_deep_warm() {
+        let u = |t: f64| DeltaCacheUsage {
+            input_est: 0,
+            prev_cached_est: 1000, // 深暖轮：整段前缀已缓存
+            prompt_total_est: 1000,
+            hit_rate: t,
+            ..DeltaCacheUsage::default()
+        };
+        for t in [0.5, 0.7, 0.9, 0.95] {
+            let (_, _, r) = u(t).split_against_total(1000);
+            assert_eq!(r, (1000.0 * t).round() as i32, "深暖轮 read == T×total（T={t}）");
+        }
+    }
+
+    /// 真实性闸门（破绽 A+B）：无 cache_control 断点 → 不合格；带断点且前缀 ≥1024 → 合格。
+    #[test]
+    fn cache_eligible_requires_control_and_min_prefix() {
+        // 大前缀但无 cache_control → 不合格（真实 Anthropic 不会凭空产生缓存）。
+        let big = "lorem ipsum dolor sit amet ".repeat(400); // 远超 1024 token
+        let no_cc = req_with(
+            vec![msg("user", &big), msg("assistant", &big), msg("user", "q")],
+            None,
+        );
+        assert!(!request_has_cache_control(&no_cc), "无断点");
+        assert!(!cache_eligible(&no_cc), "无 cache_control → 不合格（全 input）");
+
+        // 带 cache_control（system 断点）且前缀够大 → 合格。
+        let cached = req_with(
+            vec![msg("user", &big), msg("assistant", &big), msg("user", "q")],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(200),
+                cache_control: Some(super::super::types::CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+        );
+        assert!(request_has_cache_control(&cached), "system 带断点");
+        assert!(cache_eligible(&cached), "带断点 + 大前缀 → 合格");
+
+        // 带 cache_control 但可缓存前缀太小（< 1024）→ 不合格（真实 Anthropic 最小门槛）。
+        let tiny = req_with(
+            vec![msg("user", "hi"), msg("assistant", "yo"), msg("user", "q")],
+            Some(vec![SystemMessage {
+                text: "short".to_string(),
+                cache_control: Some(super::super::types::CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+        );
+        assert!(request_has_cache_control(&tiny), "有断点");
+        assert!(!cache_eligible(&tiny), "前缀 < 1024 → 不合格（全 input）");
+    }
+
+    /// cache_control 断点在 message content block 里（JSON 形态）也能被检测到。
+    #[test]
+    fn cache_control_detected_in_message_content() {
+        let req = req_with(
+            vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "text", "text": "x",
+                    "cache_control": { "type": "ephemeral" }
+                }]),
+            }],
+            None,
+        );
+        assert!(request_has_cache_control(&req), "message content block 的断点应被检测");
+    }
+
+    /// hit_rate_max 夹紧（MeterGovernance 侧的 setter/getter 语义）。
+    #[test]
+    fn hit_rate_max_getter_setter_clamps() {
+        let g = MeterGovernance::new_with_max(0.9, 300, 0.95);
+        assert!((g.hit_rate_max() - 0.95).abs() < 1e-9);
+        g.set_hit_rate_max(1.5); // 超范围 → clamp 到 1.0
+        assert!((g.hit_rate_max() - 1.0).abs() < 1e-9, "上限 clamp 到 1.0");
+        g.set_hit_rate_max(-0.2); // 负 → clamp 到 0
+        assert!(g.hit_rate_max().abs() < 1e-9, "下限 clamp 到 0");
+    }
+
     // ---- creation 塌陷复现（seed 碰撞 + 高水位）--------------------------------
 
     /// 复现 216 实测病象：同一 key 下多个**不同对话**共用一条 `key:N` seed（客户端不带
@@ -2139,46 +2415,47 @@ mod tests {
         let seed = "key:0"; // 无 _session_ 时的 fallback seed
         let g = MeterGovernance::new(1.0, 3600);
 
-        // 对话 A：一个很长的 agent 对话，把高水位顶到 40 条。
-        assert_eq!(g.observe_session(seed, 1_000, 40), None, "A 首次出现 → cold");
-        // A 继续，warm，返回高水位 40。
-        assert_eq!(g.observe_session(seed, 1_010, 42), Some(40), "A 第二轮 warm，prev_n=40");
+        // 对话 A：一个很长的 agent 对话，把 token 高水位顶到很大（远超 B 的可缓存量）。
+        assert_eq!(g.observe_session(seed, 1_000, 100_000, 3600), None, "A 首次出现 → cold");
+        // A 继续，warm，返回高水位 100_000。
+        assert_eq!(
+            g.observe_session(seed, 1_010, 100_000, 3600),
+            Some(100_000),
+            "A 第二轮 warm，prev=100000 token"
+        );
 
-        // 对话 B：一个**全新的短对话**，但共用同一 key seed。它的第 2 轮只有 4 条消息，
-        // 本该把「上次后新增的中间消息」计入 creation。但 observe_session 返回的是**高水位 40**，
-        // 远大于 B 的消息数 4。
-        let prev_n_for_b = g
-            .observe_session(seed, 1_020, 4)
-            .expect("同 key 且 TTL 内 → warm");
-        assert_eq!(prev_n_for_b, 42, "B 拿到的是被 A 顶高的水位，而非 B 自己的历史");
-
-        // 用这个被污染的 prev_n 计算 B 的一轮真实对话（4 条：u,a,u,a → 末条为 input，
-        // 中间的 a(索引1)、u(索引2) 本应计 creation）。
+        // 对话 B：一个**全新的短对话**，但共用同一 key seed。它本该把新增内容计入 creation，
+        // 但 observe_session 返回 A 顶高的 token 水位 100_000，远超 B 自己的可缓存量。
         let big = "x".repeat(4000);
         let b_req = req_with(
             vec![
-                msg("user", &big),      // 0
-                msg("assistant", &big), // 1  ← 本应计 creation
-                msg("user", &big),      // 2  ← 本应计 creation
-                msg("assistant", &big), // 3  ← input（末条）
+                msg("user", &big),      // 0  ← B 的历史前缀
+                msg("assistant", &big), // 1  ← 本应计 creation（B 新增沉淀）
+                msg("user", &big),      // 2  ← input（末条）
             ],
             None,
         );
-        let n = b_req.messages.len(); // 4
-        assert!(prev_n_for_b >= n - 1, "被污染的 prev_n({}) >= n-1({})", prev_n_for_b, n - 1);
+        let prev_for_b = g
+            .observe_session(seed, 1_020, 500, 3600)
+            .expect("同 key 且 TTL 内 → warm") as i32;
+        assert_eq!(prev_for_b, 100_000, "B 拿到的是被 A 顶高的 token 水位，而非自己的历史");
 
-        let usage = compute_structural_cache_usage(&b_req, 1.0, Some(prev_n_for_b));
-        // BUG：creation 区间 = msg_est[min(42, 3) .. 3] = msg_est[3..3] = 空 → 0。
+        // token 级塌陷：prev 被 clamp 到 B 的 cacheable → creation = cacheable − cacheable = 0。
+        let cold = compute_structural_cache_usage(&b_req, 1.0, None);
+        let cacheable = cold.prompt_total_est - cold.input_est;
+        assert!(prev_for_b >= cacheable, "被污染 prev({}) >= B 的 cacheable({})", prev_for_b, cacheable);
+        let usage = compute_structural_cache_usage(&b_req, 1.0, Some(prev_for_b));
         assert_eq!(
             usage.creation_est, 0,
-            "复现塌陷：B 的合法新增(msg 1,2)被 A 的高水位吞掉 → creation=0"
+            "复现塌陷：B 的合法新增被 A 的高水位吞掉 → creation=0（偏向便宜桶，经济安全）"
         );
 
-        // 对照：若 B 用自己真实的上轮条数(2)计算，creation 应覆盖 msg[2]（非零）。
-        let correct = compute_structural_cache_usage(&b_req, 1.0, Some(2));
+        // 对照：若 B 用自己真实的上轮前缀（仅首条 user 的 token）计算，creation 覆盖新增（非零）。
+        let true_prev = message_tokens(&b_req.messages[0]);
+        let correct = compute_structural_cache_usage(&b_req, 1.0, Some(true_prev));
         assert!(
             correct.creation_est > 0,
-            "正确隔离下 B 的新增应计入 creation（当前实现因 seed 碰撞算成 0）"
+            "正确隔离下 B 的新增应计入 creation（seed 碰撞时被算成 0）"
         );
     }
 }

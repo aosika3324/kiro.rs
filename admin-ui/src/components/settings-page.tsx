@@ -170,6 +170,7 @@ function CacheQuotaSection() {
   const [ttl, setTtl] = useState('')
   const [ratio, setRatio] = useState('')
   const [meterTtl, setMeterTtl] = useState('')
+  const [hitRateMax, setHitRateMax] = useState('')
 
   const save = (patch: Record<string, unknown>, ok: string) =>
     mutate(patch, {
@@ -226,11 +227,11 @@ function CacheQuotaSection() {
       </div>
 
       <div>
-        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · read 留存 R（当前 {cfg?.cacheReadRatio ?? '—'}）</div>
+        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · 全局默认目标缓存率 T（当前 {cfg?.cacheReadRatio ?? '—'}）</div>
         <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
-          合成给下游的 token 计量旋钮（不缓存真实响应）。保留 read×R、其余按未命中推回 input，不触碰 creation。1=给足折扣，0=不给。可被各 Key 覆盖。
+          合成给下游的 token 计量旋钮（不缓存真实响应）。面板 cache_read/总prompt 逼近 T。T 越低 → 越多旧前缀挪 creation(1.25x)：命中率降、利润升。可被各 Key 的目标缓存率覆盖。生效值按下方命中率上限夹紧。
         </div>
-        <form onSubmit={num(ratio, 0, 1, parseFloat, 'cacheReadRatio', '缓存命中率已更新', () => setRatio(''))} className="flex items-center gap-1.5">
+        <form onSubmit={num(ratio, 0, 1, parseFloat, 'cacheReadRatio', '目标缓存率已更新', () => setRatio(''))} className="flex items-center gap-1.5">
           <Input type="number" min={0} max={1} step={0.05} placeholder="0 ~ 1" value={ratio} onChange={(e) => setRatio(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !ratio.trim()}>保存</Button>
         </form>
@@ -243,6 +244,16 @@ function CacheQuotaSection() {
         <form onSubmit={num(meterTtl, 1, 86400, (s) => parseInt(s, 10), 'cacheMeterTtlSecs', '缓存热度 TTL 已更新', () => setMeterTtl(''))} className="flex items-center gap-1.5">
           <Input type="number" min={1} max={86400} placeholder="秒" value={meterTtl} onChange={(e) => setMeterTtl(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
+        </form>
+      </div>
+      <div>
+        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · 目标缓存率上限（当前 {cfg?.cacheHitRateMax ?? '—'}）</div>
+        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
+          生效目标率（全局默认或各 Key 覆盖）按此上限夹紧，防恒 ~100% 命中的检测特征。默认 0.95，保留自然抖动余量。范围 0~1。
+        </div>
+        <form onSubmit={num(hitRateMax, 0, 1, parseFloat, 'cacheHitRateMax', '目标缓存率上限已更新', () => setHitRateMax(''))} className="flex items-center gap-1.5">
+          <Input type="number" min={0} max={1} step={0.05} placeholder="0 ~ 1" value={hitRateMax} onChange={(e) => setHitRateMax(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+          <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !hitRateMax.trim()}>保存</Button>
         </form>
       </div>
     </SettingSection>

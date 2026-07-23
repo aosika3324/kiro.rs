@@ -38,8 +38,12 @@ pub struct KeyContext {
     /// 响应缓存 per-key 覆盖（None = 跟随全局配置）。
     pub response_cache_enabled: Option<bool>,
     pub response_cache_ttl_secs: Option<u32>,
-    /// 缓存计量 read 留存阻尼 R per-key 覆盖（None = 跟随全局 `MeterGovernance`）。
+    /// 缓存计量 read 留存阻尼 R per-key 覆盖（**已废弃语义**，被 `cache_hit_rate` 取代，保留兼容）。
     pub cache_read_ratio: Option<f64>,
+    /// 缓存计量**目标缓存率 T** per-key 覆盖（None = 跟随全局默认，按全局 `cacheHitRateMax` 夹紧）。
+    pub cache_hit_rate: Option<f64>,
+    /// 缓存热度 TTL per-key 覆盖（秒；None = 跟随全局 `cacheMeterTtlSecs`）。
+    pub cache_ttl_secs: Option<u64>,
     /// 缓存计量 multiplier 护栏上限 per-key 覆盖（None = 跟随默认 1.25）。
     pub cache_multiplier_cap: Option<f64>,
     /// Anthropic 标准计费模式（per-key，默认关）。开启后 usage 走真实互斥三桶口径（不超报），
@@ -204,6 +208,8 @@ pub async fn auth_middleware(
             let fast_mode = mgr.fast_mode_of(id);
             let (response_cache_enabled, response_cache_ttl_secs) = mgr.response_cache_cfg_of(id);
             let cache_read_ratio = mgr.cache_read_ratio_of(id);
+            let cache_hit_rate = mgr.cache_hit_rate_of(id);
+            let cache_ttl_secs = mgr.cache_ttl_secs_of(id);
             let cache_multiplier_cap = mgr.cache_multiplier_cap_of(id);
             let anthropic_billing_mode = mgr.anthropic_billing_mode_of(id);
             let cache_creation_ratio = mgr.cache_creation_ratio_of(id);
@@ -219,6 +225,8 @@ pub async fn auth_middleware(
                 response_cache_ttl_secs,
                 cache_multiplier_cap,
                 cache_read_ratio,
+                cache_hit_rate,
+                cache_ttl_secs,
                 anthropic_billing_mode,
                 cache_creation_ratio,
                 key_source: TraceKeySource::ClientKey,

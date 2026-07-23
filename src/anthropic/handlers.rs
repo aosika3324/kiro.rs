@@ -497,29 +497,63 @@ pub(crate) fn compute_cache_usage_for_key(
         };
     }
 
-    // ---- 默认检测安全支路（delta，billing_mode=false）：完全不变 ----------------------------
-    let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
+    // ---- 真实性闸门（破绽 A + B）：不合格 → 全 input，不产生 cache 两桶 --------------------------
+    // 真实 Anthropic 仅在①请求带 cache_control 断点、且②可缓存前缀 ≥ 最小门槛(1024)时才计缓存。
+    // 不满足却上报缓存 → 客户端 diff 请求即可识破转卖。此处短路：默认全 input 的 DeltaCacheUsage
+    // （prompt_total_est=0 触发 split 全计 input），且**不触碰 observe_session**（非缓存请求不污染
+    // 会话高水位）。
+    if !super::cache_metering::cache_eligible(payload) {
+        return super::cache_metering::CacheUsage::default();
+    }
+
+    // ---- 默认检测安全支路（delta，billing_mode=false）：目标缓存率 T 口径 ----------------------
+    // 生效目标率 T：per-key `cache_hit_rate`（含旧 `cache_read_ratio` 兼容）覆盖优先，否则全局默认；
+    // 再按全局 `cacheHitRateMax` 夹紧（防恒 ~100% 命中的检测特征）。无 governance 时用全局配置值。
+    let hit_rate_max = state
+        .meter_governance
+        .as_ref()
+        .map(|g| g.hit_rate_max())
+        .unwrap_or(super::cache_metering::DEFAULT_CACHE_HIT_RATE_MAX);
+    let target_hit_rate = key_ctx
+        .cache_hit_rate
+        .unwrap_or_else(|| {
+            state
+                .meter_governance
+                .as_ref()
+                .map(|g| g.read_ratio())
+                .unwrap_or(0.0)
+        })
+        .clamp(0.0, hit_rate_max);
+    // 生效缓存热度 TTL：per-key `cache_ttl_secs` 覆盖优先，否则全局 governance 值。
+    let eff_ttl = key_ctx.cache_ttl_secs.unwrap_or_else(|| {
         state
             .meter_governance
             .as_ref()
-            .map(|g| g.read_ratio())
-            .unwrap_or(0.0)
+            .map(|g| g.ttl_secs())
+            .unwrap_or(300)
     });
-    // 会话热度：首次出现 / 超 TTL（缓存凉了）→ cold(None)，否则返回上次消息条数。无 governance
-    // 时退化为「无上轮记录」语义——传 Some(n-1) 等价旧的恒 warm + 倒数第二条 creation。
-    let prev_msg_count = match state.meter_governance.as_ref() {
+    // 会话热度（token 级）：首次出现 / 超 TTL（缓存凉了）→ cold(None)；否则返回上轮已缓存前缀
+    // token 高水位（warm，可作本轮 read）。无 governance 时退化为「无上轮记录」→ 传 Some(cacheable)
+    // 等价旧的恒 warm、整段可读。
+    let cacheable_est = super::cache_metering::estimate_cacheable_tokens(payload).max(0) as u32;
+    let prev_cached: Option<i32> = match state.meter_governance.as_ref() {
         Some(g) => {
             let session = super::cache_metering::isolation_seed(payload, key_ctx.key_id);
             g.observe_session(
                 &session,
                 super::cache_metering::now_unix_secs(),
-                payload.messages.len(),
+                cacheable_est,
+                eff_ttl,
             )
+            .map(|v| v as i32)
         }
-        None => Some(payload.messages.len().saturating_sub(1)),
+        None => Some(cacheable_est as i32),
     };
-    let mut usage =
-        super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count);
+    let mut usage = super::cache_metering::compute_structural_cache_usage(
+        payload,
+        target_hit_rate,
+        prev_cached,
+    );
     // multiplier 护栏上限（C，仅默认模式生效）：per-key 覆盖优先，否则默认 1.25。
     // weighted/baseline 超此值时 split_against_total 把 input→read 压回（不碰 creation）。
     usage.multiplier_cap = key_ctx

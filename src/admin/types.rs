@@ -519,6 +519,9 @@ pub struct RuntimeGovernanceConfigResponse {
     /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
     /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
     pub cache_meter_ttl_secs: u64,
+    /// 目标缓存率 T 的全局上限 ∈ [0,1]（默认 0.95）：生效目标率（per-key `cacheHitRate` 或全局
+    /// `cacheReadRatio`）按此夹紧，防恒 ~100% 命中（检测特征）。
+    pub cache_hit_rate_max: f64,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -540,6 +543,9 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub cache_meter_ttl_secs: Option<u64>,
+    /// 目标缓存率上限，范围 0..=1；缺省不修改。
+    #[serde(default)]
+    pub cache_hit_rate_max: Option<f64>,
 }
 
 /// 端点路由配置响应：首选端点 + fallback 开关 + 可选端点清单。
@@ -905,6 +911,12 @@ pub struct ClientKeyItem {
     /// 标准模式 creation 占比覆盖 ∈ [0,1]（None = 跟随默认 3%）。定 creation 形状。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_ratio: Option<f64>,
+    /// 目标缓存率 T 覆盖 ∈ [0,1]（None = 跟随全局默认）。面板 `cache_read/总prompt` 逼近此值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+    /// 缓存热度 TTL 覆盖（秒；None = 跟随全局）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
@@ -988,6 +1000,14 @@ pub struct UpdateClientKeyRequest {
     /// 字段缺省=不变更；`null`=复位跟随默认 3%；数值=强制（clamp [0,1]）。
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub cache_creation_ratio: Option<Option<f64>>,
+    /// 目标缓存率 T 覆盖更新。三态语义（double-option）：
+    /// 字段缺省=不变更；`null`=清除覆盖跟随全局默认；数值=强制该 Key 的目标率（clamp [0,1]）。
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_hit_rate: Option<Option<f64>>,
+    /// 缓存热度 TTL 覆盖更新（秒）。三态语义（double-option）：
+    /// 字段缺省=不变更；`null` 或 0=清除覆盖跟随全局；数值=强制该 Key 的 TTL。
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_ttl_secs: Option<Option<u64>>,
     /// 快速模式开关更新（字段缺省=不变更；true/false=开/关）。
     #[serde(default)]
     pub fast_mode: Option<bool>,

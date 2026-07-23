@@ -183,6 +183,8 @@ mod tests {
             response_cache_enabled: None,
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
+            cache_hit_rate: None,
+            cache_ttl_secs: None,
             cache_multiplier_cap: None,
             anthropic_billing_mode: false,
             cache_creation_ratio: None,

@@ -2322,6 +2322,11 @@ impl AdminService {
                 .as_ref()
                 .map(|g| g.ttl_secs())
                 .unwrap_or(300),
+            cache_hit_rate_max: self
+                .meter_governance
+                .as_ref()
+                .map(|g| g.hit_rate_max())
+                .unwrap_or(crate::anthropic::cache_metering::DEFAULT_CACHE_HIT_RATE_MAX),
         }
     }
 
@@ -2336,9 +2341,10 @@ impl AdminService {
             && req.response_cache_ttl_secs.is_none()
             && req.cache_read_ratio.is_none()
             && req.cache_meter_ttl_secs.is_none()
+            && req.cache_hit_rate_max.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs / cacheHitRateMax 一个字段"
                     .to_string(),
             ));
         }
@@ -2375,6 +2381,14 @@ impl AdminService {
                 )));
             }
         }
+        if let Some(m) = req.cache_hit_rate_max {
+            if !(0.0..=1.0).contains(&m) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheHitRateMax 必须在 0..=1 内: {}",
+                    m
+                )));
+            }
+        }
 
         // 先改运行时值
         if let Some(t) = req.quota_disable_threshold {
@@ -2404,6 +2418,11 @@ impl AdminService {
                 g.set_ttl_secs(ttl);
             }
         }
+        if let Some(m) = req.cache_hit_rate_max {
+            if let Some(g) = &self.meter_governance {
+                g.set_hit_rate_max(m);
+            }
+        }
 
         // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
         self.update_config_file(|c| {
@@ -2421,6 +2440,9 @@ impl AdminService {
             }
             if let Some(ttl) = req.cache_meter_ttl_secs {
                 c.cache_meter_ttl_secs = ttl;
+            }
+            if let Some(m) = req.cache_hit_rate_max {
+                c.cache_hit_rate_max = m;
             }
         });
 

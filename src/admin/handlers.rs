@@ -1060,6 +1060,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         cache_multiplier_cap: k.cache_multiplier_cap,
         anthropic_billing_mode: k.anthropic_billing_mode,
         cache_creation_ratio: k.cache_creation_ratio,
+        cache_hit_rate: k.cache_hit_rate,
+        cache_ttl_secs: k.cache_ttl_secs,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -1175,6 +1177,8 @@ pub async fn update_client_key(
         payload.cache_multiplier_cap,
         payload.anthropic_billing_mode,
         payload.cache_creation_ratio,
+        payload.cache_hit_rate,
+        payload.cache_ttl_secs,
         payload.fast_mode,
     ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()

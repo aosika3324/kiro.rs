@@ -469,10 +469,12 @@ export interface RuntimeGovernanceConfig {
   quotaDisableThreshold: number
   responseCacheEnabled: boolean
   responseCacheTtlSecs: number
-  /** 缓存计量 read 留存阻尼 R ∈ [0,1]：read 桶保留 read×R，其余推回 input（不触碰 creation）。 */
+  /** 全局默认目标缓存率 T ∈ [0,1]（旧称 read 留存 R）：面板 cache_read/总prompt 逼近此值，被 per-key cacheHitRate 覆盖。 */
   cacheReadRatio: number
   /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
   cacheMeterTtlSecs: number
+  /** 目标缓存率 T 的全局上限 ∈ [0,1]（默认 0.95）：生效目标率按此夹紧，防恒 ~100% 命中的检测特征。 */
+  cacheHitRateMax: number
 }
 
 // 获取运行时治理配置

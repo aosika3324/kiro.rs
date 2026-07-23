@@ -415,8 +415,12 @@ export interface ClientKeyItem {
   responseCacheEnabled?: boolean
   /** 响应缓存 TTL 覆盖（秒；undefined = 跟随全局默认） */
   responseCacheTtlSecs?: number
-  /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
+  /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（已废弃语义，被 cacheHitRate 取代，保留兼容） */
   cacheReadRatio?: number
+  /** 目标缓存率 T 覆盖 ∈ [0,1]（undefined = 跟随全局默认）。面板 cache_read/总prompt 逼近此值 */
+  cacheHitRate?: number
+  /** 缓存热度 TTL 覆盖（秒；undefined = 跟随全局 cacheMeterTtlSecs） */
+  cacheTtlSecs?: number
   /** 缓存 multiplier 护栏上限覆盖（undefined = 跟随默认 1.25） */
   cacheMultiplierCap?: number
   /** Anthropic 标准计费模式（默认 false）：真实互斥三桶口径（不超报），仅不施加护栏；利润来自 R 挪桶 */
@@ -464,8 +468,12 @@ export interface UpdateClientKeyRequest {
   responseCacheEnabled?: boolean | null
   /** 响应缓存 TTL 覆盖（秒；省略=不变更；0=复位为跟随全局） */
   responseCacheTtlSecs?: number
-  /** 缓存 read 留存阻尼 R 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
+  /** 缓存 read 留存阻尼 R 覆盖更新（已废弃语义，保留兼容；省略=不变更；null=复位；数值=强制） */
   cacheReadRatio?: number | null
+  /** 目标缓存率 T 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
+  cacheHitRate?: number | null
+  /** 缓存热度 TTL 覆盖更新（秒；省略=不变更；null 或 0=复位为跟随全局；数值=强制） */
+  cacheTtlSecs?: number | null
   /** 缓存 multiplier 护栏上限覆盖更新（省略=不变更；null=复位跟随默认 1.25；数值=强制 [0.1,1.25]） */
   cacheMultiplierCap?: number | null
   /** Anthropic 标准计费模式开关更新（省略=不变更；true/false=开/关） */

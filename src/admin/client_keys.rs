@@ -88,6 +88,16 @@ pub struct ClientKey {
     /// creation_ratio`，定"每轮写多少缓存"的形状;与 R 正交,二者都不破坏 sum==total。老数据无此字段时 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_ratio: Option<f64>,
+    /// **目标缓存率 T** per-key 覆盖 ∈ [0,1]（None = 跟随全局默认，即 `cacheReadRatio`）。
+    /// 面板 `cache_read/总prompt` 逼近此值；生效值在入口按全局 `cacheHitRateMax` 夹紧。
+    /// 取代旧 `cache_read_ratio`（R 留存）语义——读取优先级 `cache_hit_rate ?? cache_read_ratio
+    /// ?? 全局`（见 [`ClientKeyStore::cache_hit_rate_of`]）。老数据无此字段时 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+    /// **缓存热度 TTL** per-key 覆盖（秒；None 或 0 = 跟随全局 `cacheMeterTtlSecs`）。距上次请求
+    /// 超此值 → 本轮转 cold（整段前缀按 creation 重写、read=0）。老数据无此字段时 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_secs: Option<u64>,
     /// **已废弃**（标准模式改互斥口径后不再超报，此字段被忽略）。保留仅为老配置反序列化兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_inflation: Option<f64>,
@@ -265,6 +275,8 @@ impl ClientKeyManager {
             cache_multiplier_cap: None,
             anthropic_billing_mode: false,
             cache_creation_ratio: None,
+            cache_hit_rate: None,
+            cache_ttl_secs: None,
             cache_read_inflation: None,
             anthropic_input_tokens: None,
             total_credits: 0.0,
@@ -321,6 +333,8 @@ impl ClientKeyManager {
                     cache_multiplier_cap: None,
                     anthropic_billing_mode: false,
                     cache_creation_ratio: None,
+                    cache_hit_rate: None,
+                    cache_ttl_secs: None,
                     cache_read_inflation: None,
                     anthropic_input_tokens: None,
                     total_credits: 0.0,
@@ -412,6 +426,8 @@ impl ClientKeyManager {
         cache_multiplier_cap: Option<Option<f64>>,
         anthropic_billing_mode: Option<bool>,
         cache_creation_ratio: Option<Option<f64>>,
+        cache_hit_rate: Option<Option<f64>>,
+        cache_ttl_secs: Option<Option<u64>>,
         fast_mode: Option<bool>,
     ) -> bool {
         let mut inner = self.inner.write();
@@ -465,6 +481,14 @@ impl ClientKeyManager {
                 if let Some(v) = cache_creation_ratio {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随默认 3%
                     e.cache_creation_ratio = v.map(|r| r.clamp(0.0, 1.0));
+                }
+                if let Some(v) = cache_hit_rate {
+                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局默认（生效时再按 max 夹紧）
+                    e.cache_hit_rate = v.map(|r| r.clamp(0.0, 1.0));
+                }
+                if let Some(v) = cache_ttl_secs {
+                    // 0 视为"清除覆盖、跟随全局"
+                    e.cache_ttl_secs = v.filter(|t| *t > 0);
                 }
                 if let Some(v) = fast_mode {
                     e.fast_mode = v;
@@ -520,12 +544,33 @@ impl ClientKeyManager {
     }
 
     /// 返回指定 Key 的缓存命中率 R 覆盖（None = 跟随全局；Key 不存在时也返回 None）。
+    /// **已废弃语义**：R 留存被 [`Self::cache_hit_rate_of`] 目标率取代，保留供兼容回退。
     pub fn cache_read_ratio_of(&self, id: u64) -> Option<f64> {
         self.inner
             .read()
             .entries
             .get(&id)
             .and_then(|e| e.cache_read_ratio)
+    }
+
+    /// 返回指定 Key 生效的**目标缓存率 T** 覆盖（None = 跟随全局默认）。
+    /// 优先级：`cache_hit_rate ?? cache_read_ratio`（旧字段兼容）；Key 不存在时 None。
+    pub fn cache_hit_rate_of(&self, id: u64) -> Option<f64> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.cache_hit_rate.or(e.cache_read_ratio))
+    }
+
+    /// 返回指定 Key 的缓存热度 TTL 覆盖（秒；None 或 0 = 跟随全局；Key 不存在时 None）。
+    pub fn cache_ttl_secs_of(&self, id: u64) -> Option<u64> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.cache_ttl_secs)
+            .filter(|v| *v > 0)
     }
 
     /// 返回指定 Key 的 multiplier 护栏上限覆盖（None = 跟随默认 1.25；Key 不存在时也返回 None）。
@@ -830,6 +875,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
         assert!(mgr.cache_enabled_of(entry.id));
     }
@@ -856,12 +903,16 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(true),
         ));
         assert!(mgr.fast_mode_of(entry.id));
         // 关回去
         assert!(mgr.update_meta(
             entry.id,
+            None,
+            None,
             None,
             None,
             None,
@@ -905,6 +956,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
         // ttl=0 → 清除 ttl 覆盖（跟随全局）
@@ -924,6 +977,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
     }
@@ -933,6 +988,45 @@ mod tests {
         assert_eq!(mask_client_key("sk-abcdefghijklmnop"), "sk-abcde...mnop");
         assert_eq!(mask_client_key("short"), "short");
         assert_eq!(mask_client_key("密钥🔐测试abcdefgh"), "密钥🔐测试abc...efgh");
+    }
+
+    #[test]
+    fn cache_hit_rate_priority_and_compat() {
+        // 目标缓存率 T 覆盖优先级：cache_hit_rate ?? cache_read_ratio（旧字段兼容）?? 全局(None)。
+        let mgr = ClientKeyManager::new();
+        let e = mgr.create("k".into(), None, None, false, (false, false, false));
+        // 默认都没设 → None（跟随全局）。
+        assert_eq!(mgr.cache_hit_rate_of(e.id), None, "未设 → 跟随全局");
+        assert_eq!(mgr.cache_ttl_secs_of(e.id), None);
+
+        // 只设旧 cache_read_ratio（兼容路径）→ cache_hit_rate_of 回退读它。
+        let ok = mgr.update_meta(
+            e.id, None, None, None, None, None, None, None, None, None,
+            Some(Some(0.75)), // cache_read_ratio
+            None, None, None, None, None, None,
+        );
+        assert!(ok);
+        assert_eq!(mgr.cache_hit_rate_of(e.id), Some(0.75), "无 cache_hit_rate 时回退旧 cache_read_ratio");
+
+        // 设新 cache_hit_rate → 覆盖旧字段（优先）。
+        mgr.update_meta(
+            e.id, None, None, None, None, None, None, None, None, None,
+            None, None, None, None,
+            Some(Some(0.9)), // cache_hit_rate
+            Some(Some(120)), // cache_ttl_secs
+            None,
+        );
+        assert_eq!(mgr.cache_hit_rate_of(e.id), Some(0.9), "cache_hit_rate 优先于 cache_read_ratio");
+        assert_eq!(mgr.cache_ttl_secs_of(e.id), Some(120));
+
+        // cache_ttl_secs=0 → 视为清除、跟随全局（cache_ttl_secs_of 过滤掉 0）。
+        mgr.update_meta(
+            e.id, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
+            Some(Some(0)),
+            None,
+        );
+        assert_eq!(mgr.cache_ttl_secs_of(e.id), None, "ttl=0 → 跟随全局");
     }
 
     #[test]
@@ -987,6 +1081,8 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
+            None,
+            None,
             None,
             None,
             None,
