@@ -327,6 +327,16 @@ pub struct MeterGovernance {
     read_ratio_bits: AtomicU64,
     /// 缓存热度 TTL（秒，原子）。距某会话上次请求超过此值即判 cold（缓存已凉）。
     ttl_secs: AtomicU64,
+    /// 下游输入地板开关（全局）：最终上报 input==0 时是否替换为地板值。见 [`Self::resolve_input_floor`]。
+    input_floor_enabled: std::sync::atomic::AtomicBool,
+    /// 地板随机模式开关：true = 在 [min,max] 内随机取，false = 固定用 `input_floor_value`。
+    input_floor_random: std::sync::atomic::AtomicBool,
+    /// 固定模式地板值（clamp `>=1`）。
+    input_floor_value: std::sync::atomic::AtomicI32,
+    /// 随机模式地板下限（clamp `>=1`）。
+    input_floor_min: std::sync::atomic::AtomicI32,
+    /// 随机模式地板上限（clamp `>=1`）。
+    input_floor_max: std::sync::atomic::AtomicI32,
     /// 会话热度表：`isolation_seed → (上次请求 unix 秒, 上次请求的 messages 条数)`。
     last_seen: parking_lot::Mutex<std::collections::HashMap<String, (i64, usize)>>,
 }
@@ -336,12 +346,66 @@ pub struct MeterGovernance {
 const LAST_SEEN_SWEEP_THRESHOLD: usize = 4096;
 
 impl MeterGovernance {
-    /// 用初始 R + TTL 构造（R clamp 到 [0,1]）。
+    /// 用初始 R + TTL 构造（R clamp 到 [0,1]）。输入地板旋钮取安全默认（关，固定值 1）；
+    /// 实际初值由 [`Self::set_input_floor`] 从配置注入（见 main.rs 构造）。
     pub fn new(read_ratio: f64, ttl_secs: u64) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicI32};
         Self {
             read_ratio_bits: AtomicU64::new(read_ratio.clamp(0.0, 1.0).to_bits()),
             ttl_secs: AtomicU64::new(ttl_secs),
+            input_floor_enabled: AtomicBool::new(true),
+            input_floor_random: AtomicBool::new(false),
+            input_floor_value: AtomicI32::new(1),
+            input_floor_min: AtomicI32::new(1),
+            input_floor_max: AtomicI32::new(1),
             last_seen: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 设置下游输入地板全部旋钮（运行时立即对后续请求生效）。
+    /// `value`/`min`/`max` clamp 到 `>=1`；`min > max` 时互换。
+    pub fn set_input_floor(&self, enabled: bool, random: bool, value: i32, min: i32, max: i32) {
+        let value = value.max(1);
+        let mut lo = min.max(1);
+        let mut hi = max.max(1);
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        self.input_floor_enabled.store(enabled, Ordering::Relaxed);
+        self.input_floor_random.store(random, Ordering::Relaxed);
+        self.input_floor_value.store(value, Ordering::Relaxed);
+        self.input_floor_min.store(lo, Ordering::Relaxed);
+        self.input_floor_max.store(hi, Ordering::Relaxed);
+    }
+
+    /// 当前地板配置快照：`(enabled, random, value, min, max)`。供 Admin API 回读。
+    pub fn input_floor_config(&self) -> (bool, bool, i32, i32, i32) {
+        (
+            self.input_floor_enabled.load(Ordering::Relaxed),
+            self.input_floor_random.load(Ordering::Relaxed),
+            self.input_floor_value.load(Ordering::Relaxed),
+            self.input_floor_min.load(Ordering::Relaxed),
+            self.input_floor_max.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 解析本请求生效的地板值（每请求调一次，结果一次请求内固定，避免随机模式下同一响应
+    /// 多次 `resolved_usage` 抖动）。关 → 返回 0（[`apply_input_floor`] 视为不兜底）；
+    /// 固定 → `value`；随机 → `[min,max]` 内均匀取一次。
+    pub fn resolve_input_floor(&self) -> i32 {
+        if !self.input_floor_enabled.load(Ordering::Relaxed) {
+            return 0;
+        }
+        if self.input_floor_random.load(Ordering::Relaxed) {
+            let lo = self.input_floor_min.load(Ordering::Relaxed).max(1);
+            let hi = self.input_floor_max.load(Ordering::Relaxed).max(lo);
+            if lo == hi {
+                lo
+            } else {
+                fastrand::i32(lo..=hi)
+            }
+        } else {
+            self.input_floor_value.load(Ordering::Relaxed).max(1)
         }
     }
 
@@ -405,6 +469,19 @@ impl MeterGovernance {
 
 /// `Arc<MeterGovernance>` 别名
 pub type SharedMeterGovernance = Arc<MeterGovernance>;
+
+/// 下游输入地板：最终上报口径的 `input` 若为 0 且地板值 `floor > 0`，替换为 `floor`；
+/// 否则原样返回。**只作用于 input==0 的边界兜底**（>0 一律不动），且只改 input——
+/// creation/read/output 由调用方另行传递、绝不受此函数影响。
+///
+/// `floor` 通常来自 [`MeterGovernance::resolve_input_floor`]（关闭时为 0 → 本函数不兜底）。
+pub fn apply_input_floor(input: i32, floor: i32) -> i32 {
+    if floor > 0 && input == 0 {
+        floor
+    } else {
+        input
+    }
+}
 
 /// 当前 unix 秒（i64）。用于会话热度判定的时间基准。
 pub fn now_unix_secs() -> i64 {
@@ -2795,5 +2872,63 @@ mod cch_tests {
         let req5m = req_with_messages(vec![msg_with_cc("user", "hi", false)]);
         let u5 = cch_compute_cache_usage(&CchCacheMeter::new(None), &req5m, 1);
         assert!(!u5.creation_is_1h, "无 1h 标记默认 5m");
+    }
+
+    // ---- 下游输入地板（apply_input_floor / resolve_input_floor）--------------------
+
+    #[test]
+    fn floor_only_replaces_zero_input() {
+        // 只在 input==0 且 floor>0 时替换;>0 一律原样;floor<=0 视为关闭不兜底。
+        assert_eq!(apply_input_floor(0, 1), 1, "input=0 → 地板 1");
+        assert_eq!(apply_input_floor(0, 7), 7, "input=0 → 地板 7");
+        assert_eq!(apply_input_floor(5, 1), 5, "input>0 不动");
+        assert_eq!(apply_input_floor(140_000, 3), 140_000, "大 input 不动");
+        assert_eq!(apply_input_floor(0, 0), 0, "floor=0（关）→ 不兜底");
+        assert_eq!(apply_input_floor(0, -3), 0, "floor<0 → 不兜底");
+    }
+
+    #[test]
+    fn resolve_floor_disabled_returns_zero() {
+        let g = MeterGovernance::new(1.0, 300);
+        g.set_input_floor(false, false, 5, 2, 9);
+        assert_eq!(g.resolve_input_floor(), 0, "关闭 → 0（apply 不兜底）");
+    }
+
+    #[test]
+    fn resolve_floor_fixed_returns_value() {
+        let g = MeterGovernance::new(1.0, 300);
+        g.set_input_floor(true, false, 4, 1, 1);
+        for _ in 0..20 {
+            assert_eq!(g.resolve_input_floor(), 4, "固定模式恒等 value");
+        }
+    }
+
+    #[test]
+    fn resolve_floor_random_within_range() {
+        let g = MeterGovernance::new(1.0, 300);
+        g.set_input_floor(true, true, 1, 3, 8);
+        for _ in 0..200 {
+            let v = g.resolve_input_floor();
+            assert!((3..=8).contains(&v), "随机值须落 [3,8]，实得 {v}");
+        }
+    }
+
+    #[test]
+    fn set_floor_clamps_and_orders() {
+        let g = MeterGovernance::new(1.0, 300);
+        // value/min/max 全 clamp 到 >=1;min>max 互换。
+        g.set_input_floor(true, true, 0, 9, 2);
+        let (enabled, random, value, min, max) = g.input_floor_config();
+        assert!(enabled && random);
+        assert_eq!(value, 1, "value clamp 到 >=1");
+        assert_eq!((min, max), (2, 9), "min>max 已互换");
+    }
+
+    #[test]
+    fn resolve_floor_never_below_one_even_if_misconfigured() {
+        // 直接把配置 min/max 塞成 0（set 会 clamp，但双保险验 resolve 也不返回 0/负）。
+        let g = MeterGovernance::new(1.0, 300);
+        g.set_input_floor(true, false, 0, 0, 0);
+        assert!(g.resolve_input_floor() >= 1, "启用时地板恒 >=1");
     }
 }

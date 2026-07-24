@@ -1007,6 +1007,15 @@ pub async fn post_messages(
             &payload.messages,
             &payload.tools,
         ) as i32;
+        // 下游输入地板兜底(与主链路同口径):input==0 时替换为地板值,只改 input。
+        let input_tokens = super::cache_metering::apply_input_floor(
+            input_tokens,
+            state
+                .meter_governance
+                .as_ref()
+                .map(|g| g.resolve_input_floor())
+                .unwrap_or(0),
+        );
 
         let resp = websearch::handle_websearch_request(
             provider,
@@ -1114,6 +1123,13 @@ pub async fn post_messages(
     // 恒 Some——调度粘性即便 key_id==0 也按会话根哈希粘同号(与计费不同,此处无跨用户串号顾虑)。
     let session_seed = Some(super::cache_metering::isolation_seed(&payload, key_ctx.key_id));
 
+    // 下游输入地板:每请求解析一次(随机模式下同一响应内固定)。无 governance→0=不兜底。
+    let input_floor = state
+        .meter_governance
+        .as_ref()
+        .map(|g| g.resolve_input_floor())
+        .unwrap_or(0);
+
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1138,6 +1154,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            input_floor,
             tracer,
             key_ctx.group.clone(),
             session_seed,
@@ -1168,6 +1185,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            input_floor,
             tracer,
             key_ctx.group.clone(),
             response_cache_store,
@@ -1188,6 +1206,7 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    input_floor: i32,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     session_seed: Option<String>,
@@ -1220,6 +1239,7 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    ctx.set_input_floor(input_floor);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1437,6 +1457,7 @@ async fn handle_non_stream_request(
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    input_floor: i32,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
@@ -1646,6 +1667,10 @@ async fn handle_non_stream_request(
     // 分摊入口 split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_final(total_input_tokens);
+    // 下游输入地板兜底：input==0（如 CCH 全被 read/creation 吸收）时替换为地板值，只改 input，
+    // creation/read 不动。body 与下方 hook.record（→请求日志）同用此值,保证两处一致。
+    let final_input_tokens =
+        super::cache_metering::apply_input_floor(final_input_tokens, input_floor);
     // creation 按入站 cache_control.ttl 归 5m / 1h 桶（顶层字段仍取总和以兼容旧口径）。
     let (creation_5m, creation_1h) = cache_usage.creation_split(cache_creation_tokens);
 
@@ -1887,6 +1912,15 @@ pub async fn post_messages_cc(
             &payload.messages,
             &payload.tools,
         ) as i32;
+        // 下游输入地板兜底(与主链路同口径):input==0 时替换为地板值,只改 input。
+        let input_tokens = super::cache_metering::apply_input_floor(
+            input_tokens,
+            state
+                .meter_governance
+                .as_ref()
+                .map(|g| g.resolve_input_floor())
+                .unwrap_or(0),
+        );
 
         // upstream：透传 key group 供 websearch 计量/路由使用。
         let resp = websearch::handle_websearch_request(
@@ -2066,6 +2100,13 @@ pub async fn post_messages_cc(
     // 会话粘性 seed(同 post_messages,见那里注释)。恒 Some,含 key_id==0。
     let session_seed = Some(super::cache_metering::isolation_seed(&payload, key_ctx.key_id));
 
+    // 下游输入地板:每请求解析一次(随机模式下同一响应内固定)。无 governance→0=不兜底。
+    let input_floor = state
+        .meter_governance
+        .as_ref()
+        .map(|g| g.resolve_input_floor())
+        .unwrap_or(0);
+
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -2092,6 +2133,7 @@ pub async fn post_messages_cc(
                 hook,
                 total_input_tokens,
                 cache_usage,
+                input_floor,
                 tracer,
                 key_ctx.group.clone(),
                 response_cache_store,
@@ -2110,6 +2152,7 @@ pub async fn post_messages_cc(
                 hook,
                 total_input_tokens,
                 cache_usage,
+                input_floor,
                 tracer,
                 key_ctx.group.clone(),
                 response_cache_store,
@@ -2142,6 +2185,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            input_floor,
             tracer,
             key_ctx.group.clone(),
             response_cache_store,
@@ -2165,6 +2209,7 @@ async fn handle_stream_request_buffered(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    input_floor: i32,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
@@ -2200,6 +2245,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_input_floor(input_floor);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
@@ -2401,6 +2447,7 @@ async fn handle_stream_request_gated(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    input_floor: i32,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     response_cache_store: Option<ResponseCacheStore>,
@@ -2432,6 +2479,7 @@ async fn handle_stream_request_gated(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_input_floor(input_floor);
 
     let stream = create_gated_sse_stream(call_result, ctx, hook, tracer, response_cache_store);
 

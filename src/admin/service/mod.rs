@@ -2414,6 +2414,12 @@ impl AdminService {
             .as_ref()
             .map(|c| (c.default_enabled(), c.default_ttl_secs()))
             .unwrap_or((false, crate::anthropic::response_cache::DEFAULT_TTL_SECS));
+        // 输入地板快照：(enabled, random, value, min, max)。无 governance→安全默认(开,固定,1)。
+        let floor_cfg = self
+            .meter_governance
+            .as_ref()
+            .map(|g| g.input_floor_config())
+            .unwrap_or((true, false, 1, 1, 1));
         RuntimeGovernanceConfigResponse {
             quota_disable_threshold: *self.quota_disable_threshold.lock(),
             response_cache_enabled: rc_enabled,
@@ -2428,6 +2434,11 @@ impl AdminService {
                 .as_ref()
                 .map(|g| g.ttl_secs())
                 .unwrap_or(300),
+            input_floor_enabled: floor_cfg.0,
+            input_floor_random: floor_cfg.1,
+            input_floor_value: floor_cfg.2,
+            input_floor_min: floor_cfg.3,
+            input_floor_max: floor_cfg.4,
         }
     }
 
@@ -2442,9 +2453,14 @@ impl AdminService {
             && req.response_cache_ttl_secs.is_none()
             && req.cache_read_ratio.is_none()
             && req.cache_meter_ttl_secs.is_none()
+            && req.input_floor_enabled.is_none()
+            && req.input_floor_random.is_none()
+            && req.input_floor_value.is_none()
+            && req.input_floor_min.is_none()
+            && req.input_floor_max.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs / inputFloor* 一个字段"
                     .to_string(),
             ));
         }
@@ -2481,6 +2497,19 @@ impl AdminService {
                 )));
             }
         }
+        for (name, v) in [
+            ("inputFloorValue", req.input_floor_value),
+            ("inputFloorMin", req.input_floor_min),
+            ("inputFloorMax", req.input_floor_max),
+        ] {
+            if let Some(v) = v {
+                if !(1..=1_000_000).contains(&v) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "{name} 必须在 1..=1000000 内: {v}"
+                    )));
+                }
+            }
+        }
 
         // 先改运行时值
         if let Some(t) = req.quota_disable_threshold {
@@ -2510,6 +2539,24 @@ impl AdminService {
                 g.set_ttl_secs(ttl);
             }
         }
+        // 输入地板:set_input_floor 需 5 个值一起,故先读当前快照,再用 req 里提供的字段覆盖。
+        if req.input_floor_enabled.is_some()
+            || req.input_floor_random.is_some()
+            || req.input_floor_value.is_some()
+            || req.input_floor_min.is_some()
+            || req.input_floor_max.is_some()
+        {
+            if let Some(g) = &self.meter_governance {
+                let (cur_en, cur_rand, cur_val, cur_min, cur_max) = g.input_floor_config();
+                g.set_input_floor(
+                    req.input_floor_enabled.unwrap_or(cur_en),
+                    req.input_floor_random.unwrap_or(cur_rand),
+                    req.input_floor_value.unwrap_or(cur_val),
+                    req.input_floor_min.unwrap_or(cur_min),
+                    req.input_floor_max.unwrap_or(cur_max),
+                );
+            }
+        }
 
         // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
         self.update_config_file(|c| {
@@ -2527,6 +2574,21 @@ impl AdminService {
             }
             if let Some(ttl) = req.cache_meter_ttl_secs {
                 c.cache_meter_ttl_secs = ttl;
+            }
+            if let Some(en) = req.input_floor_enabled {
+                c.input_floor_enabled = en;
+            }
+            if let Some(rand) = req.input_floor_random {
+                c.input_floor_mode = if rand { "random" } else { "fixed" }.to_string();
+            }
+            if let Some(v) = req.input_floor_value {
+                c.input_floor_value = v;
+            }
+            if let Some(v) = req.input_floor_min {
+                c.input_floor_min = v;
+            }
+            if let Some(v) = req.input_floor_max {
+                c.input_floor_max = v;
             }
         });
 

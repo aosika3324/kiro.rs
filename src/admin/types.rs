@@ -519,6 +519,16 @@ pub struct RuntimeGovernanceConfigResponse {
     /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
     /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
     pub cache_meter_ttl_secs: u64,
+    /// 下游输入地板开关（全局）：最终返回下游的 input==0 时是否替换为地板值（只改 input）。
+    pub input_floor_enabled: bool,
+    /// 地板取值模式：`true`=随机（[min,max] 内每请求随机），`false`=固定（用 `input_floor_value`）。
+    pub input_floor_random: bool,
+    /// 固定模式地板值（>=1）。
+    pub input_floor_value: i32,
+    /// 随机模式地板下限（>=1）。
+    pub input_floor_min: i32,
+    /// 随机模式地板上限（>=1）。
+    pub input_floor_max: i32,
 }
 
 /// i7relay 自动取号配置响应(**脱敏**:apiKey/webhookSecret 不回明文,只回是否已设 + 掩码)。
@@ -591,6 +601,21 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub cache_meter_ttl_secs: Option<u64>,
+    /// 下游输入地板开关；缺省不修改。
+    #[serde(default)]
+    pub input_floor_enabled: Option<bool>,
+    /// 地板取值模式（true=随机 / false=固定）；缺省不修改。
+    #[serde(default)]
+    pub input_floor_random: Option<bool>,
+    /// 固定模式地板值，范围 1..=1_000_000；缺省不修改。
+    #[serde(default)]
+    pub input_floor_value: Option<i32>,
+    /// 随机模式地板下限，范围 1..=1_000_000；缺省不修改。
+    #[serde(default)]
+    pub input_floor_min: Option<i32>,
+    /// 随机模式地板上限，范围 1..=1_000_000；缺省不修改。
+    #[serde(default)]
+    pub input_floor_max: Option<i32>,
 }
 
 /// 端点路由配置响应：首选端点 + fallback 开关 + 可选端点清单。

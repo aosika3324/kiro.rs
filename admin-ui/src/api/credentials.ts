@@ -473,6 +473,16 @@ export interface RuntimeGovernanceConfig {
   cacheReadRatio: number
   /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
   cacheMeterTtlSecs: number
+  /** 下游输入地板开关（全局）：最终返回下游的 input==0 时替换为地板值（只改 input）。 */
+  inputFloorEnabled: boolean
+  /** 地板取值模式：true=随机（[min,max] 内每请求随机），false=固定（用 inputFloorValue）。 */
+  inputFloorRandom: boolean
+  /** 固定模式地板值（>=1）。 */
+  inputFloorValue: number
+  /** 随机模式地板下限（>=1）。 */
+  inputFloorMin: number
+  /** 随机模式地板上限（>=1）。 */
+  inputFloorMax: number
 }
 
 // 获取运行时治理配置

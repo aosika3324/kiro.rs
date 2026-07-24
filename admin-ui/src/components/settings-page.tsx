@@ -170,6 +170,9 @@ function CacheQuotaSection() {
   const [ttl, setTtl] = useState('')
   const [ratio, setRatio] = useState('')
   const [meterTtl, setMeterTtl] = useState('')
+  const [floorValue, setFloorValue] = useState('')
+  const [floorMin, setFloorMin] = useState('')
+  const [floorMax, setFloorMax] = useState('')
 
   const save = (patch: Record<string, unknown>, ok: string) =>
     mutate(patch, {
@@ -245,6 +248,50 @@ function CacheQuotaSection() {
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
         </form>
       </div>
+
+      <ToggleRow
+        label={cfg?.inputFloorEnabled ? '下游输入地板：已启用' : '下游输入地板：已关闭'}
+        desc={cfg?.inputFloorEnabled
+          ? '最终返回下游的 input==0 时替换为地板值（只改 input，不触碰 creation/read）。修下游（new-api/sub2api）不认 0 输入报错。'
+          : '关闭后 input==0 原样返回（下游可能拒收）。'}
+        checked={cfg?.inputFloorEnabled ?? false}
+        disabled={isLoading || isPending}
+        onChange={(v) => save({ inputFloorEnabled: v }, v ? '已开启输入地板' : '已关闭输入地板')}
+      />
+      <ToggleRow
+        label={cfg?.inputFloorRandom ? '地板取值：区间随机' : '地板取值：固定值'}
+        desc={cfg?.inputFloorRandom
+          ? '每请求在 [下限, 上限] 内随机取一个地板值（同一响应内固定）。'
+          : '所有 input==0 的请求统一用固定地板值。'}
+        checked={cfg?.inputFloorRandom ?? false}
+        disabled={isLoading || isPending}
+        onChange={(v) => save({ inputFloorRandom: v }, v ? '已切到区间随机' : '已切到固定值')}
+      />
+      {cfg?.inputFloorRandom ? (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            地板区间（当前 {cfg?.inputFloorMin ?? '—'} ~ {cfg?.inputFloorMax ?? '—'}）
+          </div>
+          <div className="flex items-center gap-1.5">
+            <form onSubmit={num(floorMin, 1, 1000000, (s) => parseInt(s, 10), 'inputFloorMin', '地板下限已更新', () => setFloorMin(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={1} max={1000000} placeholder="下限" value={floorMin} onChange={(e) => setFloorMin(e.target.value)} disabled={isPending} className="h-8 max-w-[120px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !floorMin.trim()}>存下限</Button>
+            </form>
+            <form onSubmit={num(floorMax, 1, 1000000, (s) => parseInt(s, 10), 'inputFloorMax', '地板上限已更新', () => setFloorMax(''))} className="flex items-center gap-1.5">
+              <Input type="number" min={1} max={1000000} placeholder="上限" value={floorMax} onChange={(e) => setFloorMax(e.target.value)} disabled={isPending} className="h-8 max-w-[120px] text-xs" />
+              <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !floorMax.trim()}>存上限</Button>
+            </form>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">固定地板值（当前 {cfg?.inputFloorValue ?? '—'}）</div>
+          <form onSubmit={num(floorValue, 1, 1000000, (s) => parseInt(s, 10), 'inputFloorValue', '固定地板值已更新', () => setFloorValue(''))} className="flex items-center gap-1.5">
+            <Input type="number" min={1} max={1000000} placeholder=">=1" value={floorValue} onChange={(e) => setFloorValue(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+            <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !floorValue.trim()}>保存</Button>
+          </form>
+        </div>
+      )}
     </SettingSection>
   )
 }

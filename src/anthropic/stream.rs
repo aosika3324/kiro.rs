@@ -1535,6 +1535,10 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 下游输入地板值（每请求解析一次，见 [`super::cache_metering::MeterGovernance::resolve_input_floor`]）。
+    /// `0` = 不兜底；`>0` 时若最终上报 input==0 则替换为此值（只改 input，creation/read 不动）。
+    /// 一次请求内固定，避免随机模式下同一响应多次 `resolved_usage` 抖动。
+    input_floor: i32,
 }
 
 impl StreamContext {
@@ -1554,7 +1558,16 @@ impl StreamContext {
         // 三桶和 / baseline 冲到 7~20x 被检测判 Abnormal。本地估算最接近检测方数出的 baseline
         // → multiplier≈1x、形状对齐真实 Anthropic。窗口超限 stop_reason 仍走 context_usage%。
         // split_final：默认模式走检测安全 split_against_total；billing_mode 开启走标准口径（超报）。
-        self.cache_usage.split_final(self.input_tokens.max(0))
+        let (input, creation, read) = self.cache_usage.split_final(self.input_tokens.max(0));
+        // 下游输入地板兜底：input==0（如 CCH 全被 read/creation 吸收）时替换为地板值，
+        // 只改 input——下游(new-api/sub2api)不认 0 输入。creation/read 一律不动。
+        let input = super::cache_metering::apply_input_floor(input, self.input_floor);
+        (input, creation, read)
+    }
+
+    /// 设置本请求的下游输入地板值（每请求解析一次注入，见 handlers）。
+    pub fn set_input_floor(&mut self, floor: i32) {
+        self.input_floor = floor;
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1597,6 +1610,7 @@ impl StreamContext {
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
+            input_floor: 0,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
@@ -2723,6 +2737,11 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    /// 注入本请求的下游输入地板值（input==0 时兜底）。
+    pub fn set_input_floor(&mut self, floor: i32) {
+        self.inner.set_input_floor(floor);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -2866,6 +2885,11 @@ impl GatedStreamContext {
     /// 注入结构化缓存计量的覆盖情况，放闸时按真实 total 分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 注入本请求的下游输入地板值（input==0 时兜底）。
+    pub fn set_input_floor(&mut self, floor: i32) {
+        self.inner.set_input_floor(floor);
     }
 
     /// 判断一个 SSE 事件是否为"可见内容"（客户端真正看到模型在吐字）。

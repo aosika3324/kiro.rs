@@ -285,8 +285,16 @@ async fn main() {
         config.cache_read_ratio,
         config.cache_meter_ttl_secs,
     ));
+    // 从配置注入下游输入地板旋钮（input==0 兜底；可经 Admin runtime-governance 热调）。
+    meter_governance.set_input_floor(
+        config.input_floor_enabled,
+        config.input_floor_mode.eq_ignore_ascii_case("random"),
+        config.input_floor_value,
+        config.input_floor_min,
+        config.input_floor_max,
+    );
 
-    // CchCacheMeter：Anthropic 标准计费模式（per-key anthropic_billing_mode）专用的有状态
+    // CchCacheMeter：MeteringMode::Billing（Anthropic 标准计费）专用的有状态
     // 内容指纹缓存计量。持久化到 cache_dir/cch_cache.json，启动时自动加载未过期条目。
     // 默认检测安全 delta 支路不使用它（走上面的 MeterGovernance）。
     let cch_cache_meter = std::sync::Arc::new(anthropic::cache_metering::CchCacheMeter::new(Some(

@@ -277,6 +277,33 @@ pub struct Config {
     #[serde(default = "default_cch_cache_ttl_secs")]
     pub cch_cache_ttl_secs: u64,
 
+    /// **下游输入 token 地板**（全局，默认开）：最终返回给下游的 `input_tokens`（OpenAI 的
+    /// `prompt_tokens` / Responses 的 `input_tokens`）若为 `0`，替换为一个正的地板值。仅在
+    /// **最终上报口径 == 0** 时触发（>0 一律不动），只改 input 分量，绝不触碰 creation/read/output。
+    ///
+    /// 动机：`anthropic_billing_mode`（CCH）等模式下,整段前缀可能全被 cache_read/creation 吸收,
+    /// 使 input 合法地为 0;但下游（new-api / sub2api）不认 0 输入会报错。此地板在返回边界兜底。
+    /// 运行时可经 Admin API `/config/runtime-governance` 热调,全局生效。
+    #[serde(default = "default_input_floor_enabled")]
+    pub input_floor_enabled: bool,
+
+    /// 地板取值模式：`"fixed"`（默认，用 `input_floor_value`）或 `"random"`（在
+    /// `[input_floor_min, input_floor_max]` 内每请求随机取一次）。其它值按 `"fixed"` 处理。
+    #[serde(default = "default_input_floor_mode")]
+    pub input_floor_mode: String,
+
+    /// 固定模式的地板值（默认 1）。clamp 到 `>= 1`。
+    #[serde(default = "default_input_floor_value")]
+    pub input_floor_value: i32,
+
+    /// 随机模式的地板下限（默认 1）。clamp 到 `>= 1`，且 `min > max` 时与 max 互换。
+    #[serde(default = "default_input_floor_value")]
+    pub input_floor_min: i32,
+
+    /// 随机模式的地板上限（默认 1）。clamp 到 `>= 1`。
+    #[serde(default = "default_input_floor_value")]
+    pub input_floor_max: i32,
+
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
     /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
@@ -643,6 +670,18 @@ fn default_cch_cache_ttl_secs() -> u64 {
     300
 }
 
+fn default_input_floor_enabled() -> bool {
+    true
+}
+
+fn default_input_floor_mode() -> String {
+    "fixed".to_string()
+}
+
+fn default_input_floor_value() -> i32 {
+    1
+}
+
 fn default_response_cache_ttl_secs() -> u64 {
     crate::anthropic::response_cache::DEFAULT_TTL_SECS
 }
@@ -705,6 +744,11 @@ impl Default for Config {
             cache_read_ratio: default_cache_read_ratio(),
             cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
             cch_cache_ttl_secs: default_cch_cache_ttl_secs(),
+            input_floor_enabled: default_input_floor_enabled(),
+            input_floor_mode: default_input_floor_mode(),
+            input_floor_value: default_input_floor_value(),
+            input_floor_min: default_input_floor_value(),
+            input_floor_max: default_input_floor_value(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),
