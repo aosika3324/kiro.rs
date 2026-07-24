@@ -364,6 +364,13 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("opus.5")
+        {
+            // Opus 5（预置:上游 ListAvailableModels 尚未上线时会被上游 400,上线后即通）。精确匹配
+            // 5 代放在 4.x 分支之后,避免误命中;对齐 sonnet-5 的写法。上游 modelId 预期为 "claude-opus-5"。
+            Some("claude-opus-5".to_string())
         } else {
             None
         }
@@ -393,6 +400,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -2316,6 +2324,35 @@ mod tests {
         );
         // 不应误判 legacy claude-3-5-sonnet
         assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-20260101-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        // 点号形式 opus.5 也应命中
+        assert_eq!(map_model("claude-opus.5"), Some("claude-opus-5".to_string()));
+        // 1M 上下文
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // 显式 4.x 版本号优先命中 4.x 分支,不被 5 代误吞
+        assert_eq!(
+            map_model("claude-opus-4-8-20260101"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+        // opus-5 支持原生 reasoning 与 xhigh(预置能力,对齐其余 5 系)
+        assert!(model_supports_native_reasoning("claude-opus-5"));
+        assert!(model_supports_xhigh_effort("claude-opus-5"));
     }
 
     #[test]
