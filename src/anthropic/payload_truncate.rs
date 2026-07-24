@@ -93,13 +93,39 @@ fn is_pure_tool_result(msg: &Message) -> bool {
     }
 }
 
+/// True if a message is the truncation placeholder inserted by a prior trim pass.
+fn is_truncation_placeholder(msg: &Message) -> bool {
+    msg.role == "user"
+        && matches!(&msg.content, Value::String(s) if s == TRUNCATION_PLACEHOLDER)
+}
+
 /// Drop `drop_count` oldest messages, then keep advancing the cut until the new oldest kept turn is
 /// not a pure tool_result (avoids leaving an orphan tool_result at the window head). Always keeps at
 /// least [`MIN_RECENT_TURNS`] (including the current/last message). Inserts one placeholder where
 /// the cut was made. Mutates `messages` in place. Returns true if anything was dropped.
 fn drop_oldest_turns(messages: &mut Vec<Message>, drop_count: usize) -> bool {
+    // Strip a placeholder left by a previous pass first, so it never absorbs a "drop" (otherwise a
+    // re-estimating caller with drop_count==1 would drop the placeholder and re-add it — zero real
+    // progress, burning iterations while staying over budget). Re-added below when we cut; if we
+    // end up unable to cut, it is restored so the "context elided" note from the prior pass survives.
+    let had_placeholder = messages.first().is_some_and(is_truncation_placeholder);
+    if had_placeholder {
+        messages.remove(0);
+    }
+    let restore_placeholder = |messages: &mut Vec<Message>| {
+        if had_placeholder {
+            messages.insert(
+                0,
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(TRUNCATION_PLACEHOLDER.to_string()),
+                },
+            );
+        }
+    };
     let n = messages.len();
     if n <= MIN_RECENT_TURNS || drop_count == 0 {
+        restore_placeholder(messages);
         return false;
     }
     // Never cut into the most-recent window.
@@ -110,6 +136,7 @@ fn drop_oldest_turns(messages: &mut Vec<Message>, drop_count: usize) -> bool {
         cut += 1;
     }
     if cut == 0 {
+        restore_placeholder(messages);
         return false;
     }
     let placeholder = Message {
@@ -454,6 +481,38 @@ mod tests {
             "re-estimating loop must land strictly under cap, got {}",
             converted_payload_bytes(&r)
         );
+    }
+
+    #[test]
+    fn many_small_turns_converge_across_placeholder() {
+        // Direct regression for the 216 "remaining_messages=760, 33 bytes over, conversions=13"
+        // symptom: many small uniform turns where the first pass lands just barely over cap, so
+        // later passes must drop *real* turns even though a placeholder now heads the list. Before
+        // the fix, drop_oldest_turns(…,1) would drop+re-add the placeholder (zero progress) and burn
+        // all MAX_TRIM_ITERS while staying over. It must now converge strictly under cap.
+        let mut msgs = vec![user_text("start")];
+        for i in 0..400 {
+            msgs.push(assistant_text(&format!("a{i} {}", "x".repeat(1_500))));
+            msgs.push(user_text(&format!("u{i} {}", "y".repeat(1_500))));
+        }
+        msgs.push(user_text("final?"));
+        let mut p = req(msgs);
+        let cap = 300_000;
+        let (r, conversions) =
+            convert_within_limit_counted(&mut p, &cfg(cap), ToolCompatibilityMode::ClaudeCode).unwrap();
+        assert_pairing_valid(&r);
+        assert!(
+            p.messages.len() > MIN_RECENT_TURNS,
+            "floor must stay unreached so convergence (not the floor) is what lands us under cap"
+        );
+        assert!(
+            converted_payload_bytes(&r) <= cap,
+            "must converge strictly under cap, got {} in {conversions} conversions",
+            converted_payload_bytes(&r)
+        );
+        // Exactly one placeholder at the head — no accumulation across passes.
+        let ph = p.messages.iter().filter(|m| is_truncation_placeholder(m)).count();
+        assert_eq!(ph, 1, "exactly one truncation placeholder expected, found {ph}");
     }
 
     #[test]
