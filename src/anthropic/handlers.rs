@@ -434,6 +434,19 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 容量类失败（无可用凭据 / 全部风控冷却或禁用 / 额度用尽 / 并发槽满 / 账号级临时封锁）：
+    // 这些是「本服务此刻没有可用容量」而非客户端错误，语义上等同 Anthropic 官方的
+    // 529 `overloaded_error`（"Overloaded"）。据此客户端 SDK / Claude Code 会自动退避重试。
+    // 绝不把内部中文运维文案（AWS 账号、管理面板建议、凭据 ID 等）透传给客户端。
+    if is_capacity_exhausted_error(&err_str) {
+        tracing::warn!(error = %err, "无可用容量（映射为 529 overloaded_error）");
+        return (
+            StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            Json(ErrorResponse::new("overloaded_error", "Overloaded")),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -443,6 +456,24 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+/// 判定错误是否属于「容量耗尽」类：无可用凭据、全部风控冷却/禁用、额度用尽、并发槽满、账号级临时封锁。
+///
+/// 命中即映射为官方 `529 overloaded_error`。匹配 provider / token_manager 各处 `bail!` 的中文标记，
+/// 保持在内部错误串上做子串匹配（这些串不会随 i18n 变动，是稳定的内部归因）。
+fn is_capacity_exhausted_error(err_str: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "所有凭据都处于账号风控冷却或已禁用状态", // provider 账号级封锁收尾
+        "无可调度凭据",                           // token_manager 调度失败（禁用/冷却/不匹配）
+        "所有凭据均已禁用",                       // token_manager / provider 全禁用
+        "所有凭据已用尽",                         // provider MCP 路径
+        "所有匹配凭据的并发槽都已满",             // token_manager 并发槽满
+        "并发租约已关闭",                         // token_manager 租约关闭
+        "额度已用尽",                             // 月度/超额配额耗尽
+        "账号级临时封锁",                         // provider 单跳账号封锁归因
+    ];
+    MARKERS.iter().any(|m| err_str.contains(m))
 }
 
 /// 输入 token 规模分级(仅观测用)。阈值:medium ≥ 32K,long ≥ 100K。
@@ -2739,6 +2770,51 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body.contains(secret));
         assert!(body.contains("Upstream API request failed"));
+    }
+
+    #[tokio::test]
+    async fn capacity_exhausted_errors_map_to_529_overloaded() {
+        // 无可用凭据 / 全部风控冷却或禁用 / 额度用尽 / 并发槽满 / 账号级封锁
+        // → 官方 529 overloaded_error，且绝不透传内部中文运维文案。
+        let cases = [
+            "chat API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。上游对凭据 #7 的账号触发了临时封锁。建议：增加更多不同 AWS 账号的凭据。原始响应: 403 body",
+            "无可调度凭据（共 5：禁用 2 / 风控冷却中 3 / 不匹配本次请求模型或分组 0），最近一个约 42s 后恢复",
+            "所有凭据均已禁用（0/5）",
+            "MCP 请求失败（所有凭据已用尽）: 403 forbidden",
+            "所有匹配凭据的并发槽都已满（非阻塞快速失败，交由上层重试）",
+            "凭据 #3 并发租约已关闭，无法获取账号",
+            "凭据 #9 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
+            "chat API 请求失败（账号级临时封锁，凭据 #2 已冷却 30 分钟）: 403 body",
+        ];
+        for msg in cases {
+            let resp = map_provider_error(anyhow::anyhow!(msg.to_string()));
+            assert_eq!(
+                resp.status().as_u16(),
+                529,
+                "容量类错误应映射为 529：{msg}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            // 官方信封：顶层 type=error + 内层 overloaded_error / "Overloaded"。
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["type"], "error");
+            assert_eq!(v["error"]["type"], "overloaded_error");
+            assert_eq!(v["error"]["message"], "Overloaded");
+            // 不泄露内部中文运维细节 / AWS 账号 / 凭据 ID。
+            assert!(!body.contains("凭据"), "不应泄露内部文案：{body}");
+            assert!(!body.contains("AWS"), "不应泄露 AWS 归因：{body}");
+        }
+    }
+
+    #[test]
+    fn error_response_uses_official_anthropic_envelope() {
+        // 任意错误响应都应带顶层 "type":"error"，与 Claude 官方一致。
+        let v = serde_json::to_value(ErrorResponse::new("invalid_request_error", "boom")).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "boom");
     }
 
     #[test]
