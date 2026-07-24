@@ -258,9 +258,10 @@ const MAX_TOTAL_RETRIES: usize = 4;
 /// Anthropic JSON 体量），触发调度排序惩罚以分散大请求、避免扎堆同账号拖垮首字节。
 const LARGE_REQUEST_BYTES: usize = 512 * 1024;
 
-/// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
-/// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
-const CLIENT_CACHE_CAP: usize = 64;
+/// HTTP Client 缓存容量上限（按 `(credential_id, proxy)` 计条目）。
+/// 按账号分片后条目数 ≈ 活跃账号数（每账号一条）；取 512 覆盖大账号池（含 i7relay 自动取号
+/// 增长），超出按 LRU 淘汰最旧账号的分片集，避免 reqwest::Client 无界增长。
+const CLIENT_CACHE_CAP: usize = 512;
 
 const AUTO_ENDPOINT_NAME: &str = "auto";
 const KIRO_ENDPOINT_ALIAS: &str = "kiro";
@@ -335,41 +336,45 @@ impl ShardSet {
     }
 }
 
-/// 带容量上限的 HTTP Client 缓存。
+/// HTTP Client 缓存的 key：`(credential_id, effective proxy)`。
 ///
-/// - key 为 effective proxy 配置（None = 直连/全局回退）
-/// - value 为该账户的 [`ShardSet`]（N 个独立 Client，round-robin 摊连接）
-/// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
-/// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
+/// **按账号分片的关键**：key 含 `credential_id`(凭据自增 ID，`None` 仅出现在无 ID 的
+/// 边缘情形)后，即使所有账号共用同一个全局代理，也各自拥有独立的 [`ShardSet`]
+/// (各 N 条独立上游连接)——不再因"共用一个 proxy key"而全部塌缩成一组连接。
+/// 保留 `effective proxy` 于 key 中，使某账号切换代理(或全局代理热更新导致其 effective
+/// 代理变化)时 key 自动改变、取到用新代理的 client，旧条目随 LRU 淘汰。
+type ClientKey = (Option<u64>, Option<ProxyConfig>);
+
+/// 带容量上限的 HTTP Client 缓存（纯 LRU，按 [`ClientKey`] 分组）。
+///
+/// - key 见 [`ClientKey`]：`(credential_id, effective proxy)`
+/// - value 为该 (账号, 代理) 组合的 [`ShardSet`]（N 个独立 Client，round-robin 摊连接）
+/// - 惰性填充：首次某账号请求 miss 时构建其分片集并缓存
+/// - 超出容量时按插入顺序（近似 LRU）淘汰最旧条目；`cap` 取够大以覆盖账号规模
 struct ClientCache {
-    map: HashMap<Option<ProxyConfig>, ShardSet>,
-    /// 插入顺序（仅记录可淘汰的非受保护 key）
-    order: std::collections::VecDeque<Option<ProxyConfig>>,
-    /// 受保护、不参与淘汰的 key（全局代理）
-    protected: Option<ProxyConfig>,
+    map: HashMap<ClientKey, ShardSet>,
+    /// 插入顺序（淘汰用）
+    order: std::collections::VecDeque<ClientKey>,
     cap: usize,
 }
 
 impl ClientCache {
-    fn new(protected: Option<ProxyConfig>, initial: ShardSet, cap: usize) -> Self {
-        let mut map = HashMap::new();
-        map.insert(protected.clone(), initial);
+    fn new(cap: usize) -> Self {
         Self {
-            map,
+            map: HashMap::new(),
             order: std::collections::VecDeque::new(),
-            protected,
-            cap,
+            cap: cap.max(1),
         }
     }
 
     /// round-robin 取该 key 分片集里的一个 client。
-    fn get(&self, key: &Option<ProxyConfig>) -> Option<Client> {
+    fn get(&self, key: &ClientKey) -> Option<Client> {
         self.map.get(key).map(|s| s.pick())
     }
 
-    /// 插入新分片集，必要时淘汰最旧的非受保护条目
-    fn insert(&mut self, key: Option<ProxyConfig>, shard: ShardSet) {
-        if key == self.protected || self.map.contains_key(&key) {
+    /// 插入新分片集，必要时淘汰最旧条目（纯 LRU，无受保护 key）。
+    fn insert(&mut self, key: ClientKey, shard: ShardSet) {
+        if self.map.contains_key(&key) {
             self.map.insert(key, shard);
             return;
         }
@@ -457,10 +462,11 @@ pub struct KiroProvider {
     /// 避免长流被上游中途掐断导致的"断流"。
     streaming_client_cache: Mutex<ClientCache>,
     /// TLS 指纹 (wreq) 客户端缓存。仅当 `config.tls_fingerprint_enabled` 开启时才会建/用。
-    /// key = (effective proxy, 是否流式禁复用, profile 名)；三者任一不同即用独立 client。
+    /// key = (credential_id, effective proxy, 是否流式禁复用, profile 名)；任一不同即用独立 client。
+    /// 含 credential_id 使每账号各自 N 条指纹连接，共用全局代理也不塌缩（对齐 [`ClientKey`]）。
     /// 惰性构建（默认关闭时不产生任何 wreq client / BoringSSL 开销），带容量上限简单淘汰。
     #[cfg(feature = "tls-fingerprint")]
-    wreq_client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool, String), WreqShardSet>>,
+    wreq_client_cache: Mutex<HashMap<(Option<u64>, Option<ProxyConfig>, bool, String), WreqShardSet>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -531,17 +537,11 @@ impl KiroProvider {
             );
         }
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的分片集（N 条独立连接，作为受保护的常驻条目）。
-        let initial_shard =
-            build_shard_set(|| build_client(proxy.as_ref(), 720, tls_backend))
-                .expect("创建 HTTP 客户端失败");
-        let client_cache = ClientCache::new(proxy.clone(), initial_shard, CLIENT_CACHE_CAP);
-        // 流式专用分片集同样预热全局代理条目。
-        let initial_streaming_shard =
-            build_shard_set(|| build_streaming_client(proxy.as_ref(), 720, tls_backend))
-                .expect("创建流式 HTTP 客户端失败");
-        let streaming_client_cache =
-            ClientCache::new(proxy.clone(), initial_streaming_shard, CLIENT_CACHE_CAP);
+        // 缓存按 (credential_id, proxy) 惰性填充：启动时尚无具体凭据 ID，故从空开始，
+        // 首个请求命中该账号时才构建其分片集。`proxy` 仅用于确定 tls_backend 一致性，不再预热。
+        let _ = &proxy;
+        let client_cache = ClientCache::new(CLIENT_CACHE_CAP);
+        let streaming_client_cache = ClientCache::new(CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
@@ -562,13 +562,15 @@ impl KiroProvider {
         // 全局代理动态读自 token_manager（单一数据源），Admin 改代理后立即生效、无需重启。
         let global_proxy = self.token_manager.proxy();
         let effective = credentials.effective_proxy(global_proxy.as_ref());
+        // key 含 credential_id：每账号各自 N 条独立连接，共用全局代理也不塌缩（见 ClientKey）。
+        let key: ClientKey = (credentials.id, effective.clone());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&key) {
             return Ok(client);
         }
         let shard = build_shard_set(|| build_client(effective.as_ref(), 720, self.tls_backend))?;
         let client = shard.pick();
-        cache.insert(effective, shard);
+        cache.insert(key, shard);
         Ok(client)
     }
 
@@ -578,14 +580,16 @@ impl KiroProvider {
         // 同 client_for：全局代理动态读自 token_manager，避免 provider 持有会过期的拷贝。
         let global_proxy = self.token_manager.proxy();
         let effective = credentials.effective_proxy(global_proxy.as_ref());
+        // key 含 credential_id：每账号各自 N 条独立流式连接（见 ClientKey）。
+        let key: ClientKey = (credentials.id, effective.clone());
         let mut cache = self.streaming_client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&key) {
             return Ok(client);
         }
         let shard =
             build_shard_set(|| build_streaming_client(effective.as_ref(), 720, self.tls_backend))?;
         let client = shard.pick();
-        cache.insert(effective, shard);
+        cache.insert(key, shard);
         Ok(client)
     }
 
@@ -604,7 +608,7 @@ impl KiroProvider {
         const WREQ_CACHE_CAP: usize = 64;
         let global_proxy = self.token_manager.proxy();
         let effective = credentials.effective_proxy(global_proxy.as_ref());
-        let key = (effective.clone(), streaming, profile.to_string());
+        let key = (credentials.id, effective.clone(), streaming, profile.to_string());
         let mut cache = self.wreq_client_cache.lock();
         if let Some(shard) = cache.get(&key) {
             return Ok(shard.pick());
@@ -1950,6 +1954,42 @@ mod tests {
         let one = ShardSet::new(vec![mk()]);
         let _ = one.pick();
         let _ = one.pick();
+    }
+
+    /// ClientCache 按 (credential_id, proxy) 分组：同账号命中同一 ShardSet，不同账号各自隔离，
+    /// 且即使共用同一代理也不塌缩——这是修高并发首字延迟(proxy-key 塌缩 bug)的核心不变式。
+    #[test]
+    fn client_cache_keys_by_credential_not_just_proxy() {
+        let mk = || build_client(None, 30, TlsBackend::Rustls).unwrap();
+        let mut cache = ClientCache::new(CLIENT_CACHE_CAP);
+        // 两个账号共用同一个全局代理（proxy 部分相同，仅 credential_id 不同）。
+        let proxy = Some(ProxyConfig::new("http://127.0.0.1:7890"));
+        let key_a: ClientKey = (Some(1), proxy.clone());
+        let key_b: ClientKey = (Some(2), proxy.clone());
+
+        assert!(cache.get(&key_a).is_none(), "初始 miss");
+        cache.insert(key_a.clone(), ShardSet::new(vec![mk()]));
+        cache.insert(key_b.clone(), ShardSet::new(vec![mk()]));
+
+        // 关键：同代理但不同账号 → 两个独立条目（不塌缩成一个）。
+        assert!(cache.get(&key_a).is_some(), "账号 1 命中自己的分片");
+        assert!(cache.get(&key_b).is_some(), "账号 2 命中自己的分片");
+        assert_eq!(cache.map.len(), 2, "同代理两账号 = 两条独立 ShardSet");
+    }
+
+    /// ClientCache 纯 LRU：超容量按插入顺序淘汰最旧账号（无受保护常驻 key）。
+    #[test]
+    fn client_cache_evicts_oldest_when_over_cap() {
+        let mk = || build_client(None, 30, TlsBackend::Rustls).unwrap();
+        let mut cache = ClientCache::new(2);
+        let k = |id: u64| -> ClientKey { (Some(id), None) };
+        cache.insert(k(1), ShardSet::new(vec![mk()]));
+        cache.insert(k(2), ShardSet::new(vec![mk()]));
+        cache.insert(k(3), ShardSet::new(vec![mk()])); // 触发淘汰最旧(id=1)
+        assert!(cache.get(&k(1)).is_none(), "最旧条目被淘汰");
+        assert!(cache.get(&k(2)).is_some());
+        assert!(cache.get(&k(3)).is_some());
+        assert_eq!(cache.map.len(), 2, "容量恒定");
     }
 
     #[test]
