@@ -467,36 +467,45 @@ fn classify_input_tier(input_tokens: i32) -> InputTier {
 }
 
 
-/// 计算本次请求的结构化缓存覆盖。
-///
-/// `cache_enabled=false` 的 Key 直接返回默认（不模拟缓存，全量计入 input）。否则取该请求
-/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`——并按会话
-/// 热度取上轮消息条数（`observe_session`：首次出现或距上次超 TTL → cold=None，整段前缀按
-/// creation 重写计费；warm 返回上次条数以界定本轮新增的 creation 区间），交给
-/// `compute_structural_cache_usage` 拆分。
+/// 计算本次请求的缓存覆盖，按 per-key [`MeteringMode`](super::cache_metering::MeteringMode)
+/// 三选一分派：
+/// - `Off` → 默认（不模拟缓存，全量计入 input）；
+/// - `Billing` → CCH 内容指纹计量（真实前缀命中，无护栏）；
+/// - `Delta` → 检测安全结构化拆分（见 [`compute_delta_cache_usage`]）。
 pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
     key_ctx: &KeyContext,
 ) -> super::cache_metering::CacheUsage {
-    if !key_ctx.cache_enabled {
-        return super::cache_metering::CacheUsage::default();
-    }
+    use super::cache_metering::MeteringMode;
 
-    // ---- CCH 支路（Anthropic 标准计费模式，per-key `anthropic_billing_mode` 开启）--------
-    // 内部实现为上游 CCH 内容指纹计量（有状态最长公共前缀命中），与默认 delta 支路完全隔离。
-    // 无 CchCacheMeter 实例时回退全 input（default = Delta，split 全计 input）。
-    // 无 session 的主 Key（key_id==0）经 cch_isolation_seed 返回 None → cch_compute_cache_usage
-    // 内部返回全 input（不模拟跨用户缓存）。read_ratio / creation_ratio / multiplier_cap 在此模式失效。
-    if key_ctx.anthropic_billing_mode {
-        return match state.cch_cache_meter.as_ref() {
+    // 三选一模式分派（互斥引擎）：Off 全 input / Delta 检测安全拆分 / Billing CCH 指纹计量。
+    match key_ctx.metering_mode {
+        // ---- Off：不合成缓存计量，全量计入 input ----
+        MeteringMode::Off => super::cache_metering::CacheUsage::default(),
+
+        // ---- Billing：Anthropic 标准计费 = CCH 内容指纹计量（有状态最长公共前缀命中）----
+        // 无 CchCacheMeter 实例时回退全 input（default = Delta，split 全计 input）。
+        // 无 session 的主 Key（key_id==0）经 cch_isolation_seed 返回 None → cch_compute_cache_usage
+        // 内部返回全 input（不模拟跨用户缓存）。read_ratio / creation_ratio / multiplier_cap 在此模式失效。
+        MeteringMode::Billing => match state.cch_cache_meter.as_ref() {
             Some(cache) => super::cache_metering::CacheUsage::Cch(
                 super::cache_metering::cch_compute_cache_usage(cache, payload, key_ctx.key_id),
             ),
             None => super::cache_metering::CacheUsage::default(),
-        };
-    }
+        },
 
+        // ---- Delta：检测安全结构化拆分（下面整段）----
+        MeteringMode::Delta => compute_delta_cache_usage(state, payload, key_ctx),
+    }
+}
+
+/// Delta 模式（检测安全）的缓存覆盖计算，从 [`compute_cache_usage_for_key`] 的 match 分派出来。
+fn compute_delta_cache_usage(
+    state: &AppState,
+    payload: &MessagesRequest,
+    key_ctx: &KeyContext,
+) -> super::cache_metering::CacheUsage {
     // ---- 默认检测安全支路（delta，billing_mode=false）：完全不变 ----------------------------
     let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
         state

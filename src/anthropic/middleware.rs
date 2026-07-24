@@ -26,8 +26,10 @@ pub struct KeyContext {
     pub key_id: u64,
     /// 该 Key 绑定的账号分组；None 表示未绑定，可使用全部账号
     pub group: Option<String>,
-    /// 是否为该入口 Key 启用中转层 prompt cache。
-    pub cache_enabled: bool,
+    /// 该入口 Key 的缓存计量模式（三选一：off / delta / billing，见
+    /// [`crate::anthropic::cache_metering::MeteringMode`]）。取代旧的 `cache_enabled` +
+    /// `anthropic_billing_mode` 两个布尔开关。
+    pub metering_mode: crate::anthropic::cache_metering::MeteringMode,
     /// 提示词过滤开关（per-key，默认关）：精简 CC 提示 / 去边界标记 / 去环境噪音。
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
@@ -40,12 +42,9 @@ pub struct KeyContext {
     pub response_cache_ttl_secs: Option<u32>,
     /// 缓存计量 read 留存阻尼 R per-key 覆盖（None = 跟随全局 `MeterGovernance`）。
     pub cache_read_ratio: Option<f64>,
-    /// 缓存计量 multiplier 护栏上限 per-key 覆盖（None = 跟随默认 1.25）。
+    /// 缓存计量 multiplier 护栏上限 per-key 覆盖（None = 跟随默认 1.25；仅 delta 模式生效）。
     pub cache_multiplier_cap: Option<f64>,
-    /// Anthropic 标准计费模式（per-key，默认关）。开启后 usage 走真实互斥三桶口径（不超报），
-    /// 与默认的唯一区别是不施加 multiplier_cap 护栏；利润来自 R 挪桶。
-    pub anthropic_billing_mode: bool,
-    /// 标准模式 creation 占比 per-key 覆盖（None = 跟随默认 3%；仅标准模式生效）。定 creation 形状。
+    /// 标准模式 creation 占比 per-key 覆盖（None = 跟随默认 3%；仅 billing 模式生效）。定 creation 形状。
     pub cache_creation_ratio: Option<f64>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
@@ -69,8 +68,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量运行时治理（全局命中率 R 旋钮，per-key 可覆盖）。仅 delta 支路使用。
     pub meter_governance: Option<SharedMeterGovernance>,
-    /// CCH 内容指纹缓存计量（有状态）。仅 Anthropic 标准计费模式（per-key
-    /// `anthropic_billing_mode`）支路使用；default None 时该支路回退全 input。
+    /// CCH 内容指纹缓存计量（有状态）。仅 `MeteringMode::Billing`（Anthropic 标准计费）
+    /// 支路使用；default None 时该支路回退全 input。
     pub cch_cache_meter: Option<SharedCchCacheMeter>,
     /// 响应体缓存（真实响应回放；全局开关 + TTL 作为运行时原子值存于缓存内部）
     pub response_cache: Option<super::response_cache::SharedResponseCache>,
@@ -198,19 +197,18 @@ pub async fn auth_middleware(
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
-            let cache_enabled = mgr.cache_enabled_of(id);
+            let metering_mode = mgr.metering_mode_of(id);
             let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
                 mgr.prompt_filters_of(id);
             let fast_mode = mgr.fast_mode_of(id);
             let (response_cache_enabled, response_cache_ttl_secs) = mgr.response_cache_cfg_of(id);
             let cache_read_ratio = mgr.cache_read_ratio_of(id);
             let cache_multiplier_cap = mgr.cache_multiplier_cap_of(id);
-            let anthropic_billing_mode = mgr.anthropic_billing_mode_of(id);
             let cache_creation_ratio = mgr.cache_creation_ratio_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
-                cache_enabled,
+                metering_mode,
                 simplify_cc_prompt,
                 strip_boundary_markers,
                 strip_env_noise,
@@ -219,7 +217,6 @@ pub async fn auth_middleware(
                 response_cache_ttl_secs,
                 cache_multiplier_cap,
                 cache_read_ratio,
-                anthropic_billing_mode,
                 cache_creation_ratio,
                 key_source: TraceKeySource::ClientKey,
             });

@@ -955,7 +955,9 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
-    pub cache_enabled: bool,
+    /// 缓存计量模式（三选一：off / delta / billing）。取代旧的 `cacheEnabled` +
+    /// `anthropicBillingMode` 两个布尔开关。
+    pub metering_mode: crate::anthropic::cache_metering::MeteringMode,
     /// 提示词过滤开关（per-key，默认关）。
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
@@ -972,13 +974,10 @@ pub struct ClientKeyItem {
     /// 缓存命中率 R 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_ratio: Option<f64>,
-    /// 缓存 multiplier 护栏上限覆盖（None = 跟随默认 1.25）。
+    /// 缓存 multiplier 护栏上限覆盖（None = 跟随默认 1.25；仅 delta 模式生效）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_multiplier_cap: Option<f64>,
-    /// Anthropic 标准计费模式（默认 false）。真实互斥三桶口径 + 不施加护栏。
-    #[serde(default)]
-    pub anthropic_billing_mode: bool,
-    /// 标准模式 creation 占比覆盖 ∈ [0,1]（None = 跟随默认 3%）。定 creation 形状。
+    /// 标准模式 creation 占比覆盖 ∈ [0,1]（None = 跟随默认 3%；仅 billing 模式生效）。定 creation 形状。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1005,8 +1004,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
-    #[serde(default = "default_client_key_cache_enabled")]
-    pub cache_enabled: bool,
+    /// 缓存计量模式（默认 delta）。取代旧 `cacheEnabled`。
+    #[serde(default)]
+    pub metering_mode: crate::anthropic::cache_metering::MeteringMode,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1027,8 +1027,9 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 缓存计量模式更新（None=不变更；off/delta/billing）。取代旧 `cacheEnabled` + `anthropicBillingMode`。
     #[serde(default)]
-    pub cache_enabled: Option<bool>,
+    pub metering_mode: Option<crate::anthropic::cache_metering::MeteringMode>,
     /// 提示词过滤开关更新（None=不变更）。
     #[serde(default)]
     pub simplify_cc_prompt: Option<bool>,
@@ -1057,9 +1058,6 @@ pub struct UpdateClientKeyRequest {
     /// - 数值 → `Some(Some(v))`：强制该 Key 的护栏上限（clamp 到 [0.1, 1.25]）
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub cache_multiplier_cap: Option<Option<f64>>,
-    /// Anthropic 标准计费模式开关更新（字段缺省=不变更；true/false=开/关）。
-    #[serde(default)]
-    pub anthropic_billing_mode: Option<bool>,
     /// 标准模式 creation 占比覆盖更新。三态语义（double-option）：
     /// 字段缺省=不变更；`null`=复位跟随默认 3%；数值=强制（clamp [0,1]）。
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -1078,10 +1076,6 @@ where
     T: Deserialize<'de>,
 {
     Ok(Some(Option::<T>::deserialize(deserializer)?))
-}
-
-fn default_client_key_cache_enabled() -> bool {
-    true
 }
 
 // ============ IdC 设备授权登录 ============

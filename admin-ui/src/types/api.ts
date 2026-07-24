@@ -405,8 +405,8 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
-  /** 是否启用中转层 prompt cache */
-  cacheEnabled: boolean
+  /** 缓存计量模式（三选一：off / delta / billing）。取代旧的 cacheEnabled + anthropicBillingMode。 */
+  meteringMode: MeteringMode
   /** 提示词过滤开关（per-key，默认关） */
   simplifyCcPrompt: boolean
   stripBoundaryMarkers: boolean
@@ -417,11 +417,9 @@ export interface ClientKeyItem {
   responseCacheTtlSecs?: number
   /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
   cacheReadRatio?: number
-  /** 缓存 multiplier 护栏上限覆盖（undefined = 跟随默认 1.25） */
+  /** 缓存 multiplier 护栏上限覆盖（undefined = 跟随默认 1.25；仅 delta 模式生效） */
   cacheMultiplierCap?: number
-  /** Anthropic 标准计费模式（默认 false）：真实互斥三桶口径（不超报），仅不施加护栏；利润来自 R 挪桶 */
-  anthropicBillingMode?: boolean
-  /** 标准模式 creation 占比覆盖 ∈ [0,1]（undefined = 跟随默认 3%；仅标准模式生效） */
+  /** 标准模式 creation 占比覆盖 ∈ [0,1]（undefined = 跟随默认 3%；仅 billing 模式生效） */
   cacheCreationRatio?: number
   /** 快速模式（默认 false，首字延迟优先）：降低 payload 截断阈值 + 强制三过滤全开 */
   fastMode?: boolean
@@ -436,11 +434,15 @@ export interface ClientKeysResponse {
   keys: ClientKeyItem[]
 }
 
+/** 缓存计量模式：off=不合成 / delta=检测安全拆分 / billing=CCH 标准计费 */
+export type MeteringMode = 'off' | 'delta' | 'billing'
+
 export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
-  cacheEnabled?: boolean
+  /** 缓存计量模式（省略=后端默认 delta） */
+  meteringMode?: MeteringMode
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -455,7 +457,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
-  cacheEnabled?: boolean
+  /** 缓存计量模式更新（省略=不变更；off/delta/billing） */
+  meteringMode?: MeteringMode
   /** 提示词过滤开关更新（省略=不变更） */
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean
@@ -468,8 +471,6 @@ export interface UpdateClientKeyRequest {
   cacheReadRatio?: number | null
   /** 缓存 multiplier 护栏上限覆盖更新（省略=不变更；null=复位跟随默认 1.25；数值=强制 [0.1,1.25]） */
   cacheMultiplierCap?: number | null
-  /** Anthropic 标准计费模式开关更新（省略=不变更；true/false=开/关） */
-  anthropicBillingMode?: boolean
   /** 标准模式 creation 占比覆盖更新 ∈ [0,1]（省略=不变更；null=复位跟随默认 3%；数值=强制） */
   cacheCreationRatio?: number | null
   /** 快速模式开关更新（省略=不变更；true/false=开/关） */

@@ -1049,7 +1049,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
-        cache_enabled: k.cache_enabled,
+        metering_mode: k.metering_mode(),
         simplify_cc_prompt: k.simplify_cc_prompt,
         strip_boundary_markers: k.strip_boundary_markers,
         strip_env_noise: k.strip_env_noise,
@@ -1058,7 +1058,6 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         response_cache_ttl_secs: k.response_cache_ttl_secs,
         cache_read_ratio: k.cache_read_ratio,
         cache_multiplier_cap: k.cache_multiplier_cap,
-        anthropic_billing_mode: k.anthropic_billing_mode,
         cache_creation_ratio: k.cache_creation_ratio,
         group: k.group.clone(),
         is_system: k.is_system,
@@ -1101,7 +1100,7 @@ pub async fn create_client_key(
             .group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
-        payload.cache_enabled,
+        payload.metering_mode,
         state.service.prompt_filter_defaults(),
     );
     Json(CreateClientKeyResponse {
@@ -1165,7 +1164,7 @@ pub async fn update_client_key(
         payload.name,
         description,
         group,
-        payload.cache_enabled,
+        payload.metering_mode,
         payload.simplify_cc_prompt,
         payload.strip_boundary_markers,
         payload.strip_env_noise,
@@ -1173,7 +1172,6 @@ pub async fn update_client_key(
         payload.response_cache_ttl_secs.map(Some),
         payload.cache_read_ratio,
         payload.cache_multiplier_cap,
-        payload.anthropic_billing_mode,
         payload.cache_creation_ratio,
         payload.fast_mode,
     ) {

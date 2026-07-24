@@ -9,6 +9,9 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import {
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+} from '@/components/ui/select'
+import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -21,7 +24,7 @@ import {
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import type { ClientKeyItem, CreateClientKeyResponse, MeteringMode } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
@@ -57,7 +60,7 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
-  const [createCacheEnabled, setCreateCacheEnabled] = useState(true)
+  const [createMeteringMode, setCreateMeteringMode] = useState<MeteringMode>('delta')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -66,7 +69,7 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
-  const [editCacheEnabled, setEditCacheEnabled] = useState(true)
+  const [editMeteringMode, setEditMeteringMode] = useState<MeteringMode>('delta')
   const [editSimplifyCc, setEditSimplifyCc] = useState(false)
   const [editStripBoundary, setEditStripBoundary] = useState(false)
   const [editStripEnvNoise, setEditStripEnvNoise] = useState(false)
@@ -78,8 +81,7 @@ export function ClientKeysPage() {
   const [editCacheRatio, setEditCacheRatio] = useState('')
   // multiplier 护栏上限覆盖：空串=跟随默认 1.25，否则 0.1~1.25
   const [editMultiplierCap, setEditMultiplierCap] = useState('')
-  // Anthropic 标准计费模式开关（默认关）+ creation 占比（空串=跟随默认 3%）
-  const [editBillingMode, setEditBillingMode] = useState(false)
+  // billing 模式 creation 占比（空串=跟随默认 3%）
   const [editCreationRatio, setEditCreationRatio] = useState('')
   // 快速模式开关（默认关，首字延迟优先）
   const [editFastMode, setEditFastMode] = useState(false)
@@ -98,14 +100,14 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
-        cacheEnabled: createCacheEnabled,
+        meteringMode: createMeteringMode,
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
-      setCreateCacheEnabled(true)
+      setCreateMeteringMode('delta')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -187,7 +189,7 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
-    setEditCacheEnabled(item.cacheEnabled)
+    setEditMeteringMode(item.meteringMode)
     setEditSimplifyCc(item.simplifyCcPrompt)
     setEditStripBoundary(item.stripBoundaryMarkers)
     setEditStripEnvNoise(item.stripEnvNoise)
@@ -197,7 +199,6 @@ export function ClientKeysPage() {
     setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
-    setEditBillingMode(item.anthropicBillingMode ?? false)
     setEditCreationRatio(item.cacheCreationRatio != null ? String(item.cacheCreationRatio) : '')
     setEditFastMode(item.fastMode ?? false)
     setEditTab('basic')
@@ -244,7 +245,7 @@ export function ClientKeysPage() {
           name: editName.trim(),
           description: editDesc.trim(),
           group: editGroup.trim(),
-          cacheEnabled: editCacheEnabled,
+          meteringMode: editMeteringMode,
           simplifyCcPrompt: editSimplifyCc,
           stripBoundaryMarkers: editStripBoundary,
           stripEnvNoise: editStripEnvNoise,
@@ -252,7 +253,6 @@ export function ClientKeysPage() {
           responseCacheTtlSecs: respCacheTtl,
           cacheReadRatio,
           cacheMultiplierCap,
-          anthropicBillingMode: editBillingMode,
           cacheCreationRatio,
           fastMode: editFastMode,
         },
@@ -370,8 +370,10 @@ export function ClientKeysPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
-                        {k.cacheEnabled ? (
-                          <Badge variant="secondary">开启</Badge>
+                        {k.meteringMode === 'billing' ? (
+                          <Badge variant="secondary">Billing</Badge>
+                        ) : k.meteringMode === 'delta' ? (
+                          <Badge variant="secondary">Delta</Badge>
                         ) : (
                           <Badge variant="outline">关闭</Badge>
                         )}
@@ -482,18 +484,21 @@ export function ClientKeysPage() {
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
-            <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
-              <div>
-                <div className="text-sm font-medium">Prompt cache 计量</div>
-                <p className="text-[11px] text-muted-foreground">
-                  合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
-                </p>
-              </div>
-              <Switch
-                checked={createCacheEnabled}
-                onCheckedChange={setCreateCacheEnabled}
-                disabled={createKey.isPending}
-              />
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-1.5 text-sm font-medium">缓存计量模式</div>
+              <p className="mb-2 text-[11px] text-muted-foreground">
+                <b>off</b>＝不合成，全量计入 input；<b>delta</b>＝检测安全比例拆分；<b>billing</b>＝Anthropic 标准计费 CCH。创建后可在编辑弹窗调细项。
+              </p>
+              <Select value={createMeteringMode} onValueChange={(v) => setCreateMeteringMode(v as MeteringMode)} disabled={createKey.isPending}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="off">关闭（全 input）</SelectItem>
+                  <SelectItem value="delta">Delta（检测安全）</SelectItem>
+                  <SelectItem value="billing">Billing（标准计费）</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
@@ -622,18 +627,21 @@ export function ClientKeysPage() {
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium">Prompt cache 计量</div>
               <div className="space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm">启用计量合成</div>
-                    <p className="text-[11px] text-muted-foreground">
-                      合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
-                    </p>
-                  </div>
-                  <Switch
-                    checked={editCacheEnabled}
-                    onCheckedChange={setEditCacheEnabled}
-                    disabled={updateKey.isPending}
-                  />
+                <div>
+                  <div className="mb-1.5 text-sm">缓存计量模式（三选一）</div>
+                  <p className="mb-2 text-[11px] text-muted-foreground">
+                    <b>off</b>＝不合成，全量计入 input；<b>delta</b>＝检测安全比例拆分（下方 R 利润档 + multiplier 护栏）；<b>billing</b>＝Anthropic 标准计费 CCH 内容指纹（真实互斥三桶、无护栏，下方 creation 占比）。三者互斥。
+                  </p>
+                  <Select value={editMeteringMode} onValueChange={(v) => setEditMeteringMode(v as MeteringMode)} disabled={updateKey.isPending}>
+                    <SelectTrigger className="h-8 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="off">关闭（全 input）</SelectItem>
+                      <SelectItem value="delta">Delta（检测安全）</SelectItem>
+                      <SelectItem value="billing">Billing（标准计费）</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 {/* 利润档滑块（复用 R）：命中率≈R，multiplier≈1−0.9R；越左命中越高利润越低 */}
                 {(() => {
@@ -659,7 +667,7 @@ export function ClientKeysPage() {
                         step={0.05}
                         value={rv}
                         onChange={(e) => setEditCacheRatio(e.target.value)}
-                        disabled={updateKey.isPending || !editCacheEnabled}
+                        disabled={updateKey.isPending || editMeteringMode !== 'delta'}
                         className="w-full accent-primary disabled:opacity-50"
                       />
                       <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
@@ -692,31 +700,22 @@ export function ClientKeysPage() {
                     placeholder="默认 1.25"
                     value={editMultiplierCap}
                     onChange={(e) => setEditMultiplierCap(e.target.value)}
-                    disabled={updateKey.isPending || !editCacheEnabled}
+                    disabled={updateKey.isPending || editMeteringMode !== 'delta'}
                     className="h-8 w-28 text-xs"
                   />
                 </div>
 
-                {/* Anthropic 标准计费模式（互斥于上面的检测安全默认）*/}
+                {/* Billing 模式专属：creation 占比（仅 billing 模式生效）*/}
+                {editMeteringMode === 'billing' && (
                 <div className="mt-1 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm">Anthropic 标准计费模式</div>
-                      <p className="text-[11px] text-muted-foreground">
-                        开启后 usage 走<b>真实 Anthropic 互斥三桶口径</b>（input+creation+read 恒等真实量，<b className="text-amber-600">绝不超报、不双重收费</b>），利润来自 R 挪桶（read→input）。与默认的唯一区别：<b className="text-amber-600">不施加上面的 multiplier 护栏</b>（接受更高检测风险换 margin）。creation 形状由下方 creation 占比定。默认关＝检测安全比例分摊（受护栏）。
-                      </p>
-                    </div>
-                    <Switch
-                      checked={editBillingMode}
-                      onCheckedChange={setEditBillingMode}
-                      disabled={updateKey.isPending || !editCacheEnabled}
-                    />
+                  <div className="mb-2 text-[11px] text-muted-foreground">
+                    <b className="text-amber-600">Billing 模式</b>：usage 走真实 Anthropic 互斥三桶口径（input+creation+read 恒等真实量，<b className="text-amber-600">绝不超报</b>），<b className="text-amber-600">不施加 multiplier 护栏</b>（接受更高检测风险换 margin）。利润来自 R 挪桶（read→input）。
                   </div>
-                  <div className="mt-2 flex items-center justify-between gap-3">
+                  <div className="flex items-center justify-between gap-3">
                     <div>
                       <div className="text-sm">creation 占比</div>
                       <p className="text-[11px] text-muted-foreground">
-                        留空＝默认 3%（0.03）；0~1。creation = cacheable × 占比，定"每轮写多少缓存"的形状。与 R 正交，二者都不破坏 sum==total。仅标准计费模式生效。
+                        留空＝默认 3%（0.03）；0~1。creation = cacheable × 占比，定"每轮写多少缓存"的形状。与 R 正交，二者都不破坏 sum==total。
                       </p>
                     </div>
                     <Input
@@ -727,11 +726,12 @@ export function ClientKeysPage() {
                       placeholder="默认 0.03"
                       value={editCreationRatio}
                       onChange={(e) => setEditCreationRatio(e.target.value)}
-                      disabled={updateKey.isPending || !editCacheEnabled || !editBillingMode}
+                      disabled={updateKey.isPending}
                       className="h-8 w-28 text-xs"
                     />
                   </div>
                 </div>
+                )}
               </div>
             </div>
             )}

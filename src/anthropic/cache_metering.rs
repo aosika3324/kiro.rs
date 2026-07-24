@@ -36,6 +36,43 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// per-key 缓存计量模式（**三选一切换**，互斥）。取代旧的两个独立布尔开关
+/// （`cache_enabled` + `anthropic_billing_mode`）——它们语义上并非"开关叠开关"，
+/// 而是三种平级的计量引擎，只能选其一。
+///
+/// - [`MeteringMode::Off`]：不合成缓存计量，全量计入 input（旧 `cache_enabled=false`）。
+/// - [`MeteringMode::Delta`]（默认）：检测安全的 delta-based 结构化拆分（R 利润档 + multiplier
+///   护栏，见 [`DeltaCacheUsage`] / [`compute_structural_cache_usage`]）。旧 `cache_enabled=true
+///   & billing=false`。
+/// - [`MeteringMode::Billing`]：Anthropic 标准计费——CCH 内容指纹计量（真实互斥三桶、无护栏，
+///   见 [`CchResult`] / [`cch_compute_cache_usage`]）。旧 `cache_enabled=true & billing=true`。
+///
+/// `input_floor`（下游输入地板）是**与本模式正交的另一根轴**：无论选哪个模式，都在最终返回
+/// 下游的边界对 `input==0` 兜底，不参与模式判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeteringMode {
+    /// 不合成缓存计量，全量计入 input。
+    Off,
+    /// 检测安全 delta 结构化拆分（默认）。
+    #[default]
+    Delta,
+    /// Anthropic 标准计费（CCH 内容指纹）。
+    Billing,
+}
+
+impl MeteringMode {
+    /// 从旧的两个布尔字段折算模式（迁移用）。缺省沿用旧默认：`cache_enabled=true`（老数据
+    /// 无此字段时默认 true）、`billing=false` → [`MeteringMode::Delta`]。
+    pub fn from_legacy_bools(cache_enabled: bool, billing_mode: bool) -> Self {
+        match (cache_enabled, billing_mode) {
+            (false, _) => MeteringMode::Off,
+            (true, false) => MeteringMode::Delta,
+            (true, true) => MeteringMode::Billing,
+        }
+    }
+}
+
 /// `compute_structural_cache_usage` 的结果：按 estimate 口径算出的三桶基准 + read 留存
 /// 阻尼，最终由 [`DeltaCacheUsage::split_against_total`] 对真实 total 做互斥分摊。
 ///

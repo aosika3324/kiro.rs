@@ -2525,10 +2525,10 @@ impl AdminService {
                 c.set_default_ttl_secs(ttl);
             }
         }
-        // 运行时治理仅作用于**默认检测安全 delta 支路**的 MeterGovernance（全局 R + 热度 TTL）。
-        // Anthropic 标准计费模式（per-key anthropic_billing_mode）走 CCH 内容指纹计量，
-        // read_ratio / creation_ratio / multiplier_cap 在该模式下**失效**——CCH 命中/创建由
-        // 实际前缀匹配决定，TTL 由请求 cache_control 探测（见 cache_metering::cch_*）。
+        // 运行时治理的 R / 热度 TTL 仅作用于 `MeteringMode::Delta` 的 MeterGovernance。
+        // `MeteringMode::Billing`（Anthropic 标准计费）走 CCH 内容指纹计量，read_ratio /
+        // creation_ratio / multiplier_cap 在该模式下**失效**——CCH 命中/创建由实际前缀匹配决定，
+        // TTL 由请求 cache_control 探测（见 cache_metering::cch_*）。input_floor 与模式正交、全局生效。
         if let Some(r) = req.cache_read_ratio {
             if let Some(g) = &self.meter_governance {
                 g.set_read_ratio(r);

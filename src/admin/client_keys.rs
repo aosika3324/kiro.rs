@@ -42,11 +42,22 @@ pub struct ClientKey {
     pub total_cache_creation_tokens: u64,
     #[serde(default)]
     pub total_cache_read_tokens: u64,
-    /// 是否启用中转层 prompt cache 计量与命中。
+    /// 缓存计量模式（**三选一切换**：off / delta / billing，见
+    /// [`crate::anthropic::cache_metering::MeteringMode`]）。取代旧的
+    /// `cacheEnabled` + `anthropicBillingMode` 两个布尔开关。
     ///
-    /// 老数据无此字段时默认 true，避免升级后已有 Key 行为变化。
-    #[serde(default = "default_cache_enabled")]
-    pub cache_enabled: bool,
+    /// 反序列化优先取此 canonical 字段；老数据无此字段（`None`）时由下方两个 legacy 布尔折算
+    /// （见 [`ClientKey::metering_mode`]）。`load()` 会把每条归一化为 `Some(..)`，之后落盘不再
+    /// 写 legacy 字段——老配置一次读写即完成迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_mode: Option<crate::anthropic::cache_metering::MeteringMode>,
+    /// **仅迁移用**（只反序列化、不落盘）：旧 `cacheEnabled` 布尔。新代码一律走
+    /// [`ClientKey::metering_mode`]，勿直接读此字段。
+    #[serde(rename = "cacheEnabled", default, skip_serializing)]
+    pub legacy_cache_enabled: Option<bool>,
+    /// **仅迁移用**（只反序列化、不落盘）：旧 `anthropicBillingMode` 布尔。
+    #[serde(rename = "anthropicBillingMode", default, skip_serializing)]
+    pub legacy_billing_mode: Option<bool>,
     /// 提示词过滤（per-key，默认关）：精简 Claude Code system prompt（检测到则整段替换）。
     /// 老数据无此字段时默认 false（不过滤，行为不变）。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -78,12 +89,6 @@ pub struct ClientKey {
     /// 值时把 input→read 压回（不碰 creation）。收紧到 1.0 留足检测余量；老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_multiplier_cap: Option<f64>,
-    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的 usage 走**真实互斥三桶口径**
-    /// （`input + creation + read == total`，绝不超报/双重收费）；利润来自 R 挪桶（read→input）。
-    /// 与关闭（默认）的唯一区别：标准模式**不施加 multiplier_cap 护栏**（接受更高检测风险换 margin）。
-    /// creation 形状由 [`Self::cache_creation_ratio`] 定。老数据无此字段时默认 false。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub anthropic_billing_mode: bool,
     /// 标准模式 creation 占比 per-key 覆盖 ∈ [0,1]（None = 跟随默认 3%）。`creation = cacheable ×
     /// creation_ratio`，定"每轮写多少缓存"的形状;与 R 正交,二者都不破坏 sum==total。老数据无此字段时 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +115,27 @@ pub struct ClientKey {
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
+impl ClientKey {
+    /// 解析生效的缓存计量模式：canonical `metering_mode` 有值就用它，否则由 legacy 布尔折算
+    /// （老数据迁移）。缺省沿用旧默认 → [`MeteringMode::Delta`]。
+    pub fn metering_mode(&self) -> crate::anthropic::cache_metering::MeteringMode {
+        use crate::anthropic::cache_metering::MeteringMode;
+        self.metering_mode.unwrap_or_else(|| {
+            MeteringMode::from_legacy_bools(
+                self.legacy_cache_enabled.unwrap_or(true),
+                self.legacy_billing_mode.unwrap_or(false),
+            )
+        })
+    }
+
+    /// 归一化：把生效模式写回 canonical 字段并清空 legacy（迁移落地，落盘后老字段消失）。
+    fn normalize_metering_mode(&mut self) {
+        self.metering_mode = Some(self.metering_mode());
+        self.legacy_cache_enabled = None;
+        self.legacy_billing_mode = None;
+    }
+}
+
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
@@ -150,7 +176,9 @@ impl ClientKeyManager {
         let mut by_key = HashMap::with_capacity(entries.len());
         let mut by_id = HashMap::with_capacity(entries.len());
         let mut max_id = 0u64;
-        for ck in entries {
+        for mut ck in entries {
+            // 迁移归一化：老配置的 cacheEnabled/anthropicBillingMode 折算成 metering_mode。
+            ck.normalize_metering_mode();
             max_id = max_id.max(ck.id);
             by_key.insert(ck.key.clone(), ck.id);
             by_id.insert(ck.id, ck);
@@ -197,38 +225,27 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
-        cache_enabled: bool,
+        metering_mode: crate::anthropic::cache_metering::MeteringMode,
         prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
-        if cache_enabled {
-            self.create_with_key_full(
-                name,
-                description,
-                group,
-                generate_client_key(),
-                true,
-                prompt_filters,
-            )
-        } else {
-            self.create_with_key_full(
-                name,
-                description,
-                group,
-                generate_client_key(),
-                false,
-                prompt_filters,
-            )
-        }
+        self.create_with_key_full(
+            name,
+            description,
+            group,
+            generate_client_key(),
+            metering_mode,
+            prompt_filters,
+        )
     }
 
-    /// 用指定明文创建 Key（带缓存与提示词过滤设置）。bootstrap 系统密钥走 `sync_system_key`。
+    /// 用指定明文创建 Key（带计量模式与提示词过滤设置）。bootstrap 系统密钥走 `sync_system_key`。
     fn create_with_key_full(
         &self,
         name: String,
         description: Option<String>,
         group: Option<String>,
         plaintext: String,
-        cache_enabled: bool,
+        metering_mode: crate::anthropic::cache_metering::MeteringMode,
         prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         let mut inner = self.inner.write();
@@ -254,7 +271,9 @@ impl ClientKeyManager {
             total_output_tokens: 0,
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
-            cache_enabled,
+            metering_mode: Some(metering_mode),
+            legacy_cache_enabled: None,
+            legacy_billing_mode: None,
             simplify_cc_prompt: prompt_filters.0,
             strip_boundary_markers: prompt_filters.1,
             strip_env_noise: prompt_filters.2,
@@ -263,7 +282,6 @@ impl ClientKeyManager {
             response_cache_ttl_secs: None,
             cache_read_ratio: None,
             cache_multiplier_cap: None,
-            anthropic_billing_mode: false,
             cache_creation_ratio: None,
             cache_read_inflation: None,
             anthropic_input_tokens: None,
@@ -310,7 +328,9 @@ impl ClientKeyManager {
                     total_output_tokens: 0,
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
-                    cache_enabled: true,
+                    metering_mode: Some(crate::anthropic::cache_metering::MeteringMode::Delta),
+                    legacy_cache_enabled: None,
+                    legacy_billing_mode: None,
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
@@ -319,7 +339,6 @@ impl ClientKeyManager {
                     response_cache_ttl_secs: None,
                     cache_read_ratio: None,
                     cache_multiplier_cap: None,
-                    anthropic_billing_mode: false,
                     cache_creation_ratio: None,
                     cache_read_inflation: None,
                     anthropic_input_tokens: None,
@@ -402,7 +421,7 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
-        cache_enabled: Option<bool>,
+        metering_mode: Option<crate::anthropic::cache_metering::MeteringMode>,
         simplify_cc_prompt: Option<bool>,
         strip_boundary_markers: Option<bool>,
         strip_env_noise: Option<bool>,
@@ -410,7 +429,6 @@ impl ClientKeyManager {
         response_cache_ttl_secs: Option<Option<u32>>,
         cache_read_ratio: Option<Option<f64>>,
         cache_multiplier_cap: Option<Option<f64>>,
-        anthropic_billing_mode: Option<bool>,
         cache_creation_ratio: Option<Option<f64>>,
         fast_mode: Option<bool>,
     ) -> bool {
@@ -426,8 +444,11 @@ impl ClientKeyManager {
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
                 }
-                if let Some(enabled) = cache_enabled {
-                    e.cache_enabled = enabled;
+                if let Some(m) = metering_mode {
+                    e.metering_mode = Some(m);
+                    // 显式设了 canonical 模式后清空 legacy,避免残留影响后续读取。
+                    e.legacy_cache_enabled = None;
+                    e.legacy_billing_mode = None;
                 }
                 if let Some(v) = simplify_cc_prompt {
                     e.simplify_cc_prompt = v;
@@ -459,9 +480,6 @@ impl ClientKeyManager {
                         )
                     });
                 }
-                if let Some(v) = anthropic_billing_mode {
-                    e.anthropic_billing_mode = v;
-                }
                 if let Some(v) = cache_creation_ratio {
                     // clamp 到 [0,1]；Some(None) 清除覆盖、跟随默认 3%
                     e.cache_creation_ratio = v.map(|r| r.clamp(0.0, 1.0));
@@ -488,14 +506,14 @@ impl ClientKeyManager {
             .and_then(|e| e.group.clone())
     }
 
-    /// 返回指定 Key 是否启用 prompt cache。不存在时保守关闭。
-    pub fn cache_enabled_of(&self, id: u64) -> bool {
+    /// 返回指定 Key 的缓存计量模式（三选一）。Key 不存在时保守取 `Off`（不合成、全 input）。
+    pub fn metering_mode_of(&self, id: u64) -> crate::anthropic::cache_metering::MeteringMode {
         self.inner
             .read()
             .entries
             .get(&id)
-            .map(|e| e.cache_enabled)
-            .unwrap_or(false)
+            .map(|e| e.metering_mode())
+            .unwrap_or(crate::anthropic::cache_metering::MeteringMode::Off)
     }
 
     /// 返回指定 Key 是否启用快速模式（首字延迟优先）。不存在时保守关闭。
@@ -535,16 +553,6 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .and_then(|e| e.cache_multiplier_cap)
-    }
-
-    /// 返回指定 Key 是否启用 Anthropic 标准计费模式（Key 不存在时 false）。
-    pub fn anthropic_billing_mode_of(&self, id: u64) -> bool {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .map(|e| e.anthropic_billing_mode)
-            .unwrap_or(false)
     }
 
     /// 返回指定 Key 的标准模式 creation 占比覆盖（None = 跟随默认 3%；Key 不存在时也返回 None）。
@@ -744,10 +752,6 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-fn default_cache_enabled() -> bool {
-    true
-}
-
 /// 生成 `sk-` 前缀 + 32 位 URL-safe 随机字符串
 pub fn generate_client_key() -> String {
     // OS CSPRNG（security::secure_token_urlsafe）而非 fastrand——对外分发的凭据须密码学安全。
@@ -780,7 +784,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
+        let entry = mgr.create("test".to_string(), None, None, crate::anthropic::cache_metering::MeteringMode::Delta, (false, false, false));
         assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         assert_eq!(mgr.verify_and_touch("nope"), None);
@@ -789,7 +793,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
+        let entry = mgr.create("test".to_string(), None, None, crate::anthropic::cache_metering::MeteringMode::Delta, (false, false, false));
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -799,7 +803,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
+        let entry = mgr.create("test".to_string(), None, None, crate::anthropic::cache_metering::MeteringMode::Delta, (false, false, false));
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -811,16 +815,19 @@ mod tests {
     }
 
     #[test]
-    fn cache_enabled_can_be_updated() {
+    fn metering_mode_can_be_updated() {
+        use crate::anthropic::cache_metering::MeteringMode;
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        // 新建默认 Delta。
+        let entry = mgr.create("test".to_string(), None, None, MeteringMode::Delta, (false, false, false));
+        assert_eq!(mgr.metering_mode_of(entry.id), MeteringMode::Delta);
+        // 切到 Billing。
         assert!(mgr.update_meta(
             entry.id,
             None,
             None,
             None,
-            Some(true),
-            None,
+            Some(MeteringMode::Billing),
             None,
             None,
             None,
@@ -831,19 +838,94 @@ mod tests {
             None,
             None,
         ));
-        assert!(mgr.cache_enabled_of(entry.id));
+        assert_eq!(mgr.metering_mode_of(entry.id), MeteringMode::Billing);
+        // 切到 Off。
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some(MeteringMode::Off),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(mgr.metering_mode_of(entry.id), MeteringMode::Off);
+    }
+
+    #[test]
+    fn legacy_bools_migrate_to_mode() {
+        use crate::anthropic::cache_metering::MeteringMode;
+        // 老 JSON：cacheEnabled=true & 无 billing → Delta。
+        let k: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 1, "key": "sk-x", "name": "a", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0,
+            "cacheEnabled": true
+        })).unwrap();
+        assert_eq!(k.metering_mode(), MeteringMode::Delta);
+        // cacheEnabled=false → Off。
+        let k2: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 2, "key": "sk-y", "name": "b", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0,
+            "cacheEnabled": false
+        })).unwrap();
+        assert_eq!(k2.metering_mode(), MeteringMode::Off);
+        // cacheEnabled=true & anthropicBillingMode=true → Billing。
+        let k3: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 3, "key": "sk-z", "name": "c", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0,
+            "cacheEnabled": true, "anthropicBillingMode": true
+        })).unwrap();
+        assert_eq!(k3.metering_mode(), MeteringMode::Billing);
+        // 完全无字段（最老数据）→ 缺省 Delta。
+        let k4: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 4, "key": "sk-w", "name": "d", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0
+        })).unwrap();
+        assert_eq!(k4.metering_mode(), MeteringMode::Delta);
+        // canonical meteringMode 优先于 legacy bools。
+        let k5: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 5, "key": "sk-v", "name": "e", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0,
+            "meteringMode": "off", "cacheEnabled": true, "anthropicBillingMode": true
+        })).unwrap();
+        assert_eq!(k5.metering_mode(), MeteringMode::Off);
+    }
+
+    #[test]
+    fn normalize_drops_legacy_and_serializes_mode() {
+        use crate::anthropic::cache_metering::MeteringMode;
+        let mut k: ClientKey = serde_json::from_value(serde_json::json!({
+            "id": 1, "key": "sk-x", "name": "a", "createdAt": "2020-01-01T00:00:00Z",
+            "totalCalls": 0, "totalInputTokens": 0, "totalOutputTokens": 0,
+            "cacheEnabled": true, "anthropicBillingMode": true
+        })).unwrap();
+        k.normalize_metering_mode();
+        assert_eq!(k.metering_mode, Some(MeteringMode::Billing));
+        assert_eq!(k.legacy_cache_enabled, None);
+        assert_eq!(k.legacy_billing_mode, None);
+        // 落盘不再含 legacy 字段,只含 meteringMode。
+        let json = serde_json::to_value(&k).unwrap();
+        assert_eq!(json.get("meteringMode").and_then(|v| v.as_str()), Some("billing"));
+        assert!(json.get("cacheEnabled").is_none(), "legacy cacheEnabled 不落盘");
+        assert!(json.get("anthropicBillingMode").is_none(), "legacy billing 不落盘");
     }
 
     #[test]
     fn fast_mode_defaults_off_and_can_be_updated() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        let entry = mgr.create("test".to_string(), None, None, crate::anthropic::cache_metering::MeteringMode::Off, (false, false, false));
         // 默认关
         assert!(!mgr.fast_mode_of(entry.id));
         // 开启 fast_mode（最后一个参数）
         assert!(mgr.update_meta(
             entry.id,
-            None,
             None,
             None,
             None,
@@ -874,7 +956,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some(false),
         ));
         assert!(!mgr.fast_mode_of(entry.id));
@@ -885,7 +966,7 @@ mod tests {
     #[test]
     fn response_cache_override_can_be_updated() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        let entry = mgr.create("test".to_string(), None, None, crate::anthropic::cache_metering::MeteringMode::Off, (false, false, false));
         // 默认无覆盖
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (None, None));
         // 设置覆盖：开启 + ttl 60
@@ -900,7 +981,6 @@ mod tests {
             None,
             Some(Some(true)),
             Some(Some(60)),
-            None,
             None,
             None,
             None,
@@ -923,7 +1003,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
     }
@@ -942,7 +1021,7 @@ mod tests {
             "kb".to_string(),
             Some("desc".into()),
             Some("groupA".into()),
-            true,
+            crate::anthropic::cache_metering::MeteringMode::Delta,
             (false, false, false),
         );
         // 累计一些统计
@@ -997,7 +1076,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         mgr.record_usage(0, 100, 50, 5, 10, 1.5);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
@@ -1008,7 +1086,7 @@ mod tests {
             None,
             None,
             "custom-b".into(),
-            true,
+            crate::anthropic::cache_metering::MeteringMode::Delta,
             (false, false, false),
         );
         assert_ne!(conflicting.id, 0);
