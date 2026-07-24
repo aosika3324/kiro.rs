@@ -1616,10 +1616,14 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
-    // finish() 返回 IncompleteJson。已有错误则保持不变。
+    // 收尾：对未显式收到 stop=true 的 pending 工具，finish() 尽力恢复（空参→{}、合法 JSON→
+    // 原样），只把非空且非法 JSON 的真截断当错误。恢复出的调用补进 tool_uses；已有错误则保持不变。
+    let (recovered, trunc_err) = tool_accumulator.finish(&tool_name_map);
+    for completed in recovered {
+        tool_uses.push(completed.to_anthropic_block());
+    }
     if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
+        && let Some(e) = trunc_err
     {
         tracing::error!("{}", e);
         tool_json_error = Some(e);

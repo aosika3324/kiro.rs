@@ -1108,23 +1108,65 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
-        if let Some((tool_use_id, (name, input))) = self
+    /// 流结束时收尾：处理仍未收到 `stop=true` 的缓冲。
+    ///
+    /// 上游并不总为每个 tool_use 单独发 `stop=true` 的 `toolUseEvent`——尤其**零参工具**
+    /// （`get_current_time` 等）常只发一个开启帧（`input` 空、无 stop），完成信号靠流结束隐含
+    /// （对齐 Kiro-Go `finishToolUse`：流末尾对 pending 工具照常发出，空参当 `{}`）。旧逻辑把这类
+    /// 一律当"上游截断"报 `IncompleteJson` 并丢弃，导致本该成功的工具调用被吞（回归）。
+    ///
+    /// 分三类收尾：
+    /// - 缓冲为空 → 零参调用，按 `{}` 正常发出（补回被误杀的多数场景）。
+    /// - 非空且是**合法 JSON** → 参数其实收全了、只是没显式 stop，正常发出。
+    /// - 非空但**非法 JSON** → 真·参数写到一半被截断，仍报 `InvalidJson`、不发出（绝不把半截
+    ///   参数当完整调用转发）。多个截断取字节数最多者作代表错误。
+    ///
+    /// 返回 (已恢复可发出的工具调用, 真截断错误)。两者可并存（部分恢复 + 部分截断）。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> (Vec<CompletedToolUse>, Option<ToolJsonAccumulatorError>) {
+        // 稳定顺序：按 tool_use_id 排序，避免 HashMap 迭代顺序导致输出抖动。
+        let mut leftovers: Vec<(String, String, String)> = self
             .buffers
-            .iter()
-            .max_by_key(|(_, (_, input))| input.len())
-            .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
-        {
-            self.buffers.remove(&tool_use_id);
-            return Err(ToolJsonAccumulatorError::IncompleteJson {
-                tool_use_id,
-                name,
-                bytes: input.len(),
-            });
+            .drain()
+            .map(|(id, (name, input))| (id, name, input))
+            .collect();
+        leftovers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut recovered = Vec::new();
+        let mut trunc_error: Option<ToolJsonAccumulatorError> = None;
+        let mut trunc_max_bytes = 0usize;
+
+        for (tool_use_id, kiro_name, input_json) in leftovers {
+            let parsed = if input_json.trim().is_empty() {
+                Some(serde_json::json!({}))
+            } else {
+                serde_json::from_str::<serde_json::Value>(&input_json).ok()
+            };
+            match parsed {
+                Some(input) => {
+                    recovered.push(CompletedToolUse::from_kiro(
+                        tool_use_id,
+                        &kiro_name,
+                        input,
+                        tool_name_map,
+                    ));
+                }
+                None => {
+                    // 真截断：非空却解析不出。保留字节数最多的作代表错误。
+                    if input_json.len() >= trunc_max_bytes {
+                        trunc_max_bytes = input_json.len();
+                        trunc_error = Some(ToolJsonAccumulatorError::IncompleteJson {
+                            tool_use_id,
+                            name: kiro_name,
+                            bytes: input_json.len(),
+                        });
+                    }
+                }
+            }
         }
-        Ok(())
+        (recovered, trunc_error)
     }
 }
 
@@ -2648,10 +2690,15 @@ impl StreamContext {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
-        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
-        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
+        // 收尾检查工具调用累积器：对未显式收到 stop=true 的 pending 工具，finish() 会尽力恢复
+        // （空参→{}、合法 JSON→原样发出），只把非空且非法 JSON 的真截断当错误。恢复出的工具调用
+        // 照常经 emit_completed_tool_use 发出；process_tool_use 中已置位的错误保持不变。
+        let (recovered, trunc_err) = self.tool_json_accumulator.finish(&self.tool_name_map);
+        for completed in recovered {
+            events.extend(self.emit_completed_tool_use(completed));
+        }
         if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
+            && let Some(e) = trunc_err
         {
             tracing::error!("{}", e);
             self.tool_json_error = Some(e);
@@ -3106,9 +3153,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_json_accumulator_incomplete_on_missing_stop() {
+    fn tool_json_accumulator_truncated_json_still_errors_on_finish() {
         let mut acc = ToolJsonAccumulator::new();
-        // 只来了半截、从未 stop → finish() 报 IncompleteJson。
+        // 非空却是半截 JSON、从未 stop → 真截断：finish() 不恢复、报 IncompleteJson。
         assert!(
             acc.push(
                 &tool_evt("t1", "read_file", "{\"path\":\"/a", false),
@@ -3117,10 +3164,66 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
-        assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
-        // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        let (recovered, err) = acc.finish(&HashMap::new());
+        assert!(recovered.is_empty(), "truncated JSON must not be recovered");
+        assert!(matches!(
+            err,
+            Some(ToolJsonAccumulatorError::IncompleteJson { .. })
+        ));
+        // 已取出残留后再 finish() 应无残留、无错误。
+        let (recovered2, err2) = acc.finish(&HashMap::new());
+        assert!(recovered2.is_empty() && err2.is_none());
+    }
+
+    #[test]
+    fn tool_json_accumulator_finish_recovers_zero_arg_and_unstopped_valid() {
+        // 回归：零参工具（get_current_time 等）只来一个开启帧、input 空、从未 stop——旧逻辑当
+        // IncompleteJson 丢弃。现在 finish() 必须把它按 {} 恢复发出；合法但无 stop 的也照发。
+        let mut acc = ToolJsonAccumulator::new();
+        // 零参：空 input、无 stop。
+        assert!(
+            acc.push(&tool_evt("z1", "get_current_time", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+        // 参数收全但从未发 stop 的合法 JSON。
+        assert!(
+            acc.push(
+                &tool_evt("z2", "some_tool", "{\"a\":1}", false),
+                &HashMap::new()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let (mut recovered, err) = acc.finish(&HashMap::new());
+        assert!(err.is_none(), "no genuine truncation → no error");
+        assert_eq!(recovered.len(), 2, "both pending tools recovered");
+        recovered.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(recovered[0].id, "z1");
+        assert_eq!(recovered[0].name, "get_current_time");
+        assert_eq!(recovered[0].input, serde_json::json!({}));
+        assert_eq!(recovered[1].id, "z2");
+        assert_eq!(recovered[1].input, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn tool_json_accumulator_finish_mixes_recovery_and_truncation() {
+        // 一个零参可恢复 + 一个真截断并存：恢复该恢复的,同时报截断错误。
+        let mut acc = ToolJsonAccumulator::new();
+        acc.push(&tool_evt("ok", "get_current_time", "", false), &HashMap::new())
+            .unwrap();
+        acc.push(
+            &tool_evt("bad", "fs_write", "{\"path\":\"/x", false),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let (recovered, err) = acc.finish(&HashMap::new());
+        assert_eq!(recovered.len(), 1, "the zero-arg tool is recovered");
+        assert_eq!(recovered[0].id, "ok");
+        assert!(
+            matches!(err, Some(ToolJsonAccumulatorError::IncompleteJson { ref name, .. }) if name == "fs_write"),
+            "the truncated fs_write still reported"
+        );
     }
 
     #[test]
