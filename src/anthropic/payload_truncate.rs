@@ -27,9 +27,10 @@ use crate::model::config::ToolCompatibilityMode;
 use super::types::{Message, MessagesRequest};
 use crate::kiro::model::requests::kiro::KiroRequest;
 
-/// Default whole-payload byte cap. Sits below the failure-region median (~685 KB observed) so it
-/// engages before the upstream 400, while leaving normal traffic untouched. `0` disables.
-const DEFAULT_MAX_PAYLOAD_BYTES: usize = 640_000;
+/// Default whole-payload byte cap. Matches the Kiro-Go reference implementation's
+/// `maxPayloadBytes = 900 * 1024` — kept conservatively below the observed upstream threshold to
+/// leave room for headers and minor serialization overhead. `0` disables.
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 900 * 1024;
 
 /// Most-recent `messages` entries always kept (current message + recent context survive).
 const MIN_RECENT_TURNS: usize = 6;
@@ -151,45 +152,45 @@ fn convert_within_limit_counted(
         return Ok((result, conversions));
     }
 
-    // Single-pass sizing: instead of reconverting to re-measure after each drop, estimate the trim
-    // once from per-message byte sizes scaled by the observed Anthropic→Kiro expansion ratio, drop
-    // that many oldest turns, then reconvert **once** to verify (and let the pairing cleanup run).
-    // A small bounded correction loop follows only if the estimate undershot — normally never taken.
-    let msg_bytes: Vec<usize> = payload.messages.iter().map(anthropic_msg_bytes).collect();
-    let anthropic_total: usize = msg_bytes.iter().sum::<usize>().max(1);
-    // converted_total / anthropic_total ≈ how many Kiro bytes each Anthropic byte expands to.
-    let over_converted = before - cfg.max_bytes;
-    // Convert the converted-space overage back into Anthropic-space bytes to drop from the head.
-    let over_anthropic = ((over_converted as u128 * anthropic_total as u128)
-        / before.max(1) as u128) as usize;
-    // Walk oldest→newest accumulating message bytes until we've covered the target drop; that count
-    // is how many oldest turns to shed. `drop_oldest_turns` still enforces MIN_RECENT_TURNS and the
-    // pure-tool_result head guard, so an over-estimate here can never cut into the recent window.
-    let trimmable = payload.messages.len().saturating_sub(MIN_RECENT_TURNS);
-    let mut acc = 0usize;
-    let mut est = 0usize;
-    for &b in msg_bytes.iter().take(trimmable) {
-        if acc >= over_anthropic {
+    // Re-estimating proportional trim (mirrors Kiro-Go's guarantee that the emitted payload fits):
+    // each pass sizes the drop from per-message byte sizes scaled by the observed Anthropic→Kiro
+    // expansion ratio, drops that many oldest turns, then reconverts (so the pairing cleanup runs)
+    // and re-measures. Because the estimate is recomputed against the *current* overage every pass,
+    // an undershoot on one pass is corrected on the next — it keeps going until the converted payload
+    // is truly under `max_bytes` or nothing more can be dropped (the MIN_RECENT_TURNS floor). Uniform
+    // histories converge in a single drop (≤2 conversions); uneven/tool-heavy ones take a few more.
+    // MAX_TRIM_ITERS remains only as a paranoia bound against a pathological non-converging ratio.
+    let mut iters = 0;
+    loop {
+        let current = converted_payload_bytes(&result);
+        if current <= cfg.max_bytes || payload.messages.len() <= MIN_RECENT_TURNS {
             break;
         }
-        acc += b;
-        est += 1;
-    }
-    est = est.max(1);
-
-    if drop_oldest_turns(&mut payload.messages, est) {
-        result = convert_request_with_mode(payload, mode)?;
-        conversions += 1;
-    }
-
-    // Bounded correction: if the single-pass estimate still left us over (uneven turn sizes), shed
-    // one turn at a time. Capped by MAX_TRIM_ITERS as a safety bound; normally not entered at all.
-    let mut iters = 0;
-    while converted_payload_bytes(&result) > cfg.max_bytes
-        && payload.messages.len() > MIN_RECENT_TURNS
-        && iters < MAX_TRIM_ITERS
-    {
-        if !drop_oldest_turns(&mut payload.messages, 1) {
+        if iters >= MAX_TRIM_ITERS {
+            break;
+        }
+        // Estimate oldest turns to shed to cover the *current* converted-space overage, translated
+        // back to Anthropic-space via the live expansion ratio (current converted / anthropic total).
+        let msg_bytes: Vec<usize> = payload.messages.iter().map(anthropic_msg_bytes).collect();
+        let anthropic_total: usize = msg_bytes.iter().sum::<usize>().max(1);
+        let over_converted = current - cfg.max_bytes;
+        let over_anthropic = ((over_converted as u128 * anthropic_total as u128)
+            / current.max(1) as u128) as usize;
+        // Walk oldest→newest accumulating message bytes until we've covered the target drop; that
+        // count is how many oldest turns to shed. `drop_oldest_turns` still enforces MIN_RECENT_TURNS
+        // and the pure-tool_result head guard, so an over-estimate can never cut the recent window.
+        let trimmable = payload.messages.len().saturating_sub(MIN_RECENT_TURNS);
+        let mut acc = 0usize;
+        let mut est = 0usize;
+        for &b in msg_bytes.iter().take(trimmable) {
+            if acc >= over_anthropic {
+                break;
+            }
+            acc += b;
+            est += 1;
+        }
+        est = est.max(1);
+        if !drop_oldest_turns(&mut payload.messages, est) {
             break;
         }
         result = convert_request_with_mode(payload, mode)?;
@@ -422,6 +423,37 @@ mod tests {
         let mut p = req(vec![user_text("short"), assistant_text("ok"), user_text("q")]);
         let (_r, conversions) = convert_within_limit_counted(&mut p, &cfg(640_000), ToolCompatibilityMode::ClaudeCode).unwrap();
         assert_eq!(conversions, 1, "under budget = exactly one convert");
+    }
+
+    #[test]
+    fn non_uniform_history_converges_strictly_under_cap() {
+        // Regression for the 216 case: a huge oldest turn skews the single-pass estimate low, so the
+        // old 1-turn-at-a-time correction (capped at 12) could stop while still over cap. The
+        // re-estimating loop must drive it strictly under (plenty of trimmable turns → floor not the
+        // escape). Big head + many mid turns; current message small.
+        let mut msgs = vec![user_text(&"H".repeat(800_000))]; // enormous oldest turn
+        for i in 0..60 {
+            msgs.push(assistant_text(&format!("a{i} {}", "x".repeat(2_000))));
+            msgs.push(user_text(&format!("u{i} {}", "y".repeat(2_000))));
+        }
+        msgs.push(user_text("final?")); // small current message
+        let mut p = req(msgs);
+        // Mid turns total ~240 KB — comfortably under this cap once the 800 KB head is dropped, so
+        // convergence lands strictly under cap with the floor unreached (the assertions below).
+        let cap = 500_000;
+        let r = convert_within_limit(&mut p, &cfg(cap), ToolCompatibilityMode::ClaudeCode).unwrap();
+        assert_pairing_valid(&r);
+        // Floor not reached (many turns remain trimmable) → must be strictly under cap, not merely
+        // "gave up at the floor".
+        assert!(
+            p.messages.len() > MIN_RECENT_TURNS,
+            "test should leave the floor unreached to exercise convergence"
+        );
+        assert!(
+            converted_payload_bytes(&r) <= cap,
+            "re-estimating loop must land strictly under cap, got {}",
+            converted_payload_bytes(&r)
+        );
     }
 
     #[test]
